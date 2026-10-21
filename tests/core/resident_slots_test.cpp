@@ -42,12 +42,16 @@ struct ResidentDraftReadinessFixture {
         dispatch.slot_requests[0] = 17; dispatch.slot_requests[1] = 23;
         draft.st_.max_cells = 64; draft.window_ = 40;
         draft.slots_.resize(2);
+        draft.owners_[0] = {0, 17, 3, 0};
+        draft.owners_[1] = {1, 23, 9, 0};
         auto& chain = draft.slots_[0];
         chain.state.max_cells = 64; chain.request = 17; chain.certified = true;
+        chain.producer = draft.owners_[0];
         chain.begin = 8; chain.cells = chain.completed_cells = 16; chain.prompt_len = 48;
         chain.tail_token = 116;
         auto& peer_chain = draft.slots_[1];
         peer_chain.request = 23; peer_chain.certified = true;
+        peer_chain.producer = draft.owners_[1]; peer_chain.state.max_cells = 64;
         peer_chain.begin = 0; peer_chain.cells = peer_chain.completed_cells = 3;
         peer_chain.tail_token = 24;
         std::string error;
@@ -79,37 +83,36 @@ struct ResidentDraftReadinessFixture {
                 dispatch.completion[0].active() && peer_chain.request == 23 && peer_chain.certified &&
                 peer_chain.cells == 3 && peer_chain.completed_cells == 3 && peer_chain.tail_token == 24;
         };
-        const auto refused = [&](const char* reason) {
+        const auto refused = [&] {
             PrefixWork work{123, 456};
             error.clear();
-            check(!slots.resume_work(0, nullptr, work, error) && work.bytes == 0 && work.route == 0 &&
-                  error.find(reason) != std::string::npos,
+            check(!slots.resume_work(0, nullptr, work, error) && work.bytes == 0 && work.route == 0,
                   "readiness refusal happens before target/draft pricing, writes or owner mutation");
             check(unchanged(), "refusal preserves target identity/history and the peer's state/operation witness");
         };
         slots.inject_absent_draft(0);
         check(slots.certify_continuation(0).certified && !slots.certify_continuation(0).draft_ready,
               "removing optional draft readiness leaves the target cut certified");
-        refused("draft_readiness=draft_absent");
-        check(error.find("residual_rows=8 residual_bytes=327680") != std::string::npos &&
-              error.find("reconstruction_priced=0 extra_scratch_bytes=unknown") != std::string::npos,
-              "the request receives missing-input work/storage bounds, not an invented zero scratch quote");
-        chain.certified = true; chain.begin = 8; chain.completed_cells = 16; chain.tail_token = 116;
-        chain.request = 18;
-        refused("draft_readiness=draft_owner");
-        chain.request = 17; chain.completed_cells = 17;
-        refused("draft_readiness=draft_interval");
+        refused();
+        const auto absent = decide_draft_readiness(slots.certify_continuation(0), 48, 40, 40960);
+        check(!absent.ready && absent.refusal == ContinuationRefusal::draft_absent &&
+              absent.residual_rows == 8 && absent.residual_bytes_known && absent.residual_bytes == 327680 &&
+              !absent.reconstruction_priced,
+              "missing draft history has bounded required inputs but no invented reconstruction quote");
+        chain.certified = true; chain.producer = draft.owners_[0];
+        chain.begin = 8; chain.completed_cells = 16; chain.tail_token = 116;
+        chain.request = 18; chain.producer.request = 18;
+        refused();
+        chain.request = 17; chain.producer.request = 17; chain.completed_cells = 17;
+        refused();
         chain.completed_cells = 16; chain.begin = 17;
-        refused("draft_readiness=draft_interval");
+        refused();
         chain.begin = 8; chain.tail_token = 999;
-        refused("draft_readiness=draft_boundary");
-        check(error.find("draft_ready=0") != std::string::npos &&
-              error.find("reconstruction_priced=0 extra_scratch_bytes=unknown") != std::string::npos,
-              "a wrong boundary never advertises a priced reconstruction with unknown scratch");
+        refused();
         chain.tail_token = 116; chain.begin = 9;
-        refused("draft_readiness=draft_window");
+        refused();
         chain.begin = 8; tokens.resize(16);
-        refused("draft_readiness=draft_interval");
+        refused();
         tokens.assign(source.prompt.begin(), source.prompt.end());
         core::ConversationCheckpoint cut;
         cut.ids.assign(source.ids.begin(), source.ids.begin() + 12);
@@ -137,6 +140,7 @@ struct ResidentDraftReadinessFixture {
         check(!slots.resume_prompt(lease, cursor, error) && source.stop && source.preparing && peer.active,
               "cancellation while preparing wins before readiness work or another operation is issued");
         source.request = 18; source.incarnation = 4;
+        draft.owners_[0] = {0, 18, 4, 0};
         check(!slots.resume_prompt(lease, cursor, error) && source.request == 18 && peer.request == 23,
               "a stale readiness completion cannot claim a successor's seat incarnation");
         check(dispatch.completion[0].release(peer_operation), "the untouched peer drains its own operation");

@@ -28,7 +28,8 @@ PlanDecision streaming_capability(const ExecutionPlan& resolved, const plan::Adm
     if (resolved.admission.support != Support::off || resolved.suspension_mode != Suspension::none ||
         resolved.suspension.support != Support::off || resolved.concurrent_reader.support != Support::off ||
         resolved.budget.support != Support::off || (resolved.proposal != ProposalShape::none &&
-        resolved.proposal != ProposalShape::serial_single_draft))
+        resolved.proposal != ProposalShape::serial_single_draft &&
+        resolved.proposal != ProposalShape::serial_block_draft))
         return refuse("serial working owner excludes native seats, suspension, concurrent readers and batched work");
     if (selection.source == StreamingSource::unresolved || !selection.source_ready || selection.source_retired)
         return refuse("streaming requires an explicitly resolved ready, nonretired expert source");

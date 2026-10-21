@@ -2,10 +2,12 @@
 // The row layout of a batch window (Verifier::stage_batch), as pure logic so a CPU test can pin it down.
 //
 // A batch window carries S rows, each a token of one slot.  A slot owns one row (plain --batch) or a contiguous group
-// of rows at consecutive positions (--batch-mtp: the slot's current token and its MTP proposal; a layer split's every
-// stage sees the same layout).  The rows travel between the stages of a layer split in hand-off buffers of
+// of rows at consecutive positions (--batch-mtp: the slot's current token and proposals; a native DFlash2 decode
+// window has at most two owners of up to four rows each; a layer split's every stage sees the same layout).
+// The rows travel between the stages of a layer split in hand-off buffers of
 // `handoff_rows` rows, the window's group starting at row `hbase`.
 
+#include <array>
 #include <cstdint>
 
 namespace strata::core {
@@ -26,6 +28,42 @@ inline const char* batch_rows_error(const int* rows, int S, const int64_t* pos, 
     }
     return nullptr;
 }
+
+/// The exact window/commit graph-cache key, shared with Verifier and its CPU capacity proof.
+/// `rows` and S must already describe a validated window of at most eight rows. The residency variant bit is
+/// stored unchanged: Verifier passes ar_off_, so true selects its doorbell graph rather than the all-resident one.
+using VerifyBatchKey = std::array<int, 11>;
+inline constexpr VerifyBatchKey verify_batch_graph_key(const int* rows, int S, int hbase, bool has_residency) {
+    VerifyBatchKey key{};
+    key[0] = hbase;
+    key[1] = S;
+    key[2] = has_residency ? 1 : 0;
+    for (int t = 0; t < S; ++t) key[3 + t] = rows[t];
+    return key;
+}
+
+/// Native DFlash2's priced production families, without restricting the general row validator:
+/// decode has at most two contiguous owners of depth 1..4; retained known-input target reads have
+/// one owner of depth 1..8; final prompts have at most four distinct one-row owners, in any order.
+/// Positions and handoff extents remain batch_rows_error's responsibility.
+inline constexpr bool dflash2_batch_rows_supported(const int* rows, int S) {
+    if (!rows || S < 1 || S > 8) return false;
+    unsigned seen = 0;
+    int owners = 0;
+    bool depth_one = true, depth_at_most_four = true;
+    for (int t = 0; t < S;) {
+        const int owner = rows[t];
+        if (owner < 0 || owner >= 4 || (seen & (1u << owner))) return false;
+        seen |= 1u << owner;
+        ++owners;
+        const int first = t++;
+        while (t < S && rows[t] == owner) ++t;
+        depth_one = depth_one && t - first == 1;
+        depth_at_most_four = depth_at_most_four && t - first <= 4;
+    }
+    return owners == 1 || (owners <= 2 && depth_at_most_four) || depth_one;
+}
+
 /// A slot's entire verified row range is invalid when any of its logits were nonfinite,
 /// including a rejected draft row. Masks are local to the verifier owner, not handoff offsets.
 inline bool batch_rows_nonfinite(uint32_t mask, int first, int count) {

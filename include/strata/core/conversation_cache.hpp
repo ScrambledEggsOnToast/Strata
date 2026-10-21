@@ -5,6 +5,7 @@
 #include "strata/core/conversation_buffer.hpp"
 #include "strata/core/checkpoint_bytes.hpp"
 #include "strata/core/conversation_cache_trace.hpp"
+#include "strata/core/draft_state.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -294,7 +295,7 @@ struct SavedConversation {
     // Incremental inline metadata charge for this certification extension.
     // Embedded stage objects already pay it through their directory capacity.
     static constexpr size_t draft_metadata_bytes =
-        sizeof(int64_t) * 2 + sizeof(int32_t) + sizeof(ConversationBuffer);
+        sizeof(int64_t) * 3 + sizeof(int32_t) + sizeof(ConversationBuffer) + sizeof(DraftIdentity);
     // RAM-only namespace; session files keep their existing model/config schema.
     ConversationScope scope;
     // Transient sole publication owner; never serialized or propagated to an alias.
@@ -309,6 +310,8 @@ struct SavedConversation {
     bool cvec = true;
     // Certified populated draft interval, not the rounded allocation extent.
     // Unknown coverage must refuse direct source reuse before any destination write.
+    DraftIdentity draft_identity;
+    int64_t draft_origin = -1;
     int64_t draft_begin = -1, draft_cells = -1;
     // The token consumed with the last retained main residual when draft_cells == live length.
     int32_t draft_next_token = -1;
@@ -349,6 +352,7 @@ struct SavedConversation {
         out.cvec = cvec;
         out.draft_begin = draft_begin; out.draft_cells = draft_cells;
         out.draft_next_token = draft_next_token;
+        out.draft_identity = draft_identity; out.draft_origin = draft_origin;
         out.draft_boundary_residual = draft_boundary_residual.frozen_alias();
         out.stage_images.reserve(stage_images.size());
         for (const auto& stage : stage_images) out.stage_images.push_back(stage.frozen_alias());

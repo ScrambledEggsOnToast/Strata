@@ -8,6 +8,7 @@
 #include "strata/core/graph.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/progress.hpp"
+#include "conversation_store_sha256.hpp"
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -135,228 +136,6 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 }
 
 }  // namespace
-MtpDrafter::Operation::Operation(MtpDrafter& owner, std::string& err, int slot, cudaStream_t external,
-                                int32_t token, int32_t position)
-    : owner_(owner), lease_(owner.scratch_), slot_(slot), external_(external) {
-    if (!lease_) {
-        err = lease_.failure() == OperationLease::Failure::timeout
-            ? "mtp: operation lease wait exceeded 2000 ms" : "mtp: operation scratch is poisoned by a failed operation";
-        return;
-    }
-    if (owner_.chain_live_) {
-        lease_.complete();
-        err = "mtp: a pipelined chain still owns operation scratch";
-        return;
-    }
-    if (owner_.async_owned_ && !owner_.idle_owned(err)) return;
-    acquired_ = true;
-    owner_.pending_writes_ = owner_.pending_boundary_ = false;
-    owner_.pending_slot_ = slot_;
-    owner_.canary_.begin(slot_, owner_.cs_, token, position);
-}
-
-MtpDrafter::Operation::~Operation() {
-    if (acquired_ && !finished_) {
-        const OnDevice on(owner_.device_);
-        for (cudaStream_t stream : {external_, owner_.cs_})
-            if (stream && cudaStreamSynchronize(stream) != cudaSuccess) std::terminate();
-        owner_.invalidate_coverage();
-    }
-    // Failed work remains poisoned: draining does not repair partially written request state.
-}
-
-bool MtpDrafter::Operation::finish(std::string& err) {
-    if (!acquired_) return false;
-    if (external_ && cudaStreamSynchronize(external_) != cudaSuccess) {
-        err = "mtp: external prefill stream failed"; return false;
-    }
-    owner_.canary_.check(slot_, owner_.cs_);
-    if (!owner_.idle_owned(err) || !owner_.canary_.validate("mtp", err)) return false;
-    owner_.complete_writes();
-    finished_ = true;
-    lease_.complete();
-    return true;
-}
-
-void MtpDrafter::Operation::writes(int64_t begin, int64_t end, int32_t token) {
-    if (!owner_.pending_writes_) {
-        if (slot_ == 8) owner_.pending_coverage_ = owner_.coverage_;
-        else {
-            const auto& source = owner_.slots_[(size_t) slot_];
-            owner_.pending_coverage_ = source.certified
-                ? ConversationDraftCoverage{source.begin, source.completed_cells, source.tail_token}
-                : ConversationDraftCoverage{};
-        }
-    }
-    owner_.pending_writes_ = true;
-    owner_.pending_coverage_.completed(begin, end, token);
-}
-
-bool MtpDrafter::Operation::boundary(const float* rows, int64_t begin, int64_t count, std::string& err) {
-    if (slot_ != 8 || owner_.boundary_capture_ < begin || owner_.boundary_capture_ - begin >= count) return true;
-    const size_t bytes = size_t(owner_.g_->hc * owner_.g_->n_embd) * sizeof(float);
-    owner_.boundary_position_ = -1;
-    owner_.boundary_owner_ = 0;
-    owner_.boundary_residual_.resize(bytes);
-    const auto* source = reinterpret_cast<const uint8_t*>(rows +
-        (owner_.boundary_capture_ - begin) * owner_.g_->hc * owner_.g_->n_embd);
-    if (!owner_.boundary_residual_.visit(0, bytes, [&](uint8_t* dst, size_t n, size_t at) {
-            return cudaMemcpyAsync(dst, source + at, n, cudaMemcpyDeviceToHost,
-                                   external_ ? external_ : owner_.cs_) == cudaSuccess;
-        })) { err = "mtp: boundary residual capture failed"; return false; }
-    owner_.pending_boundary_ = true;
-    return true;
-}
-
-void MtpDrafter::invalidate_coverage() {
-    coverage_.clear();
-    coverage_owner_ = 0;
-    for (auto& slot : slots_) { slot.certified = false; slot.begin = -1; slot.tail_token = -1; }
-    pending_writes_ = pending_boundary_ = false;
-    boundary_position_ = -1; boundary_owner_ = 0;
-    boundary_residual_ = {};
-}
-
-void MtpDrafter::complete_writes() {
-    if (pending_writes_) {
-        if (pending_slot_ == 8) { coverage_ = pending_coverage_; coverage_owner_ = working_request_; }
-        else {
-            auto& target = slots_[(size_t) pending_slot_];
-            target.begin = pending_coverage_.begin; target.cells = pending_coverage_.cells;
-            target.completed_cells = pending_coverage_.cells;
-            target.tail_token = pending_coverage_.next_token; target.certified = pending_coverage_.known();
-        }
-    }
-    if (pending_boundary_) {
-        boundary_residual_.freeze();
-        boundary_position_ = boundary_capture_; boundary_owner_ = working_request_;
-    }
-    pending_writes_ = pending_boundary_ = false;
-}
-
-void MtpDrafter::set_boundary_capture(int64_t position) {
-    boundary_capture_ = position; boundary_position_ = -1; boundary_owner_ = 0;
-    boundary_residual_ = {};
-}
-
-bool MtpDrafter::capture_boundary(const float* residual, int64_t position, uint64_t request, std::string& err) {
-    if (!residual || !request || request != working_request_ || coverage_owner_ != working_request_ ||
-        !coverage_.known() || position < coverage_.begin || coverage_.cells != position) {
-        err = "mtp: boundary residual owner/position mismatch"; return false;
-    }
-    const OnDevice on(device_);
-    Operation operation(*this, err);
-    if (!operation) return false;
-    set_boundary_capture(position);
-    return operation.boundary(residual, position, 1, err) && operation.finish(err);
-}
-
-void MtpDrafter::certify_view(ConversationView& view, int slot) const {
-    const auto interval = slot == 8 ? coverage_ : slot_state(slot) && slots_[(size_t) slot].certified
-        ? ConversationDraftCoverage{slots_[(size_t) slot].begin, slots_[(size_t) slot].completed_cells,
-                                    slots_[(size_t) slot].tail_token} : ConversationDraftCoverage{};
-    view.draft_tokens = view.draft_begin = -1; view.draft_next_token = -1; view.draft_owner = 0;
-    view.draft_boundary_residual = nullptr; view.draft_boundary_position = -1; view.draft_boundary_owner = 0;
-    // The working coverage describes the request that wrote it: a later bind without its own completed writes
-    // leaves the previous request's interval unusable rather than advertising rows this view never recomputed.
-    // A resident slot's own certification is already keyed by its request.
-    if (!interval.known() || async_owned_ || (slot == 8 && coverage_owner_ != working_request_)) return;
-    view.draft_owner = slot == 8 ? coverage_owner_ : slot_state(slot) ? slots_[size_t(slot)].request : 0;
-    const int64_t live = int64_t(view.ids.size());
-    const int64_t end = view.exact_cut ? live - 1 : std::min(interval.cells, live);
-    if (end < interval.begin || end > interval.cells) return;
-    view.draft_begin = interval.begin; view.draft_tokens = end;
-    if (!view.exact_cut && end == live && interval.cells == live) view.draft_next_token = interval.next_token;
-    if (end == live && view.draft_next_token < 0) {
-        // A rounded speculative suffix is not a known private tail.
-        view.draft_tokens = view.draft_begin = -1; return;
-    }
-    if (slot == 8 && end == live - 1 && boundary_owner_ == coverage_owner_ && boundary_owner_ &&
-        boundary_position_ == live - 1 && !boundary_residual_.empty()) {
-        view.draft_boundary_residual = &boundary_residual_;
-        view.draft_boundary_position = boundary_position_; view.draft_boundary_owner = boundary_owner_;
-    }
-}
-
-void MtpDrafter::restored_snapshot(const SavedConversation& image, int64_t cells) {
-    // Called only after actual whole-image restoration succeeds.
-    coverage_ = {image.draft_begin, image.draft_cells, image.draft_next_token};
-    coverage_owner_ = working_request_;
-    if (!coverage_.known() || cells < 0) coverage_.clear();
-    else if (cells < coverage_.cells) {
-        coverage_.rewind(cells);
-        if (cells < int64_t(image.live.ids.size()) && cells > coverage_.begin)
-            coverage_.next_token = image.live.ids[size_t(cells)];
-    }
-    set_boundary_capture(-1);
-}
-
-bool MtpDrafter::idle(std::string& err) {
-    OperationLease::Guard lease(scratch_, std::try_to_lock);
-    if (!lease || chain_live_) { err = "mtp: operation scratch is in flight or poisoned"; if (lease) lease.complete(); return false; }
-    if (!idle_owned(err)) return false;
-    lease.complete();
-    return true;
-}
-
-bool MtpDrafter::idle_owned(std::string& err) {
-    const OnDevice on_device(device_);
-    if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) {
-        invalidate_coverage(); err = "mtp: its stream failed"; return false;
-    }
-    if (async_owned_ && !chain_live_) {
-        if (!canary_.validate("mtp", err)) { invalidate_coverage(); return false; }
-        complete_writes();
-        async_owned_ = false;
-    }
-    return true;
-}
-
-
-bool MtpDrafter::bind_request(int slot, uint64_t request, std::string& err) {
-    const OnDevice on(device_);
-    if (!g_) return true;
-    if (!request || (slot != 8 && !slot_state(slot))) {
-        err = "mtp: invalid request destination"; return false;
-    }
-    OperationLease::Guard lease(scratch_, std::try_to_lock);
-    if (!lease || async_owned_) {
-        if (lease) lease.complete();
-        err = "mtp: owner rebind while scratch is in flight or poisoned"; return false;
-    }
-    const bool ok = canary_.bind(slot, request, err);
-    if (ok) {
-        if (slot == 8 && working_request_ != request) {
-            working_request_ = request;
-        }
-        if (slot != 8) {
-            auto& target = slots_[(size_t) slot];
-            if (target.request != request) {
-                target.proposal = target.proposal_token = -1;
-                target.proposal_cell = -1;
-            }
-            target.request = request;
-        }
-        lease.complete();
-    }
-    return ok;
-}
-
-bool MtpDrafter::scratch_idle(std::string& err, bool wait) {
-    // try_lock_for(0) is a nonblocking lifecycle preflight. Resident commits
-    // wait for the prompt's bounded scratch pass, not for its separate K/V.
-    OperationLease::Guard lease(scratch_, wait ? OperationLease::wait_limit : std::chrono::milliseconds(0));
-    if (!lease || async_owned_) {
-        if (lease) lease.complete();
-        err = "mtp: operation scratch is in flight or poisoned"; return false;
-    }
-    lease.complete();
-    return true;
-}
-
-bool MtpDrafter::context_idle(std::string& err) {
-    return scratch_idle(err, false);
-}
 
 
 MtpDrafter::~MtpDrafter() {
@@ -388,7 +167,6 @@ MtpDrafter::~MtpDrafter() {
     if (h_cparams_) cudaFreeHost(h_cparams_);
     if (h_chist_) cudaFreeHost(h_chist_);
     if (h_q_) cudaFreeHost(h_q_);
-    if (cs_) cudaStreamDestroy(cs_);
     if (side_) cudaStreamDestroy(side_);
     if (sh_fork_) cudaEventDestroy(sh_fork_);
     if (sh_join_) cudaEventDestroy(sh_join_);
@@ -507,6 +285,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // Loader fix (0.1.15+loaderfix.2): the two reads below are the whole “drafter files” cost; reporting
     // them apart from the rest of the stage is what makes the next regression visible.
     const auto t_files = std::chrono::steady_clock::now();
+    conversation_store_detail::Sha256 weight_identity;
     // ---- the index and the dense weights
     {
         std::ifstream idx(rt_dir + "/dense.txt");
@@ -518,10 +297,12 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
             Tensor t;
             is >> t.name >> t.kind >> t.rows >> t.cols >> t.off >> t.bytes;
             if (!is) { err = "mtp: malformed dense.txt line: " + line; return false; }
+            weight_identity.update(line.data(), line.size());
             tensors_.push_back(t);
         }
         std::vector<uint8_t> blob;
         if (!read_file(rt_dir + "/dense.bin", blob)) { err = "mtp: cannot read dense.bin"; return false; }
+        weight_identity.update(blob.data(), blob.size());
         const cudaError_t alloc = cudaMalloc((void**) &dense_, blob.size());
         if (alloc != cudaSuccess) {
             size_t free_bytes = 0, total_bytes = 0;
@@ -554,11 +335,15 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         for (uint64_t off = 0; off < bytes;) {
             const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
             if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: experts.bin is truncated"; return false; }
+            weight_identity.update(chunk.data(), size_t(n));
             cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
             off += n;
         }
         vram_ += bytes;
     }
+    identity_.weights = weight_identity.digest();
+    identity_.geometry = {1, g.n_embd, g.n_head_kv, g.head_dim, window, max_t,
+                          ss.max_cells, int64_t(qsa_kv_format(st_))};
     const char* required[] = {"fc_embedding.weight", "fc_hidden.weight", "self_attn.q_proj.weight", "self_attn.k_proj.weight",
                               "self_attn.v_proj.weight", "self_attn.o_proj.weight", "mlp.shared_expert.gate_proj.weight",
                               "mlp.shared_expert.up_proj.weight", "mlp.shared_expert.down_proj.weight"};
@@ -850,7 +635,9 @@ bool MtpDrafter::setup_coupled(std::string& err) {
 void MtpDrafter::set_draft_sampling(const strata::kernels::SamplerParams& sp) {
     const OnDevice on_device(device_);
     std::string err;
-    Operation operation(*this, err);
+    // Sampler policy preserves numerical storage and its producer certificate.
+    // The full lease/drain still fences these mapped inputs against live graphs.
+    Operation operation(*this, err, 8, nullptr, 0, 0, nullptr, nullptr, true);
     if (!operation) std::terminate();
     coupled_active_ = coupled_ok_ && !sp.greedy && sp.temperature > 0.0f && sp.temperature >= spec_min_temp();
     if (!coupled_active_) { if (!operation.finish(err)) std::terminate(); return; }
@@ -862,7 +649,8 @@ void MtpDrafter::set_draft_sampling(const strata::kernels::SamplerParams& sp) {
 void MtpDrafter::set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next) {
     const OnDevice on_device(device_);
     std::string err;
-    Operation operation(*this, err);
+    // Host history is not a numerical KV write, but cannot race its consumer.
+    Operation operation(*this, err, 8, nullptr, 0, 0, nullptr, nullptr, true);
     if (!operation) std::terminate();
     if (!coupled_active_) { if (!operation.finish(err)) std::terminate(); return; }
     const int h = coupled_hist_len(h_cparams_->penalty_last_n, kCoupledHistCap);
@@ -983,9 +771,30 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         }
     }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
+    refresh_configuration_identity();
+    identity_.borrowed_target = {}; identity_.load_generation = 0;
+    if (head && !head->identity().sha256.empty()) {
+        conversation_store_detail::Sha256 target;
+        target.update(head->identity().sha256.data(), head->identity().sha256.size());
+        if (const auto* embedding = native_embed(); embedding && !embedding->identity().sha256.empty())
+            target.update(embedding->identity().sha256.data(), embedding->identity().sha256.size());
+        identity_.borrowed_target = target.digest();
+        identity_.load_generation = head->identity().generation;
+    }
     if (!prepare_slots(err)) return false;
     const char* probe = std::getenv("STRATA_MTP_CANARY_PROBE");
     return !probe || probe[0] != '1' || check_input_graphs(err);
+}
+void MtpDrafter::refresh_configuration_identity() {
+    if (!identity_.bound()) return;
+    conversation_store_detail::Sha256 configuration;
+    const std::array<int64_t, 9> settings{int64_t(hnorm_stream_), int64_t(dense4_ != nullptr),
+        dhead_type_, window_, int64_t(catchup_all()), int64_t(rr_res_ != nullptr), rr_lo_, rr_hi_, max_t_};
+    configuration.update(settings.data(), sizeof(settings));
+    configuration.update(&rr_margin_, sizeof(rr_margin_));
+    configuration.update(dvocab_host_.data(), dvocab_host_.size() * sizeof(int32_t));
+    identity_.configuration = configuration.digest();
+    identity_.geometry[7] = int64_t(qsa_kv_format(st_));
 }
 
 // STRATA_MTP_PROFILE=1 (measurement only): GPU stamps between the draft layer's stages in the round graph and in every
@@ -1550,7 +1359,8 @@ bool MtpDrafter::prepare_slots(std::string& err) {
         canary_.check((int) i, cs_, tok_, pos_);
         bool ok = record_forward(1, batch_drafting_ ? 0 : -1, cs_, err, &slot.state);
         if (ok && batch_drafting_)
-            ok = cudaMemcpyAsync(m_out_, out_ids_, sizeof(int32_t), cudaMemcpyDeviceToDevice, cs_) == cudaSuccess;
+            ok = cudaMemcpyAsync(m_out_, out_ids_, sizeof(int32_t), cudaMemcpyDeviceToDevice, cs_) == cudaSuccess &&
+                 cudaMemcpyAsync(m_prob_, probs_, sizeof(float), cudaMemcpyDeviceToDevice, cs_) == cudaSuccess;
         if (ok) canary_.check((int) i, cs_, tok_, pos_);
         if (!finish_capture(probe, cs_, ok, slot.advance, "resident slot", err)) return false;
     }
@@ -1566,44 +1376,105 @@ int64_t MtpDrafter::first_needed(int slot) const {
     return window_ > 0 && length > 0 ? std::max<int64_t>(0, length - window_ - 64) : 0;
 }
 
-int64_t MtpDrafter::slot_cells(int slot) const {
-    return slot_state(slot) ? slots_[(size_t) slot].cells : -1;
+DraftSlotState* MtpDrafter::slot_metadata(int slot) {
+    return slot >= 0 && size_t(slot) < slots_.size() ? &slots_[size_t(slot)] : nullptr;
+}
+const DraftSlotState* MtpDrafter::slot_metadata(int slot) const {
+    return slot >= 0 && size_t(slot) < slots_.size() ? &slots_[size_t(slot)] : nullptr;
+}
+int64_t MtpDrafter::state_capacity(int slot) const {
+    const auto* state = legacy_state(slot);
+    return state ? state->max_cells : -1;
+}
+DraftAllocationPlan MtpDrafter::allocation_plan() const {
+    DraftAllocationPlan result;
+    result.device = device_; result.shared_device = vram_;
+    for (const auto& slot : slots_) result.shared_device -= slot.arena_bytes;
+    if (!slots_.empty()) result.owner_device = slots_.front().arena_bytes;
+    return result;
+}
+uint64_t MtpDrafter::copy_bytes(int slot, int64_t cells, bool direct, std::string& error) const {
+    const auto* state = slot_state(slot);
+    std::array<uint64_t, 5> parts{};
+    if (!g_ || !state || !conversation_kv_part_sizes(*state, *g_, cells, false, parts, error)) return UINT64_MAX;
+    uint64_t bytes = 0;
+    for (auto part : parts) {
+        if (part > (UINT64_MAX - bytes) / (direct ? 1 : 2)) return UINT64_MAX;
+        bytes += part * (direct ? 1 : 2);
+    }
+    return bytes;
+}
+bool MtpDrafter::propose_slot(int slot, const float* residual, int32_t anchor, int64_t cell,
+                             int32_t& token, std::string& error) {
+    DraftProposal proposal;
+    if (!NeuralDrafter::propose_slot(slot, residual, anchor, cell, proposal, error)) return false;
+    token = proposal.count == 1 ? proposal.tokens[0] : -1;
+    return proposal.count == 1;
+}
+bool MtpDrafter::snapshot_capture(SavedConversation& image, Operation& operation, std::string& error) {
+    const int slot = operation.identity().seat;
+    if (!operation || !operation.guard().holds(scratch_) || !owns(operation.identity())) {
+        error = "mtp: stale or foreign snapshot capture operation"; return false;
+    }
+    const auto coverage = slot_coverage(slot);
+    if (!coverage.present || coverage.certified_begin < 0 ||
+        coverage.certified_end < coverage.certified_begin || !identity_.bound()) {
+        error = "mtp: snapshot has no drained producer certificate/identity"; return false;
+    }
+    const int64_t live = int64_t(image.live.ids.size());
+    if (image.draft_cells < 0 || image.draft_cells > coverage.certified_end ||
+        image.draft_begin < coverage.certified_begin || image.draft_cells > live) {
+        error = "mtp: snapshot does not name its actual producer interval"; return false;
+    }
+    image.draft_identity = identity_; image.draft_origin = 0;
+    return true;
+}
+bool MtpDrafter::snapshot_preflight(const SavedConversation& image, int slot, int64_t cells,
+        ConversationSnapshotExpectation expectation, std::string& error) const {
+    if (!legacy_state(slot) || image.draft_identity.kind == DraftKind::dflash2 ||
+        (image.draft_identity.kind != DraftKind::none && !identity_.content_matches(image.draft_identity)) ||
+        (image.draft_identity.load_generation &&
+         image.draft_identity.load_generation != identity_.load_generation) ||
+        image.draft_begin < 0 || image.draft_cells < image.draft_begin || cells < image.draft_begin ||
+        cells > image.draft_cells + ((!image.draft_boundary_residual.empty() ||
+            (expectation == ConversationSnapshotExpectation::ordinary &&
+             cells == int64_t(image.live.ids.size()) && image.draft_cells == cells - 1)) ? 1 : 0) ||
+        (expectation == ConversationSnapshotExpectation::exact_cut &&
+         (image.draft_cells != int64_t(image.live.ids.size()) - 1 || image.draft_boundary_residual.empty()))) {
+        error = "mtp: absent/foreign producer certificate or invalid snapshot cut"; return false;
+    }
+    return true;
+}
+bool MtpDrafter::snapshot_restore(const SavedConversation& image, Operation& operation, int64_t cells,
+        int64_t prompt_length, int32_t next_token, ConversationSnapshotExpectation expectation,
+        std::string& error) {
+    const int slot = operation.identity().seat;
+    if (!operation || !operation.guard().holds(scratch_) || !owns(operation.identity()) || image.kv.empty() ||
+        image.draft_identity.kind == DraftKind::dflash2 ||
+        (image.draft_identity.kind != DraftKind::none && !identity_.content_matches(image.draft_identity))) {
+        error = "mtp: stale/foreign snapshot restore operation or identity"; return false;
+    }
+    const auto* state = legacy_state(slot);
+    const int64_t restored = std::min(cells, image.draft_cells);
+    const OnDevice on(device_);
+    if (!state || !conversation_kv_restore(image.kv.back(), *state, *g_, restored, false,
+            expectation, error, int64_t(image.live.ids.size()))) return false;
+    if (slot == 8 && !restore_ring(restored, error)) return false;
+    const int32_t witness = restored > image.draft_begin
+        ? (restored < int64_t(image.live.ids.size()) ? image.live.ids[size_t(restored)] : next_token) : -1;
+    operation.writes(image.draft_begin, restored, witness);
+    set_boundary_capture(-1);
+    if (restored != cells && !image.draft_boundary_residual.empty() &&
+        !catchup_owned(operation, slot, image.draft_boundary_residual, next_token, cells - 1, error)) return false;
+    if (slot == 8) prompt_len_ = prompt_length;
+    else {
+        auto& target = slots_[size_t(slot)];
+        target.prompt_len = prompt_length;
+        target.proposal = target.proposal_token = -1; target.proposal_cell = -1;
+    }
+    return true; // common caller drains and publishes target + draft together
 }
 
-int64_t MtpDrafter::slot_begin(int slot) const {
-    return slot_state(slot) && slots_[(size_t) slot].certified ? slots_[(size_t) slot].begin : -1;
-}
-
-int64_t MtpDrafter::slot_prompt_len(int slot) const {
-    return slot_state(slot) ? slots_[(size_t) slot].prompt_len : -1;
-}
-
-int32_t MtpDrafter::slot_next_token(int slot) const {
-    return slot_state(slot) ? slots_[(size_t) slot].tail_token : -1;
-}
-
-int64_t MtpDrafter::slot_resume_frontier(int slot, int64_t cells) const {
-    if (!slot_state(slot)) return cells;
-    const auto& target = slots_[(size_t) slot];
-    return target.certified && target.completed_cells >= 0 ? std::min(cells, target.completed_cells) : cells;
-}
-
-// Two questions share this predicate. Given a prompt length, the certified interval must reach the
-// oldest cell that prompt's retained window still holds: that is what makes reusing the chain safe.
-// Given only a frontier cell (propose at cells-1, advance at cells), the chain must merely contain
-// it. A chain that legally begins at a resumed position - a gap below `begin` starts a new interval,
-// never a union over missing cells (conversation_cache.hpp) - is a real certificate of its own rows,
-// and refusing it at its own frontier ended the engine on 2026-10-18.
-bool MtpDrafter::slot_covers(int slot, int64_t cells, int64_t prompt_length) const {
-    if (!slot_state(slot)) return false;
-    const auto& target = slots_[(size_t) slot];
-    if (cells < 0 || cells > target.completed_cells || prompt_length < 0 ||
-        prompt_length > target.state.max_cells || (prompt_length && cells >= prompt_length)) return false;
-    if (!target.request || !target.certified || target.begin < 0 || target.begin > cells) return false;
-    if (!prompt_length) return true;
-    const int64_t needed = window_ > 0 ? std::max<int64_t>(0, prompt_length - window_) : 0;
-    return target.begin <= std::min(cells, needed);
-}
 
 bool MtpDrafter::prepare_slot(int slot, uint64_t request, int64_t prompt_length,
                              int64_t cells, bool reset, std::string& err) {
@@ -1689,7 +1560,10 @@ bool MtpDrafter::prefill_slot(int slot, const float* residuals, const int32_t* n
 }
 
 bool MtpDrafter::save_slot(int slot, int64_t cells, std::string& err) {
-    if (!slot_state(slot) || !slots_[(size_t) slot].request || cells < 0 || cells > st_.max_cells) {
+    const auto destination_owner = owner(slot);
+    const auto source_owner = owner(8);
+    if (!slot_state(slot) || !destination_owner.request || destination_owner.request != working_request_ ||
+        slots_[(size_t) slot].request != destination_owner.request || cells < 0 || cells > st_.max_cells) {
         err = "mtp: invalid slot save"; return false;
     }
     const OnDevice on_device(device_);
@@ -1699,7 +1573,7 @@ bool MtpDrafter::save_slot(int slot, int64_t cells, std::string& err) {
         return v != nullptr && std::strcmp(v, "0") != 0; // cached: unset/=0 off
     }();
     const auto start = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    Operation operation(*this, err);
+    Operation operation(*this, err, slot, nullptr, 0, int32_t(cells), &destination_owner, &source_owner);
     if (!operation) return false;
     if (!idle_owned(err)) return false;
     const QsaState& target = slots_[(size_t) slot].state;
@@ -1710,14 +1584,15 @@ bool MtpDrafter::save_slot(int slot, int64_t cells, std::string& err) {
         if (!conversation_kv_save(image, st_, *g_, cells, false, err) ||
             !conversation_kv_restore(image, target, *g_, cells, false, err)) return false;
     }
+    const int64_t completed = coverage_.known() ? std::min(cells, coverage_.cells) : -1;
+    if (completed >= coverage_.begin && coverage_.known())
+        operation.writes(coverage_.begin, completed, completed == coverage_.cells ? coverage_.next_token : -1);
+    else invalidate_slot_coverage(slot);
     const bool ok = operation.finish(err);
     if (ok) {
         auto& target = slots_[(size_t) slot];
         target.cells = cells;
-        target.completed_cells = coverage_.known() ? std::min(cells, coverage_.cells) : -1;
-        target.begin = coverage_.known() ? std::min(target.completed_cells, coverage_.begin) : -1;
-        target.certified = target.begin >= 0;
-        target.tail_token = target.certified && target.completed_cells == coverage_.cells ? coverage_.next_token : -1;
+        target.producer = target.certified ? operation.identity() : DraftOwner{};
         target.prompt_len = prompt_len_;
         target.proposal = target.proposal_token = -1;
         target.proposal_cell = -1;
@@ -1731,6 +1606,8 @@ bool MtpDrafter::save_slot(int slot, int64_t cells, std::string& err) {
 }
 
 bool MtpDrafter::restore_slot(int slot, int64_t cells, std::string& err) {
+    const auto source_owner = owner(slot);
+    const auto destination_owner = owner(8);
     if (!slot_state(slot) || !slots_[(size_t) slot].request || cells < slots_[(size_t) slot].begin ||
         cells < 0 || cells > slots_[(size_t) slot].cells) {
         err = "mtp: invalid slot resume extent"; return false;
@@ -1738,7 +1615,7 @@ bool MtpDrafter::restore_slot(int slot, int64_t cells, std::string& err) {
     const OnDevice on_device(device_);
     admission_copy::Scope observed("draft_resume", slot, device_, cells);
     if (!idle(err)) return false;
-    Operation operation(*this, err);
+    Operation operation(*this, err, 8, nullptr, 0, int32_t(cells), &destination_owner, &source_owner);
     if (!operation) return false;
     if (resident_direct_copy_enabled()) {
         if (!conversation_kv_copy(slots_[(size_t) slot].state, st_, *g_, cells, false, err)) return false;
@@ -1748,30 +1625,27 @@ bool MtpDrafter::restore_slot(int slot, int64_t cells, std::string& err) {
             !conversation_kv_restore(image, st_, *g_, cells, false, err)) return false;
     }
     if (!restore_ring(cells, err)) return false;
+    const auto& source = slots_[(size_t) slot];
+    if (source.certified)
+        operation.writes(source.begin, std::min(cells, source.completed_cells),
+                         cells == source.completed_cells ? source.tail_token : -1);
+    else invalidate_slot_coverage(8);
+    set_boundary_capture(-1);
     const bool ok = operation.finish(err);
     if (ok) observed.complete();
-    if (ok) {
-        const auto& source = slots_[(size_t) slot];
-        const int64_t completed = std::min(cells, source.completed_cells);
-        coverage_ = source.certified ? ConversationDraftCoverage{std::min(completed, source.begin), completed,
-            completed == source.completed_cells ? source.tail_token : -1} : ConversationDraftCoverage{};
-        set_boundary_capture(-1);
-        coverage_owner_ = working_request_;
-    }
     return ok;
 }
 
-bool MtpDrafter::catchup_slot(int slot, const ConversationBuffer& residual, int32_t next_token,
-                             int64_t cell, std::string& err) {
+bool MtpDrafter::catchup_owned(Operation& operation, int slot, const ConversationBuffer& residual,
+                              int32_t next_token, int64_t cell, std::string& err) {
     const size_t bytes = g_ ? size_t(g_->hc * g_->n_embd) * sizeof(float) : 0;
-    if (!bytes || residual.size() != bytes || !slot_state(slot) || !slot_covers(slot, cell) ||
-        cell != slots_[size_t(slot)].cells || cell >= slots_[size_t(slot)].state.max_cells ||
-        next_token < 0 || next_token >= n_vocab_) {
-        err = "mtp: invalid one-cell boundary catchup"; return false;
+    const auto* state = legacy_state(slot);
+    if (!operation || !operation.guard().holds(scratch_) || !owns(operation.identity()) ||
+        operation.identity().seat != slot || !bytes || residual.size() != bytes || !state ||
+        cell < 0 || cell >= state->max_cells || next_token < 0 || next_token >= n_vocab_) {
+        err = "mtp: invalid owned one-cell boundary catchup"; return false;
     }
     const OnDevice on(device_);
-    Operation operation(*this, err, slot, nullptr, next_token, int32_t(cell));
-    if (!operation) return false;
     h_tok_[0] = next_token;
     h_step_[0] = int32_t(cell); h_step_[1] = int32_t(cell + 1);
     h_step_[2] = int32_t((cell + 1) / 4); h_step_[3] = int32_t(cell + 1);
@@ -1784,14 +1658,15 @@ bool MtpDrafter::catchup_slot(int slot, const ConversationBuffer& residual, int3
     if (!residual.visit(0, bytes, [&](const uint8_t* source, size_t n, size_t at) {
             return cudaMemcpyAsync(reinterpret_cast<uint8_t*>(Rin_) + at, source, n,
                                    cudaMemcpyHostToDevice, cs_) == cudaSuccess;
-        }) || !record_front(1, 0, cs_, err, slot_state(slot))) {
+        }) || !record_front(1, 0, cs_, err, legacy_state(slot))) {
         if (err.empty()) err = "mtp: boundary catchup transfer failed";
         return false;
     }
     operation.writes(cell, cell + 1, next_token);
-    if (!operation.finish(err)) return false;
-    auto& target = slots_[size_t(slot)];
-    target.proposal = target.proposal_token = -1; target.proposal_cell = -1;
+    if (slot != 8) {
+        auto& target = slots_[size_t(slot)];
+        target.proposal = target.proposal_token = -1; target.proposal_cell = -1;
+    }
     return true;
 }
 
@@ -1818,8 +1693,9 @@ bool MtpDrafter::advance_slot(int slot, const float* residual, int32_t next_toke
         if (err.empty()) err = "mtp: resident slot advance failed";
         return false;
     }
-    if (batch_drafting_ && (h_out_[0] < 0 || h_out_[0] >= n_vocab_)) {
-        err = "mtp: resident graph returned an invalid proposal"; return false;
+    if (batch_drafting_ && (h_out_[0] < 0 || h_out_[0] >= n_vocab_ ||
+        !std::isfinite(h_prob_[0]) || h_prob_[0] < 0 || h_prob_[0] > 1)) {
+        err = "mtp: resident graph returned an invalid proposal/confidence"; return false;
     }
     operation.writes(cell, cell + 1, next_token);
     if (!operation.finish(err)) return false;
@@ -1829,11 +1705,12 @@ bool MtpDrafter::advance_slot(int slot, const float* residual, int32_t next_toke
     target.proposal = batch_drafting_ ? h_out_[0] : -1;
     target.proposal_cell = batch_drafting_ ? cell : -1;
     target.proposal_token = batch_drafting_ ? next_token : -1;
+    target.proposal_confidence = batch_drafting_ ? h_prob_[0] : 0;
     return true;
 }
 
-bool MtpDrafter::propose_slot(int slot, const float* residual, int32_t next_token, int64_t cell,
-                              int32_t& proposal, std::string& err) {
+bool MtpDrafter::proposal_preflight(int slot, const float* residual, int32_t next_token, int64_t cell,
+                                   std::string& err) const {
     if (!batch_drafting_ || !slot_state(slot) || !slots_[(size_t) slot].advance || !residual ||
         next_token < 0 || next_token >= n_vocab_ ||
         cell < 0 || cell != slots_[(size_t) slot].cells - 1 ||
@@ -1860,17 +1737,20 @@ bool MtpDrafter::propose_slot(int slot, const float* residual, int32_t next_toke
             (long long) (target ? target->prompt_len : -1), (long long) window_);
         err = detail; return false;
     }
-    if (!scratch_idle(err, true)) return false;
+    return true;
+}
+bool MtpDrafter::propose_impl(Operation& operation, const float* residual, int32_t next_token, int64_t cell,
+                             DraftProposal& result, std::string& err) {
+    const int slot = operation.identity().seat;
     auto& target = slots_[(size_t) slot];
     if (target.proposal >= 0 && target.proposal < n_vocab_ &&
         target.proposal_cell == cell && target.proposal_token == next_token) {
-        proposal = target.proposal; return true;
+        result.count = 1; result.tokens[0] = target.proposal;
+        result.confidence[0] = target.proposal_confidence; return true;
     }
     target.proposal = target.proposal_token = -1;
     target.proposal_cell = -1;
     const OnDevice on_device(device_);
-    Operation operation(*this, err, slot, nullptr, next_token, (int32_t) cell);
-    if (!operation) return false;
     h_tok_[0] = next_token;
     h_step_[0] = (int32_t) cell; h_step_[1] = (int32_t) (cell + 1);
     h_step_[2] = (int32_t) ((cell + 1) / 4); h_step_[3] = (int32_t) (cell + 1);
@@ -1881,14 +1761,14 @@ bool MtpDrafter::propose_slot(int slot, const float* residual, int32_t next_toke
         if (err.empty()) err = "mtp: resident proposal failed";
         return false;
     }
-    if (h_out_[0] < 0 || h_out_[0] >= n_vocab_) {
-        err = "mtp: resident graph returned an invalid proposal"; return false;
+    if (h_out_[0] < 0 || h_out_[0] >= n_vocab_ || !std::isfinite(h_prob_[0]) ||
+        h_prob_[0] < 0 || h_prob_[0] > 1) {
+        err = "mtp: resident graph returned an invalid proposal/confidence"; return false;
     }
     operation.writes(cell, cell + 1, next_token);
-    if (!operation.finish(err)) return false;
-    proposal = h_out_[0];
+    result.count = 1; result.tokens[0] = h_out_[0]; result.confidence[0] = h_prob_[0];
     target.tail_token = next_token;
-    target.proposal = proposal;
+    target.proposal = h_out_[0]; target.proposal_confidence = h_prob_[0];
     target.proposal_cell = cell;
     target.proposal_token = next_token;
     return true;

@@ -5,10 +5,14 @@
 // ran, until `STRATA_SPLIT_MTP_BATCH=1` (opt-in) lets the last stage's prompt path try E-9 as well.  The
 // drafter's K/V then come from Q8_1 x Q8_0 MMQ instead of its own mmvq, so its drafts can differ a little; the
 // target's tokens are decided by the verify window and do not.
+// Shared MTP cuts also need a prompt horizon independent of the request's private suffix.
 //
 // Pure (no GPU, no environment read): generate.cpp passes in what it knows.
 #pragma once
 
+#include "strata/core/draft_state.hpp"
+
+#include <cstdint>
 #include <cstdlib>
 
 namespace strata::program::draft_kv {
@@ -39,6 +43,24 @@ inline Plan plan(bool use_mtp, bool multi_gpu, bool split_env, bool has_native_e
     }
     p.try_batched = true;
     return p;
+}
+
+struct PromptHorizon {
+    int64_t read_from;          ///< effective start, including a diagnostic reread from zero
+    int64_t prompt_len;         ///< metadata used by the drafter's prompt-row pruning
+    int64_t boundary_capture;   ///< immutable MTP R row, or -1 when no capture is needed
+};
+
+/// A shared MTP cut must retain rows without regard to a later private suffix. Its horizon
+/// is pin+1 whenever this read crosses the pin; only a certified store needs the pin-1 R row.
+/// DFlash keeps full-prompt metadata and has separate feature certification, not an MTP R boundary.
+constexpr PromptHorizon prompt_horizon(core::DraftKind kind, int64_t prompt_len, int64_t resume,
+                                      int64_t reread_to, bool shared_scope, int64_t pin,
+                                      bool certified_store) {
+    const int64_t read_from = reread_to > 0 ? 0 : resume;
+    const bool shared_mtp_cut = kind == core::DraftKind::mtp && shared_scope && read_from < pin;
+    return {read_from, shared_mtp_cut ? pin + 1 : prompt_len,
+            shared_mtp_cut && certified_store ? pin - 1 : -1};
 }
 
 }  // namespace strata::program::draft_kv

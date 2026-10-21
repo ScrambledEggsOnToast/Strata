@@ -35,7 +35,7 @@ struct Files {
          std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     d::DailyTargetFiles files;
     c::NativeTensorIdentity embedding, head;
-    Files() {
+    explicit Files(const std::string& expert_roles = "shard0.gguf,shard1.gguf,shard0.gguf") {
         fs::create_directories(root / "pack"); fs::create_directories(root / "tokenizer");
         files.profile_name = d::daily_profile;
         files.pack_path = (root / "pack").string(); files.tokenizer_path = (root / "tokenizer").string();
@@ -46,7 +46,7 @@ struct Files {
         }
         std::string expert_index;
         for (int layer = 0; layer < 48; ++layer)
-            expert_index += std::to_string(layer) + " 8 8 0 1 0 0 0 shard0.gguf,shard1.gguf,shard0.gguf\n";
+            expert_index += std::to_string(layer) + " 8 8 0 1 0 0 0 " + expert_roles + "\n";
         for (const char* name : {"index.txt", "conversions.json", "native_experts.txt", "dense.bin"}) {
             const std::string data = std::string(name) == "native_experts.txt" ? expert_index : "fixture " + std::string(name);
             file(root / "pack" / name, data); files.pack_sha256[name] = hash(data);
@@ -180,6 +180,20 @@ void artifact_tests() {
           verified.binding().identity.embedding_sha256 == fixture.embedding.sha256 &&
           verified.binding().identity.head_sha256 == fixture.head.sha256,
           "verified target binding identity/geometry");
+    {
+        Files split(",shard1.gguf,");
+        const auto split_target = split.verify();
+        const auto& binding = split_target.binding();
+        check(binding.identity.embedding_sha256 == split.embedding.sha256 &&
+              binding.identity.head_sha256 == split.head.sha256,
+              "empty v4 expert roles retain the verified primary shard across a split layer");
+    }
+    for (const std::string roles : {",shard1.gguf", ",shard1.gguf,,", "../shard0.gguf,,",
+                                    ",foreign.gguf,"}) {
+        Files changed(roles);
+        file(changed.root / "foreign.gguf", "unverified expert source");
+        refuses([&] { changed.verify(); });
+    }
     for (int scenario = 0; scenario < 18; ++scenario) {
         Files changed;
         c::ModelGeometry geometry;

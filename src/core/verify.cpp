@@ -1266,6 +1266,38 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
     sampling_.logit_bias = bias.empty() ? nullptr : logit_bias_device_;
     return true;
 }
+bool Verifier::reserve_spec_q(std::string& err) {
+    if (!g_ || !max_t_) { err = "verify: sparse q reserve requires initialized ownership"; return false; }
+    if (next_) return next_->reserve_spec_q(err);
+    const OnDevice on_device(device_);
+    if (d_spec_) return true;
+    if (cudaMalloc((void**) &d_spec_, planned_spec_q_bytes()) != cudaSuccess) {
+        err = "verify: cannot reserve conditional-q transport"; return false;
+    }
+    return true;
+}
+
+bool Verifier::set_batch_spec_q(const int32_t* q, const int32_t* drafts, int rows,
+                               bool required, std::string& err) {
+    if (b_running_ || rows < 0 || rows > kernels::kVerifyMaxT ||
+        (rows && (!q || !drafts)) || (required && !rows)) {
+        err = "verify: invalid or busy packed conditional-q frame"; return false;
+    }
+    if (rows) {
+        if (!g_ || n_vocab_ <= 0) { err = "verify: conditional q before initialization"; return false; }
+        for (int t = 0; t < rows; ++t)
+            if (drafts[t] >= 0 && !validate_spec_q_row(q + size_t(t) * kSpecQStride, drafts[t], n_vocab_, err))
+                return false;
+        if (required && !next_ && !d_spec_) {
+            err = "verify: required conditional-q storage was not reserved"; return false;
+        }
+    }
+    if (next_ && !next_->set_batch_spec_q(q, drafts, rows, required, err)) return false;
+    batch_spec_q_ = q; batch_spec_drafts_ = drafts;
+    batch_spec_rows_ = rows; batch_spec_required_ = required;
+    return true;
+}
+
 
 bool Verifier::enable_dflash2_capture(std::string& err) {
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_USE_SYCL) || defined(STRATA_GPU_METAL)
@@ -1310,6 +1342,158 @@ bool Verifier::release_dflash2_capture(dflash2::CaptureOwner owner, std::string&
     if (!dflash2_capture_.release(owner, err)) return false;
     *dflash2_on_h_ = 0;
     return true;
+}
+
+bool Verifier::arm_dflash2_batch(std::span<const dflash2::BatchCaptureRow> rows, std::string& err) {
+    if (!dflash2_enabled_ || !dflash2_on_h_ || slots_.empty() || rows.empty() ||
+        rows.size() > size_t(max_t_) || !context_idle(err)) {
+        if (err.empty()) err = "dflash2 capture: initialized idle resident verifier and bounded rows required";
+        return false;
+    }
+    auto seats = dflash2_seats_;
+    for (auto& seat : seats) { seat.first = -1; seat.count = 0; }
+    unsigned seen = 0;
+    for (size_t first = 0; first < rows.size();) {
+        const auto& row = rows[first];
+        const int slot = row.slot;
+        if (slot < 0 || slot >= int(slots_.size()) || (seen & (1u << slot)) ||
+            row.owner.request != slot_request_id_[slot] ||
+            row.owner.request != validated_slot_id_[slot] || !row.owner.incarnation ||
+            row.owner.incarnation != slot_incarnation_[slot] || !row.owner.generation) {
+            err = "dflash2 capture: stale, missing or discontiguous resident owner"; return false;
+        }
+        seen |= 1u << slot;
+        size_t end = first + 1;
+        while (end < rows.size() && rows[end].slot == slot) ++end;
+        if (end - first > size_t(dflash2_raw_rows_)) {
+            err = "dflash2 capture: an owner exceeds the admitted target-window staging"; return false;
+        }
+        if (row.position < 0 || row.position > dflash2::max_position - int64_t(end - first)) {
+            err = "dflash2 capture: resident positions exceed the absolute capture range"; return false;
+        }
+        for (size_t t = first; t < end; ++t)
+            if (rows[t].owner != row.owner || rows[t].position != row.position + int64_t(t - first) ||
+                rows[t].position < 0 || rows[t].position >= dflash2::max_position ||
+                rows[t].position >= slots_[size_t(slot)]->max_cells) {
+                err = "dflash2 capture: duplicate, stale or nonconsecutive resident positions"; return false;
+            }
+        auto& seat = seats[size_t(slot)];
+        if (row.owner.incarnation < seat.owner.incarnation ||
+            (row.owner.incarnation == seat.owner.incarnation && seat.owner.request &&
+             (row.owner.request != seat.owner.request || row.owner.generation <= seat.owner.generation))) {
+            err = "dflash2 capture: resident incarnation or generation did not advance"; return false;
+        }
+        if (!seat.state.arm(row.owner, row.position, row.position, int(end - first), err)) return false;
+        seat.owner = row.owner; seat.first = int(first); seat.count = int(end - first);
+        first = end;
+    }
+    // The complete descriptor was checked before changing any live capture,
+    // graph key, target state, or mapped payload.
+    dflash2_seats_ = seats;
+    std::copy(rows.begin(), rows.end(), dflash2_rows_.begin());
+    dflash2_batch_rows_ = int(rows.size());
+    dflash2_batch_phase_ = Dflash2BatchPhase::armed;
+    *dflash2_on_h_ = 0;
+    if (std::getenv("STRATA_STATE_HASH"))
+        for (float* host : dflash2_h_)
+            if (host) std::fill_n(host, rows.size() * dflash2::residual_width,
+                                 std::numeric_limits<float>::quiet_NaN());
+    return true;
+}
+
+bool Verifier::validate_dflash2_batch(const int* rows, int count, const int64_t* positions,
+                                     std::string& err) const {
+    if (!dflash2_enabled_) return true;
+    if (!dflash2_capture_.idle() ||
+        (dflash2_batch_phase_ != Dflash2BatchPhase::idle &&
+         (dflash2_batch_phase_ != Dflash2BatchPhase::armed || count != dflash2_batch_rows_))) {
+        err = "dflash2 capture: release every previous owner before another physical frame"; return false;
+    }
+    if (dflash2_batch_phase_ == Dflash2BatchPhase::armed) {
+        for (int t = 0; t < count; ++t) {
+            const auto& expected = dflash2_rows_[size_t(t)];
+            if (rows[t] != expected.slot || positions[t] != expected.position ||
+                expected.owner.request != slot_request_id_[rows[t]] ||
+                expected.owner.request != validated_slot_id_[rows[t]] ||
+                expected.owner.incarnation != slot_incarnation_[rows[t]]) {
+                err = "dflash2 capture: launched rows differ from the armed resident frame"; return false;
+            }
+        }
+    }
+    for (int64_t layer = 0; layer < g_->n_layers; ++layer)
+        if (strata::kernels::cvec().covers(layer)) {
+            err = "dflash2 capture: control-vector steering is unsupported"; return false;
+        }
+    return true;
+}
+
+bool Verifier::begin_dflash2_batch(std::string& err) {
+    if (!dflash2_enabled_) return true;
+    *dflash2_on_h_ = 0;
+    if (dflash2_batch_phase_ == Dflash2BatchPhase::idle) return true;
+    if (dflash2_batch_phase_ != Dflash2BatchPhase::armed) {
+        err = "dflash2 capture: resident frame was already launched"; return false;
+    }
+    for (auto& seat : dflash2_seats_)
+        if (seat.first >= 0 && !seat.state.begin_run(seat.owner.request,
+                dflash2_rows_[size_t(seat.first)].position, seat.count, err)) return false;
+    dflash2_batch_phase_ = Dflash2BatchPhase::running;
+    *dflash2_on_h_ = 1;
+    return true;
+}
+
+bool Verifier::finish_dflash2_batch(std::string& err) {
+    if (!dflash2_enabled_ || dflash2_batch_phase_ == Dflash2BatchPhase::idle) return true;
+    if (dflash2_batch_phase_ != Dflash2BatchPhase::running) {
+        err = "dflash2 capture: resident frame did not own a running target window"; return false;
+    }
+    for (auto& seat : dflash2_seats_)
+        if (seat.first >= 0 && !seat.state.finish_run(err)) return false;
+    dflash2_batch_phase_ = Dflash2BatchPhase::verified;
+    return true;
+}
+
+bool Verifier::dflash2_batch_tap(dflash2::CaptureOwner owner, int slot, int tap_layer,
+                                dflash2::TapView& out, std::string& err) const {
+    if (released_.load() || dflash2_batch_phase_ != Dflash2BatchPhase::ready ||
+        slot < 0 || slot >= int(slots_.size()) || owner.request != slot_request_id_[slot] ||
+        owner.incarnation != slot_incarnation_[slot] || dflash2_seats_[size_t(slot)].first < 0) {
+        err = "dflash2 capture: resident tap owner is stale, absent or not drained"; return false;
+    }
+    const auto& seat = dflash2_seats_[size_t(slot)];
+    for (size_t i = 0; i < dflash2::tap_layers.size(); ++i)
+        if (tap_layer == dflash2::tap_layers[i]) {
+            const float* host = dflash2_h_[i];
+            return seat.state.view(owner, int(i),
+                host ? host + size_t(seat.first) * dflash2::residual_width : nullptr, out, err);
+        }
+    err = "dflash2 capture: unknown tap layer"; return false;
+}
+
+bool Verifier::release_dflash2_batch(dflash2::CaptureOwner owner, int slot, std::string& err) {
+    if (released_.load() || dflash2_batch_phase_ != Dflash2BatchPhase::ready ||
+        scratch_.phase() != VerifyScratchOwnership::Phase::idle || slot < 0 || slot >= int(slots_.size()) ||
+        owner.request != slot_request_id_[slot] || owner.incarnation != slot_incarnation_[slot]) {
+        err = "dflash2 capture: resident release requires its live, drained owner"; return false;
+    }
+    auto& seat = dflash2_seats_[size_t(slot)];
+    if (seat.first < 0 || !seat.state.release(owner, err)) {
+        if (err.empty()) err = "dflash2 capture: resident owner was already released";
+        return false;
+    }
+    seat.first = -1; seat.count = 0;
+    for (const auto& other : dflash2_seats_) if (other.first >= 0) return true;
+    dflash2_batch_phase_ = Dflash2BatchPhase::idle;
+    dflash2_batch_rows_ = 0;
+    *dflash2_on_h_ = 0;
+    return true;
+}
+
+void Verifier::poison_dflash2_capture() {
+    dflash2_capture_.poison();
+    for (auto& seat : dflash2_seats_) seat.state.poison();
+    if (dflash2_batch_phase_ != Dflash2BatchPhase::idle)
+        dflash2_batch_phase_ = Dflash2BatchPhase::poisoned;
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
@@ -1378,8 +1562,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     if (dflash2_enabled_) {
-        if (!dflash2_capture_.configure(dflash2::CapturePhase::verify, dflash2::block_size, lb_, le_,
+        dflash2_raw_rows_ = std::max(max_t, dflash2::block_size);
+        if (!dflash2_capture_.configure(dflash2::CapturePhase::verify, dflash2_raw_rows_, lb_, le_,
                                         g.n_embd, g.hc, g.n_layers, err)) return false;
+        for (auto& seat : dflash2_seats_)
+            if (!seat.state.configure(dflash2::CapturePhase::verify, dflash2_raw_rows_, lb_, le_,
+                                      g.n_embd, g.hc, g.n_layers, err)) return false;
         for (int64_t layer = 0; layer < g.n_layers; ++layer)
             if (strata::kernels::cvec().covers(layer)) {
                 err = "dflash2 capture: control-vector steering is unsupported"; return false;
@@ -1388,16 +1576,22 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             err = "dflash2 capture: mapped replay flag allocation failed"; return false;
         }
         *dflash2_on_h_ = 0;
+        auto pages = [](size_t bytes) { return (bytes + 4095) / 4096 * 4096; };
+        dflash2_staging_bytes_ = pages(sizeof(uint32_t));
         for (size_t i = 0; i < dflash2_h_.size(); ++i)
-            if (dflash2_capture_.owns_tap(int(i)) &&
-                !mapped(dflash2::block_size * dflash2::residual_row_bytes,
-                        (void**) &dflash2_h_[i], (void**) &dflash2_m_[i])) {
-                err = "dflash2 capture: mapped verifier tap allocation failed"; return false;
+            if (dflash2_capture_.owns_tap(int(i))) {
+                const size_t bytes = size_t(dflash2_raw_rows_) * dflash2::residual_row_bytes;
+                if (!mapped(bytes, (void**) &dflash2_h_[i], (void**) &dflash2_m_[i])) {
+                    err = "dflash2 capture: mapped verifier tap allocation failed"; return false;
+                }
+                dflash2_staging_bytes_ += pages(bytes);
             }
         if (std::getenv("STRATA_STATE_HASH"))
             std::fprintf(stderr, "DFLASH2_STAGE_ALLOCATION phase=verify device=%d layers=%lld:%lld "
-                "payload_bytes=%zu flag_bytes=%zu\n", device_, (long long) lb_, (long long) le_,
-                dflash2_capture_.staging_bytes(), sizeof(uint32_t));
+                "owner=%p raw_rows=%d payload_bytes=%zu flag_bytes=%zu mapped_bytes=%llu\n",
+                device_, (long long) lb_, (long long) le_, static_cast<const void*>(this), dflash2_raw_rows_,
+                dflash2_capture_.staging_bytes(),
+                sizeof(uint32_t), (unsigned long long) dflash2_staging_bytes_);
     }
     const WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }
@@ -2095,7 +2289,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 #if !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_METAL)
         // This first read has JUST folded layer l-1's deferred FFN write into R.
         // Publish unmixed FP32 R, before this layer's attention can write it.
-        if (dflash2_enabled_ && !batch_rec_ && T <= dflash2::block_size)
+        if (dflash2_enabled_)
             for (size_t i = 0; i < dflash2::tap_layers.size(); ++i)
                 if (l == dflash2::tap_layers[i] + 1 && dflash2_m_[i])
                     tap_publish(Rt(tb), dflash2_m_[i] + size_t(tb) * HC * N,
@@ -3144,6 +3338,10 @@ std::string Verifier::profile_report() {
 
 bool Verifier::prepare_graphs(std::string& err) {
     if (!wt_ || !ss_ || !cs_) { err = "verify: prepare requires init"; return false; }
+    for (const Verifier* stage = this; stage; stage = stage->next_)
+        if (!stage->dflash2_capture_.idle() || stage->dflash2_batch_phase_ != Dflash2BatchPhase::idle) {
+            err = "dflash2 capture: graph preparation requires every owned capture released"; return false;
+        }
     const OnDevice on_device(device_);
     if (!acquire_scratch(err)) return false;
     ScratchGuard guard{*this};
@@ -3545,7 +3743,7 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
 
 Verifier::ScratchGuard::~ScratchGuard() {
     if (keep) return;
-    v.dflash2_capture_.poison();
+    v.poison_dflash2_capture();
     if (launched) {
         v.release_gpu_waits(5000); // partial state is never reusable, even if draining succeeds
     } else {
@@ -3558,6 +3756,7 @@ Verifier::ScratchGuard::~ScratchGuard() {
 bool Verifier::fail_operation(std::string& err) {
     if (!released_.load()) err += released_note(release_gpu_waits(5000));
     scratch_.poison();
+    poison_dflash2_capture();
     for (auto& row : committed_slot_row_) row = {};
     b_running_ = false;
     return false;
@@ -3569,7 +3768,7 @@ bool Verifier::context_idle(std::string& err) {
     if (released_.load() || scratch_.phase() != VerifyScratchOwnership::Phase::idle) {
         err = "verify: request context requires idle, unpoisoned operation scratch"; return false;
     }
-    if (!dflash2_capture_.idle()) {
+    if (!dflash2_capture_.idle() || dflash2_batch_phase_ != Dflash2BatchPhase::idle) {
         err = "dflash2 capture: release the owned capture before request rebind"; return false;
     }
     return true;
@@ -3577,6 +3776,9 @@ bool Verifier::context_idle(std::string& err) {
 
 bool Verifier::slot_consumers_idle(int slot, bool expert_pending, std::string& err) {
     if (!wait_commit(err)) return false;
+    if (slot < 0 || slot >= int(slots_.size()) || !dflash2_seats_[size_t(slot)].state.idle()) {
+        err = "dflash2 capture: resident slot still owns captured target inputs"; return false;
+    }
     const auto phase = scratch_.phase();
     if (phase == VerifyScratchOwnership::Phase::idle && !expert_pending) return true;
     if (phase != VerifyScratchOwnership::Phase::idle && phase != VerifyScratchOwnership::Phase::poisoned && last_batch_) {
@@ -3604,7 +3806,8 @@ bool Verifier::set_request_id(uint64_t request_id, std::string& err) {
 }
 
 bool Verifier::set_slot_context(int slot, uint64_t request_id, const strata::kernels::SamplerParams& sp,
-                                const std::vector<int32_t>* history, bool steering, std::string& err) {
+                                const std::vector<int32_t>* history, bool steering, std::string& err,
+                                uint64_t incarnation) {
     if (slot < 0 || slot >= (int) slots_.size() || !request_id) {
         err = "verify: slot context needs a valid slot and nonzero request ID"; return false;
     }
@@ -3613,13 +3816,14 @@ bool Verifier::set_slot_context(int slot, uint64_t request_id, const strata::ker
         if (s != slot && slot_request_id_[s] == request_id) {
             err = "verify: resident request ID already owns another slot"; return false;
         }
-    if (next_ && !next_->set_slot_context(slot, request_id, sp, history, steering, err)) return false;
+    if (next_ && !next_->set_slot_context(slot, request_id, sp, history, steering, err, incarnation)) return false;
     validated_slot_id_[slot] = 0;
     committed_slot_row_[slot] = {};
     slot_sp_[(size_t) slot] = sp;
     slot_history_[slot] = history;
     slot_steering_[slot] = steering ? 1 : 0;
     slot_request_id_[slot] = request_id;
+    slot_incarnation_[size_t(slot)] = incarnation;
     h_owner_[slot] = {request_id, steering ? 1 : 0, 0};
     return validate_slot_context(slot, err);
 }
@@ -3818,13 +4022,23 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (pos0 < 0 || pos0 > ss.qsa_states[ss.qsa_primary()].max_cells - T) {
         err = "verify: the window runs past the context"; return false;
     }
-    if (dflash2_enabled_ && (T > dflash2::block_size || chain_overlap() || ext_stream_)) {
-        err = "dflash2 capture: serial windows of at most four rows without overlapped stage launches required";
+    if (dflash2_batch_phase_ != Dflash2BatchPhase::idle) {
+        err = "dflash2 capture: a resident frame still owns the raw staging"; return false;
+    }
+    if (dflash2_enabled_ && (T > dflash2_raw_rows_ || chain_overlap() || ext_stream_)) {
+        err = "dflash2 capture: a bounded target window without overlapped stage launches is required";
         return false;
     }
     if (dflash2_enabled_)
         for (int64_t layer = 0; layer < g.n_layers; ++layer)
             if (cvec().covers(layer)) { err = "dflash2 capture: control-vector steering is unsupported"; return false; }
+    if (le_ == g.n_layers && spec_required_q_rows_) {
+        if (sampling_.greedy || sampling_.temperature <= 0.0f || !head_sampling_ || !d_spec_) {
+            err = "verify: selected neural prefix lacks sampled verification or reserved transport"; return false;
+        }
+        if (!validate_spec_q_prefix(spec_q_, spec_nq_, spec_required_q_rows_,
+                std::span(tokens + 1, size_t(T - 1)), n_vocab_, err)) return false;
+    }
     const bool pre = prelaunched_ == T;
     prelaunched_ = 0;
     if (observe_next) {
@@ -4194,6 +4408,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             if (!next_->run(T, tokens, pos0, pool, next_user_, out, err)) return false;
             causal_operation("next-stage-handoff-wait", handoff_start, causal_now(), -1, true);
         }
+        spec_q_ = nullptr; spec_nq_ = 0; spec_required_q_rows_ = 0;
         if (!scratch_.ready()) { err = "verify: window ownership was poisoned"; return false; }
         if (!causal_write_window(err)) return false;
         if (!dflash2_capture_.finish_run(err)) return false;
@@ -4221,12 +4436,17 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                         cudaSuccess &&
                     cudaMemcpyAsync(d_q, spec_q_, (size_t) nq * strata::core::kSpecQStride * sizeof(int32_t),
                                     cudaMemcpyHostToDevice, cs_) == cudaSuccess)
-                    judged = sample_tokens_spec(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, d_spec_, d_q, nq,
+                    judged = sample_tokens_spec(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, d_spec_, d_q, T - 1, nq,
                                                 m_out_, cs_);
             }
         }
+        const bool required_q = spec_required_q_rows_ > 0;
         spec_q_ = nullptr;
         spec_nq_ = 0;
+        spec_required_q_rows_ = 0;
+        if (required_q && !judged) {
+            err = "verify: required conditional-q rejection sampler did not run"; return false;
+        }
         if (judged) ++spec_windows;
         else sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
         causal_operation("sampling-submit", sampling_submit_start, causal_now());
@@ -4541,7 +4761,6 @@ bool Verifier::wait_commit(std::string& err) {
 
 bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& err) {
     const OnDevice on_device(device_);
-    if (dflash2_enabled_) { err = "dflash2 capture: batch/resident verifier rows are unsupported"; return false; }
     if (g_ == nullptr || ss_ == nullptr) { err = "verify: init_slots before init"; return false; }
     if (!context_idle(err)) return false;
     if (arena_b_ || h_commitb_ || !slots_.empty()) { err = "verify: release batch resources before rebinding slots"; return false; }
@@ -4656,6 +4875,7 @@ bool Verifier::release_batch_resources(std::string& err) {
     std::vector<strata::kernels::SamplerParams>().swap(slot_sp_);
     for (int i = 0; i < 8; ++i) {
         slot_request_id_[i] = validated_slot_id_[i] = 0;
+        slot_incarnation_[size_t(i)] = 0;
         committed_slot_row_[i] = {};
         slot_history_[i] = nullptr;
     }
@@ -4665,6 +4885,11 @@ bool Verifier::release_batch_resources(std::string& err) {
 }
 
 bool Verifier::reserve_batch_key(const BatchKey& key, std::string& err) {
+    if (dflash2_enabled_ && (!kDflash2BatchGraphHostPricingSupported ||
+        (key[0] != 0 && key[0] != 8) || !dflash2_batch_rows_supported(key.data() + 3, key[1]))) {
+        err = "verify: native graph schedule or host-metadata pricing is outside the admitted bound";
+        return false;
+    }
     if (exec_bm_.find(key) != exec_bm_.end()) return true;
     if (exec_bm_.size() >= (batch_graph_limit_ ? batch_graph_limit_ : kVerifyBatchGraphKeys)) {
         err = "verify: bounded batch graph cache exhausted; release idle batch graphs before another row schedule";
@@ -4851,6 +5076,9 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
 bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
                            std::string& err) {
     using namespace strata::kernels;
+    if (!g_ || !ss_ || !rows || !tokens || !pos || S < 1 || S > max_t_) {
+        err = "verify: initialized resident owner and complete bounded row inputs required"; return false;
+    }
     // the row layout: a slot may own a contiguous group of rows (--batch-mtp), also across the stages of a layer split,
     // whose hand-off buffers hold kVerifyMaxT rows, or set_handoff_rows' (a stage that hands rows on or takes them)
     if (const char* why = batch_rows_error(rows, S, pos, (int) slots_.size(), max_t_, hbase,
@@ -4867,12 +5095,14 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             err = "verify: slot " + std::to_string(rows[t]) + " runs past its context";
             return false;
         }
+    if (!validate_dflash2_batch(rows, S, pos, err)) return false;
     if (!acquire_scratch(err)) return false;
     ScratchGuard guard{*this};
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
     refresh_ar();
 
     if (!capture_batch(rows, S, hbase, err) || !capture_commit_batch(rows, S, hbase, err)) return false;
+    if (!begin_dflash2_batch(err)) return false;
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
     int32_t steering[8] = {};
@@ -4962,7 +5192,10 @@ bool Verifier::run_slot_rows(const BatchRow* metadata, int count, PoolMultiFn po
     if (!g_ || count < 0 || count > max_t_ || (count && (!metadata || !out))) {
         err = "verify: invalid batch metadata extent"; return false;
     }
-    if (!context_idle(err)) return false;
+    if (!wait_commit(err) || released_.load() || scratch_.phase() != VerifyScratchOwnership::Phase::idle) {
+        if (err.empty()) err = "verify: batch metadata requires idle target scratch";
+        return false;
+    }
     int rows[8] = {}, offsets[8] = {}, active = 0;
     int32_t tokens[8] = {}, picks[8] = {};
     int64_t positions[8] = {};
@@ -4990,6 +5223,7 @@ bool Verifier::run_slot_rows(const BatchRow* metadata, int count, PoolMultiFn po
         rows[active] = row.slot; offsets[active] = row.output_offset;
         tokens[active] = row.token; positions[active++] = row.position;
     }
+    if (!validate_dflash2_batch(rows, active, positions, err)) return false;
     // Validate the entire descriptor before any model state or caller output changes.
     for (int i = 0; i < count; ++i) out[i] = -1;
     if (active) {
@@ -5019,8 +5253,8 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
                              void* user, int32_t* out, std::string& err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
-    const ModelGeometry& g = *g_;
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
+    const ModelGeometry& g = *g_;
     ScratchGuard guard{*this, true};
     if (released_.load()) { err = "verify: watchdog released batch before launch"; return false; }
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
@@ -5053,6 +5287,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         if (le_ < g.n_layers) {
             if (next_ && !next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err)) return false;
             if (!scratch_.ready()) { err = "verify: batch ownership was poisoned"; return false; }        // FORK
+            if (!finish_dflash2_batch(err)) return false;
             guard.keep = true;                                                                          // FORK
             return true;
         }
@@ -5062,6 +5297,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         progress_at("decode");
         progress_beat();
         if (!scratch_.ready()) { err = "verify: batch ownership was poisoned"; return false; }            // FORK
+        if (!finish_dflash2_batch(err)) return false;
         guard.keep = true;                                                                              // FORK
         return true;
     }
@@ -5139,6 +5375,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     if (le_ < g.n_layers) {
         if (next_ && !next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err)) return false;
         if (!scratch_.ready()) { err = "verify: batch ownership was poisoned"; return false; }
+        if (!finish_dflash2_batch(err)) return false;
         guard.keep = true;
         return true;
     }
@@ -5148,6 +5385,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     progress_at("decode");
     progress_beat();
     if (!scratch_.ready()) { err = "verify: batch ownership was poisoned"; return false; }
+    if (!finish_dflash2_batch(err)) return false;
     guard.keep = true;
     return true;
 }
@@ -5161,6 +5399,30 @@ bool Verifier::commit_slots(std::string& err) {
 bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
     const OnDevice on_device(device_);
     if (!last_batch_ || last_t_ < 0) { err = "verify: commit_slots without a batch window"; return false; }
+    if (last_t_ && !keep) { err = "verify: accepted slot prefixes are missing"; return false; }
+    if (dflash2_batch_phase_ != Dflash2BatchPhase::idle) {
+        if (dflash2_batch_phase_ != Dflash2BatchPhase::verified || last_t_ != dflash2_batch_rows_) {
+            err = "dflash2 capture: prefix commit does not own a completed resident frame"; return false;
+        }
+        for (int t = 0; t < last_t_; ++t) {
+            const auto& row = dflash2_rows_[size_t(t)];
+            if (last_rows_[t] != row.slot || last_pos_b_[t] != row.position ||
+                row.owner.request != slot_request_id_[row.slot] ||
+                row.owner.request != validated_slot_id_[row.slot] ||
+                row.owner.incarnation != slot_incarnation_[row.slot]) {
+                err = "dflash2 capture: stale resident completion before target commit"; return false;
+            }
+        }
+    }
+    // Check every owner's accepted prefix before mutating even the mapped
+    // commit records, so a malformed later group cannot partially stage a frame.
+    for (int t = 0; t < last_t_;) {
+        const int first = t;
+        while (t < last_t_ && last_rows_[t] == last_rows_[first]) ++t;
+        if (keep[last_rows_[first]] < 1 || keep[last_rows_[first]] > t - first) {
+            err = "verify: accepted prefix is outside its slot group"; return false;
+        }
+    }
     if (released_.load() || !scratch_.commit()) {
         err = "verify: batch commit does not own a completed window"; return false;
     }
@@ -5178,10 +5440,6 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
         const int first = t;
         while (t < S && last_rows_[t] == last_rows_[first]) ++t;
         const int n = keep[last_rows_[first]];
-        if (n < 1 || n > t - first) {
-            err = "verify: accepted prefix is outside its slot group";
-            return false;
-        }
         int32_t* c = h_commitb_ + (size_t) last_rows_[first] * CB;
         c[0] = n;
         c[1] = n - 1;
@@ -5210,24 +5468,64 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
     ms_commit += ms_since(t0);
     if (next_ && !next_->commit_slot_prefixes(keep, err)) return false;
     if (!scratch_.finish()) { err = "verify: batch commit ownership was poisoned"; return false; }
+    if (dflash2_batch_phase_ != Dflash2BatchPhase::idle) {
+        if (dflash2_batch_phase_ != Dflash2BatchPhase::verified) {
+            err = "dflash2 capture: accepted prefixes do not own a verified resident frame"; return false;
+        }
+        for (size_t slot = 0; slot < dflash2_seats_.size(); ++slot) {
+            auto& seat = dflash2_seats_[slot];
+            if (seat.first >= 0 &&
+                (!seat.state.committed(keep[slot], err) || !seat.state.waited(err))) return false;
+        }
+        dflash2_batch_phase_ = Dflash2BatchPhase::ready;
+        *dflash2_on_h_ = 0;
+    }
     guard.keep = true;
     return true;
 }
 
 bool Verifier::sample_rows(int S, std::string& err) {
-    if (!head_sampling_) return true; // known-input private prompt rows, like the scalar read_windows path
-    bool any = false;
+    if (!head_sampling_) {
+        if (batch_spec_required_) { err = "verify: required packed q with sampling disabled"; return false; }
+        batch_spec_q_ = nullptr; batch_spec_drafts_ = nullptr; batch_spec_rows_ = 0;
+        return true;
+    }
+    const bool has_q = batch_spec_rows_ > 0;
+    if ((batch_spec_required_ && !has_q) || (has_q && (batch_spec_rows_ != S || !batch_spec_q_ || !batch_spec_drafts_))) {
+        err = "verify: packed conditional-q frame differs from completed rows"; return false;
+    }
+    if (has_q) {
+        if (!d_spec_ ||
+            cudaMemcpyAsync(d_spec_, batch_spec_drafts_, size_t(S) * sizeof(int32_t),
+                            cudaMemcpyHostToDevice, cs_) != cudaSuccess ||
+            cudaMemcpyAsync(d_spec_ + kernels::kVerifyMaxT, batch_spec_q_, size_t(S) * kSpecQStride * sizeof(int32_t),
+                            cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+            err = "verify: packed conditional-q transport failed"; return false;
+        }
+    }
+    bool any = false, judged = false;
     for (int t = 0; t < S; ++t) {
         strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
         const int n = history_len_b_[t];
         if ((sp.greedy || sp.temperature <= 0.0f) && n == 0) continue;
         sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position), never a process-wide draw sequence
         sp.penalty_last_n = n;
-        strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_,
-                                       n ? history_b_ + (size_t) t * 4096 : nullptr, n, sp, m_out_ + t, cs_);
+        if (has_q && batch_spec_drafts_[t] >= 0 && !sp.greedy && sp.temperature > 0.0f) {
+            if (!strata::kernels::sample_tokens_spec(head_logits_ + size_t(t) * size_t(n_vocab_), 1, int(n_vocab_),
+                    n ? history_b_ + size_t(t) * 4096 : nullptr, n, sp, d_spec_ + t,
+                    d_spec_ + kernels::kVerifyMaxT + size_t(t) * kSpecQStride, 1, 1, m_out_ + t, cs_)) {
+                err = "verify: packed conditional-q rejection sampler did not run"; return false;
+            }
+            judged = true;
+        } else {
+            strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_,
+                                           n ? history_b_ + (size_t) t * 4096 : nullptr, n, sp, m_out_ + t, cs_);
+        }
         any = true;
     }
     if (any && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
+    if (judged) ++spec_windows;
+    batch_spec_q_ = nullptr; batch_spec_drafts_ = nullptr; batch_spec_rows_ = 0; batch_spec_required_ = false;
     return true;
 }
 
@@ -5235,6 +5533,12 @@ bool Verifier::batch_launch(int base, const int* rows, int S, const int32_t* tok
                             std::string& err, BatchCommit commit) {
     const OnDevice on_device(device_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
+    if (!rows || !tokens || !pos || S < 1 || S > max_t_) {
+        err = "verify: batch_launch requires complete bounded row inputs"; return false;
+    }
+    if (dflash2_batch_phase_ != Dflash2BatchPhase::idle && commit != BatchCommit::deferred) {
+        err = "dflash2 capture: resident capture requires commit_slot_prefixes, not eager commit"; return false;
+    }
     for (int t = 1; commit == BatchCommit::eager && t < S; ++t)
         if (rows[t] == rows[t - 1]) {
             err = "verify: speculative slot rows require deferred accepted-prefix commit";
@@ -5407,6 +5711,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
             sx.ple_prev[1] = last_tokens_[t];
         }
     if (!(b_deferred_ ? scratch_.ready() : scratch_.finish_batch())) { err = "verify: batch ownership was poisoned"; return -1; }
+    if (!finish_dflash2_batch(err)) return -1;
     guard.keep = true;
     progress_beat();
     return 1;

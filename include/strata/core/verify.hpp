@@ -25,12 +25,15 @@
 #include <array>
 
 #include "strata/core/batch_rows.hpp"
+#include "strata/core/dflash2_batch_capture.hpp"
 #include "strata/core/dflash2_capture.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/spec_prob.hpp"
 #include "strata/core/verify_ownership.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -41,6 +44,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <span>
 
 namespace strata::program { struct ResidentExecutorFixture; }
 
@@ -175,6 +179,17 @@ public:
                             std::string& err);
     bool dflash2_tap(dflash2::CaptureOwner owner, int tap_layer, dflash2::TapView& out, std::string& err) const;
     bool release_dflash2_capture(dflash2::CaptureOwner owner, std::string& err);
+    /// Resident rows use disjoint slices of this physical verifier's fixed raw
+    /// staging. Arm every row before launch; owner groups are contiguous and at
+    /// most four rows. Only commit_slot_prefixes + target drain publishes views.
+    /// The complete frame stays reserved until every captured owner releases.
+    bool arm_dflash2_batch(std::span<const dflash2::BatchCaptureRow> rows, std::string& err);
+    bool dflash2_batch_tap(dflash2::CaptureOwner owner, int slot, int tap_layer,
+                          dflash2::TapView& out, std::string& err) const;
+    bool release_dflash2_batch(dflash2::CaptureOwner owner, int slot, std::string& err);
+    /// Actual page-rounded mapped allocation for this physical owner, including
+    /// its replay flag. Price independently for each concurrent verifier.
+    uint64_t dflash2_staging_bytes() const { return dflash2_staging_bytes_; }
     /// One window: tokens[0..T) at consecutive positions, out[t] = head pick.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
@@ -225,13 +240,25 @@ public:
     /// PROBABILISTIC DRAFT ACCEPTANCE (core/spec_prob.hpp, STRATA_SPEC_PROB=1): for the NEXT run() only, judge the
     /// window's first `n_q` drafts against the drafter's distributions `q` (host memory, n_q rows of kSpecQStride
     /// int32: ids, -1 terminated, then probabilities as float bits) with rejection sampling instead of exact match; the
-    /// drafts past `n_q` (a lookup chain's tail) are point masses.  Has no effect on a greedy request, a window of one
-    /// token, or where the split sampler cannot run - those take the exact-match path.  Cleared by run().
-    void set_spec_q(const int32_t* q, int n_q) {
+    /// drafts past `n_q` are explicit point masses. A positive required_neural_rows
+    /// names the actually selected sampled-neural prefix, independently of q's
+    /// available length. It requires exactly that many valid q rows and reserved
+    /// transport; unsupported rejection sampling never silently falls back.
+    void set_spec_q(const int32_t* q, int n_q, int required_neural_rows) {
         spec_q_ = q;
         spec_nq_ = n_q;
-        if (next_) next_->set_spec_q(q, n_q);
+        spec_required_q_rows_ = required_neural_rows;
+        if (next_) next_->set_spec_q(q, n_q, required_neural_rows);
     }
+    /// Allocate the sparse-q device payload before serving/capture. Only the
+    /// stage owning the head allocates; repeated calls allocate nothing.
+    bool reserve_spec_q(std::string& err);
+    static constexpr uint64_t planned_spec_q_bytes() {
+        return uint64_t(kernels::kVerifyMaxT) * (1 + kSpecQStride) * sizeof(int32_t);
+    }
+    /// Host rows belong to this packed frame until sampling completes. A draft
+    /// token of -1 marks a bonus row. Clear with null/null/0/false between frames.
+    bool set_batch_spec_q(const int32_t* q, const int32_t* drafts, int rows, bool required, std::string& err);
     /// Counters of the rejection path (windows judged, drafts kept / offered over its rows with a q list).
     int64_t spec_windows = 0;
 
@@ -290,8 +317,8 @@ public:
     /// One batch window over slots [0, S): tokens[s] at positions pos[s]; out[s] = the greedy pick after it.
     bool run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err);
-    /// Capture cache is capped at kVerifyBatchGraphKeys distinct row-order/base
-    /// keys (window + commit per key). An unseen key past the cap is rejected
+    /// Capture cache has a fixed priced row-order/base key cap (legacy or
+    /// native DFlash2). An unseen key past the cap is rejected
     /// before capture; graphs are never evicted while a request can use them.
     /// The same over the S slots `rows` (row t is slot rows[t], any distinct slots in any order): the slots not
     /// listed are not touched, so an idle slot keeps its state (a finished conversation it may continue later).
@@ -316,8 +343,12 @@ public:
     /// Commit an accepted prefix in each contiguous slot group of the last window. `keep` has
     /// one entry per slot (indexed by slot ID), each in 1..that slot's group length.
     bool commit_slot_prefixes(const int* keep, std::string& err);
-    /// An operator may tighten the priced 32-key bound, never enlarge it or request an unbounded cache.
-    void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n == 0 ? kVerifyBatchGraphKeys : std::min<size_t>(n, kVerifyBatchGraphKeys); }
+    /// Tighten the selected priced bound; never request an unbounded cache.
+    /// Only owned DFlash2 capture enables the separate native schedule bound.
+    void set_batch_graph_limit(size_t n) {
+        const size_t cap = dflash2_enabled_ ? kDflash2BatchGraphKeys : kVerifyBatchGraphKeys;
+        batch_graph_limit_ = n == 0 ? cap : std::min(n, cap);
+    }
 
     // ---- The stages of a layer split as a PIPELINE. Packed row t uses hand-off base+t on every stage.
     // Eager windows commit every row before releasing scratch. Deferred windows retain their own
@@ -341,7 +372,8 @@ public:
     /// distinct across slots. History stays alive until rebind; do not mutate it
     /// while an operation owns scratch. Also forwards to chained stages.
     bool set_slot_context(int slot, uint64_t request_id, const strata::kernels::SamplerParams& sp,
-                          const std::vector<int32_t>* history, bool steering, std::string& err);
+                          const std::vector<int32_t>* history, bool steering, std::string& err,
+                          uint64_t incarnation = 0);
     /// Last GPU-validated owner, zero before validation/rebind or after failure.
     uint64_t validated_slot_request_id(int slot) const {
         return !released_.load() && slot >= 0 && slot < (int) slots_.size() ? validated_slot_id_[slot] : 0;
@@ -508,15 +540,12 @@ private:
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
     int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
-    using BatchKey = std::array<int, 11>;
+    using BatchKey = VerifyBatchKey;
     std::map<BatchKey, cudaGraphExec_t> exec_bm_, commit_bm_;
     size_t batch_graph_limit_ = kVerifyBatchGraphKeys;
     int last_rows_[8] = {};                ///< the slots of the last batch window's rows
     BatchKey bkey(const int* rows, int S, int hbase) const {
-        BatchKey key{};
-        key[0] = hbase; key[1] = S; key[2] = ar_off_ ? 1 : 0;
-        for (int t = 0; t < S; ++t) key[3 + t] = rows[t];
-        return key;
+        return verify_batch_graph_key(rows, S, hbase, bool(ar_off_));
     }
     // External serving publishes layer completion; the submitter retains the scratch lease and CUDA drain.
     std::atomic<bool> b_running_{false};
@@ -617,6 +646,11 @@ private:
     const int32_t* hist_d_ = nullptr;   ///< penalty-history row (set_history); null = no penalties apply
     const int32_t* spec_q_ = nullptr;   ///< set_spec_q: the drafter's q rows for the next window (host)
     int spec_nq_ = 0;
+    int spec_required_q_rows_ = 0;
+    const int32_t* batch_spec_q_ = nullptr;
+    const int32_t* batch_spec_drafts_ = nullptr;
+    int batch_spec_rows_ = 0;
+    bool batch_spec_required_ = false;
     int32_t* d_spec_ = nullptr;          ///< device: kVerifyMaxT draft ids, then kVerifyMaxT q rows
     int hist_len_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
@@ -717,6 +751,22 @@ private:
 
     bool dflash2_enabled_ = false;
     dflash2::TapCaptureState dflash2_capture_;
+    struct Dflash2SeatCapture {
+        dflash2::TapCaptureState state;
+        dflash2::CaptureOwner owner;
+        int first = -1, count = 0;
+    };
+    enum class Dflash2BatchPhase { idle, armed, running, verified, ready, poisoned };
+    std::array<Dflash2SeatCapture, kernels::kVerifyMaxT> dflash2_seats_;
+    std::array<dflash2::BatchCaptureRow, kernels::kVerifyMaxT> dflash2_rows_;
+    std::array<uint64_t, kernels::kVerifyMaxT> slot_incarnation_{};
+    Dflash2BatchPhase dflash2_batch_phase_ = Dflash2BatchPhase::idle;
+    int dflash2_batch_rows_ = 0, dflash2_raw_rows_ = 0;
+    uint64_t dflash2_staging_bytes_ = 0;
+    bool validate_dflash2_batch(const int* rows, int count, const int64_t* positions, std::string& err) const;
+    bool begin_dflash2_batch(std::string& err);
+    bool finish_dflash2_batch(std::string& err);
+    void poison_dflash2_capture();
     std::array<float*, dflash2::tap_layers.size()> dflash2_h_{}, dflash2_m_{};
     uint32_t* dflash2_on_h_ = nullptr;
     uint32_t* dflash2_on_m_ = nullptr;

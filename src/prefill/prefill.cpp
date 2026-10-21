@@ -933,6 +933,11 @@ struct Prefill::Impl {
     int64_t T = 0, T_max = 0;
     bool borrowed = false, initialized = false, borrow_spill = false;
     core::dflash2::TapCaptureState dflash2_capture;
+    core::dflash2::CaptureOwner dflash2_owner;
+    std::array<core::dflash2::CaptureOwner, kPrefillOwners + 1> dflash2_last_owner;
+    int dflash2_slot = 8;
+    int64_t dflash2_next = 0, dflash2_end = 0;
+    uint64_t dflash2_staging_bytes = 0;
     std::array<float*, core::dflash2::tap_layers.size()> dflash2_host{}, dflash2_mapped{};
     uint32_t* dflash2_on_host = nullptr;
     uint32_t* dflash2_on_mapped = nullptr;
@@ -1284,15 +1289,39 @@ bool Prefill::enable_dflash2_capture(std::string& err) {
 #endif
 }
 
+bool Prefill::capture_owner_matches(core::dflash2::CaptureOwner owner, int slot) const {
+    const Impl& m = *impl_;
+    if (slot == 8) return owner.request && owner.request == m.bound_request && m.ss == m.original_ss;
+    if (slot < 0 || slot >= kPrefillOwners) return false;
+    const auto* state = m.owner_sessions[size_t(slot)];
+    return owner.request && owner.incarnation && owner.request == m.owner_requests[size_t(slot)] &&
+        owner.incarnation == m.owner_incarnations[size_t(slot)] && state && state != m.original_ss &&
+        state->allocation_id == m.owner_allocations[size_t(slot)] && state->allocation_device == m.device &&
+        state->layer_lo == stage_lb_ && state->layer_hi == stage_le_;
+}
+
 bool Prefill::arm_dflash2_capture(core::dflash2::CaptureOwner owner, int64_t frontier, int64_t start,
-                                 int64_t count, std::string& err) {
+                                 int64_t count, std::string& err, int slot) {
     Impl& m = *impl_;
-    if (!dflash2_enabled_ || !m.initialized || owner.request != m.bound_request || public_running_.load() ||
-        next_packet_ || !local_idle(err)) {
-        if (err.empty()) err = "dflash2 capture: initialized, bound serial prefill required";
+    if (!dflash2_enabled_ || !m.initialized || public_running_.load() || next_packet_ || !local_idle(err)) {
+        if (err.empty()) err = "dflash2 capture: initialized idle prefill required";
         return false;
     }
+    if (!capture_owner_matches(owner, slot)) {
+        err = "dflash2 capture: request/incarnation does not own the selected prefill destination"; return false;
+    }
+    auto& previous = m.dflash2_last_owner[size_t(slot == 8 ? kPrefillOwners : slot)];
+    if ((previous.request == owner.request && previous.incarnation == owner.incarnation &&
+         owner.generation <= previous.generation) ||
+        (slot != 8 && (owner.incarnation < previous.incarnation ||
+         (owner.incarnation == previous.incarnation && previous.request &&
+          owner.request != previous.request)))) {
+        err = "dflash2 capture: selected owner's incarnation or generation did not advance"; return false;
+    }
     if (!m.dflash2_capture.arm(owner, frontier, start, count, err)) return false;
+    previous = owner;
+    m.dflash2_owner = owner; m.dflash2_slot = slot;
+    m.dflash2_next = start; m.dflash2_end = start + count;
     // Idle, owned observer storage only; finite committed rows must subsequently
     // come from this operation's completed device writes, not an older payload.
     if (std::getenv("STRATA_STATE_HASH"))
@@ -1305,7 +1334,8 @@ bool Prefill::arm_dflash2_capture(core::dflash2::CaptureOwner owner, int64_t fro
 bool Prefill::dflash2_tap(core::dflash2::CaptureOwner owner, int tap_layer, core::dflash2::TapView& out,
                          std::string& err) const {
     const Impl& m = *impl_;
-    if (public_running_.load() || m.running.load() || m.poisoned || next_packet_) {
+    if (public_running_.load() || m.running.load() || m.poisoned || next_packet_ ||
+        !capture_owner_matches(owner, m.dflash2_slot) || owner != m.dflash2_owner) {
         err = "dflash2 capture: prefill has not drained successfully"; return false;
     }
     for (size_t i = 0; i < core::dflash2::tap_layers.size(); ++i)
@@ -1315,11 +1345,16 @@ bool Prefill::dflash2_tap(core::dflash2::CaptureOwner owner, int tap_layer, core
 }
 
 bool Prefill::release_dflash2_capture(core::dflash2::CaptureOwner owner, std::string& err) {
-    if (public_running_.load() || impl_->running.load() || next_packet_) {
-        err = "dflash2 capture: prefill still in flight"; return false;
+    if (public_running_.load() || impl_->running.load() || impl_->poisoned || next_packet_ ||
+        !capture_owner_matches(owner, impl_->dflash2_slot) || owner != impl_->dflash2_owner) {
+        err = "dflash2 capture: prefill owner is stale, poisoned or still in flight"; return false;
     }
-    return impl_->dflash2_capture.release(owner, err);
+    if (!impl_->dflash2_capture.release(owner, err)) return false;
+    *impl_->dflash2_on_host = 0;
+    return true;
 }
+
+uint64_t Prefill::dflash2_staging_bytes() const { return impl_->dflash2_staging_bytes; }
 
 int Prefill::device() const { return impl_ != nullptr ? impl_->device : -1; }
 std::span<const float> Prefill::stage_output() const {
@@ -1553,6 +1588,9 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
                    void* stream, std::string& err, void* borrow, uint64_t borrow_bytes, bool borrow_spill) {
     Impl& m = *impl_;
+    if (!m.dflash2_capture.idle()) {
+        err = "dflash2 capture: release the owned capture before prefill initialization"; return false;
+    }
     // The per-take spill suffix must be priced before a caller may enable the hybrid layout.
     if (borrow_spill) {
         err = "prefill: the hybrid borrowed/owned layout (borrow_spill) is not priced by the admission gate";
@@ -1587,17 +1625,23 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (!mapped_tap(sizeof(uint32_t), (void**) &m.dflash2_on_host, (void**) &m.dflash2_on_mapped)) {
             err = "dflash2 capture: mapped prefill replay flag allocation failed"; return false;
         }
-        *m.dflash2_on_host = 1;
+        *m.dflash2_on_host = 0;
+        auto pages = [](size_t bytes) { return (bytes + 4095) / 4096 * 4096; };
+        m.dflash2_staging_bytes = pages(sizeof(uint32_t));
         for (size_t i = 0; i < m.dflash2_host.size(); ++i)
-            if (m.dflash2_capture.owns_tap(int(i)) &&
-                !mapped_tap(core::dflash2::context_rows * core::dflash2::residual_row_bytes,
-                            (void**) &m.dflash2_host[i], (void**) &m.dflash2_mapped[i])) {
-                err = "dflash2 capture: mapped prefill tap allocation failed"; return false;
+            if (m.dflash2_capture.owns_tap(int(i))) {
+                const size_t bytes = core::dflash2::context_rows * core::dflash2::residual_row_bytes;
+                if (!mapped_tap(bytes, (void**) &m.dflash2_host[i], (void**) &m.dflash2_mapped[i])) {
+                    err = "dflash2 capture: mapped prefill tap allocation failed"; return false;
+                }
+                m.dflash2_staging_bytes += pages(bytes);
             }
         if (std::getenv("STRATA_STATE_HASH"))
             std::fprintf(stderr, "DFLASH2_STAGE_ALLOCATION phase=prefill device=%d layers=%lld:%lld "
-                "payload_bytes=%zu flag_bytes=%zu\n", m.device, (long long) stage_lb_, (long long) stage_le_,
-                m.dflash2_capture.staging_bytes(), sizeof(uint32_t));
+                "owner=%p raw_rows=%d payload_bytes=%zu flag_bytes=%zu mapped_bytes=%llu\n",
+                m.device, (long long) stage_lb_, (long long) stage_le_, static_cast<const void*>(this),
+                core::dflash2::context_rows, m.dflash2_capture.staging_bytes(), sizeof(uint32_t),
+                (unsigned long long) m.dflash2_staging_bytes);
     }
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
@@ -1895,7 +1939,7 @@ bool Prefill::carve(size_t T, void* alloc) {
 
 bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err) {
     Impl& m = *impl_;
-    if (public_running_.load() || m.running.load() || m.poisoned) {
+    if (public_running_.load() || m.running.load() || m.poisoned || !m.dflash2_capture.idle()) {
         err = "prefill: relayout while scratch is in flight or poisoned"; return false;
     }
     if (m.borrow_spill) {
@@ -1935,12 +1979,13 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 int64_t Prefill::chunk() const { return impl_->T; }
 bool Prefill::owns_work_buffers() const { return impl_->initialized && !impl_->borrowed; }
 
-bool Prefill::local_idle(std::string& err) const {
+bool Prefill::local_idle(std::string& err, bool allow_armed) const {
     const Impl& m = *impl_;
     if (m.running.load() || m.poisoned) {
         err = "prefill: owner rebind while scratch is in flight or poisoned"; return false;
     }
-    if (!m.dflash2_capture.idle()) {
+    if (!m.dflash2_capture.idle() &&
+        !(allow_armed && !m.dflash2_capture.running() && m.dflash2_next < m.dflash2_end)) {
         err = "dflash2 capture: release the owned capture before request rebind"; return false;
     }
     if (m.device >= 0) {
@@ -1955,14 +2000,16 @@ bool Prefill::local_idle(std::string& err) const {
     return true;
 }
 
-bool Prefill::context_idle(std::string& err) const {
+bool Prefill::operation_idle(std::string& err, bool allow_armed) const {
     if (public_running_.load() || next_packet_ ||
         std::any_of(std::begin(impl_->handoff), std::end(impl_->handoff),
                     [](const auto& handoff) { return !handoff.packet.reusable(); })) {
         err = "prefill: owner rebind while pipeline is in flight"; return false;
     }
-    return local_idle(err) && (!next_ || next_->context_idle(err));
+    return local_idle(err, allow_armed) && (!next_ || next_->operation_idle(err, allow_armed));
 }
+
+bool Prefill::context_idle(std::string& err) const { return operation_idle(err, false); }
 
 bool Prefill::bind_request(uint64_t request, std::string& err) {
     Impl& m = *impl_;
@@ -2344,6 +2391,9 @@ bool Prefill::helper_allocation(const core::ModelGeometry& g, int64_t chunk, int
 
 bool Prefill::set_stage_helper(Prefill* helper, std::string& err) {
     Impl& m = *impl_;
+    if (!m.dflash2_capture.idle()) {
+        err = "dflash2 capture: release the owned capture before helper preparation"; return false;
+    }
     m.help_pp.reset();
     if (helper == nullptr || helper == this || !split_help_env()) return true;
     const Impl& h = *helper->impl_;
@@ -2698,6 +2748,9 @@ bool Prefill::add_prompt_helper(const PromptHelper& owner, int64_t cap_rows, std
 // order while executing on the primary. The separate peer tier retains its existing transport semantics.
 bool Prefill::set_prompt_helpers(const std::vector<PromptHelper>& helpers, int64_t cap_rows, bool execute, std::string& err) {
     Impl& m = *impl_;
+    if (!m.dflash2_capture.idle()) {
+        err = "dflash2 capture: release the owned capture before helper preparation"; return false;
+    }
     m.pps.clear();
     m.pp = nullptr;
     m.pe_last = nullptr;
@@ -3332,6 +3385,31 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             err = "prefill packet: stale request or incarnation"; return false;
         }
     }
+    // Validate the real selected destination and absolute run before taking the
+    // arithmetic lease or touching row staging. One-owner segments are not the
+    // ambient working session, even though they share this stage's arena.
+    if (dflash2_enabled_) {
+        if (segmented && (!segments || segment_count != 1 || segments[0].row != 0 ||
+            segments[0].owner.position != pos0 || segments[0].owner.rows != n)) {
+            err = "dflash2 capture: multi-owner packed prompt arithmetic is unsupported"; return false;
+        }
+        if (!m.dflash2_capture.idle()) {
+            const auto& owner = m.dflash2_owner;
+            const int slot = segmented ? segments[0].owner.slot : 8;
+            if (slot != m.dflash2_slot || !capture_owner_matches(owner, slot) ||
+                (segmented && (segments[0].owner.request != owner.request ||
+                 segments[0].owner.incarnation != owner.incarnation ||
+                 std::find(segments[0].owner.stages.begin(), segments[0].owner.stages.end(),
+                           m.owner_sessions[size_t(slot)]) == segments[0].owner.stages.end())) ||
+                pos0 != m.dflash2_next || n < 1 || n > m.dflash2_end - pos0) {
+                err = "dflash2 capture: actual prefill owner/session/interval differs from the armed run"; return false;
+            }
+        }
+        for (int64_t layer = 0; layer < m.g->n_layers; ++layer)
+            if (strata::kernels::cvec().covers(layer)) {
+                err = "dflash2 capture: control-vector steering is unsupported"; return false;
+            }
+    }
     if (prefill_attribution_requested() && (stage_lb_ < 0 || stage_le_ > 48 || stage_lb_ >= stage_le_)) {
         err = "prefill attribution: stage layer bounds must lie within [0,48]";
         return false;
@@ -3390,14 +3468,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     } lease{m, err};
     if (m.poisoned) { err = "prefill: scratch poisoned by failed work"; return false; }
     if (dflash2_enabled_) {
-        if (segmented || retained_step_ || stop_at_chunk) {
-            err = "dflash2 capture: packed, retained or yieldable prefill is unsupported"; return false;
-        }
-        for (int64_t layer = 0; layer < m.g->n_layers; ++layer)
-            if (strata::kernels::cvec().covers(layer)) {
-                err = "dflash2 capture: control-vector steering is unsupported"; return false;
-            }
-        if (!m.dflash2_capture.begin_run(m.bound_request, pos0, n, err)) return false;
+        const uint64_t request = segmented ? segments[0].owner.request : m.bound_request;
+        if (!m.dflash2_capture.begin_run(request, pos0, n, err)) return false;
+        *m.dflash2_on_host = m.dflash2_capture.copying() ? 1u : 0u;
     }
     m.pe_last = nullptr;
     for (auto& helper : m.pps) {
@@ -6095,7 +6168,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (!packet.publish(generation, handoff.pieces == 0, err)) return false;
             next_packet_ = &packet;
             if (retained_step_) {
-                const bool complete = next_->run_impl(tokens + c0, T, p0, err, nullptr, 0, 0, &packet, generation);
+                const bool complete = next_->run_impl(segmented ? handoff.tokens.data() : tokens + c0, T, p0, err,
+                    segmented ? packet.owners() : nullptr, segment_count, execution, &packet, generation);
                 if (!packet.finish(generation, complete, err)) return false;
                 if (!complete) {
                     if (next_->impl_->retained_cancelled) {
@@ -6349,6 +6423,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata prefill: GDN_HASH %s\n", line.c_str());
     }
     if (!m.dflash2_capture.finish_run(err)) return false;
+    if (!m.dflash2_capture.idle()) m.dflash2_next = pos0 + n;
     return true;
 }
 
@@ -6396,6 +6471,8 @@ StagePacket::Outcome Prefill::drain_pipeline(std::string& err) {
 }
 
 bool Prefill::reserve_uploads(int64_t T) {
+    for (const Prefill* stage = this; stage; stage = stage->next_)
+        if (!stage->impl_->dflash2_capture.idle()) return false;
     bool ok = true;
     if (impl_ != nullptr && T > 0) {
         Impl& m = *impl_;
@@ -6475,10 +6552,14 @@ SegmentedResult Prefill::run_segments(const OwnerSpan* owners, int count, std::s
     SegmentedResult result;
     err.clear();
     if (!private_preparation_enabled() || !owners || count < 1 || count > kPrefillOwners ||
-        !on_segment || !on_segment_stage || !context_idle(err)) {
+        !on_segment || !on_segment_stage || (!retained_step_ && !operation_idle(err, true))) {
         if (err.empty()) err = "prefill: segmented execution requires 1..4 prepared owners and lifecycle callbacks";
         return result;
     }
+    for (const Prefill* stage = this; stage; stage = stage->next_)
+        if (stage->dflash2_enabled_ && count != 1) {
+            err = "dflash2 capture: multi-owner packed prompt arithmetic is unsupported"; return result;
+        }
     int stage_count = 0;
     int64_t capacity = kPrefillRows;
     for (Prefill* stage = this; stage; stage = stage->next_, ++stage_count) {
@@ -6487,6 +6568,16 @@ SegmentedResult Prefill::run_segments(const OwnerSpan* owners, int count, std::s
             err = "prefill: segmented execution requires owned text-only stage arenas"; return result;
         }
         capacity = std::min(capacity, arena.T);
+        if (!arena.dflash2_capture.idle()) {
+            const auto& input = owners[0];
+            if (input.slot != arena.dflash2_slot || input.request != arena.dflash2_owner.request ||
+                input.incarnation != arena.dflash2_owner.incarnation ||
+                !stage->capture_owner_matches(arena.dflash2_owner, input.slot) ||
+                input.position != arena.dflash2_next || input.rows < 1 ||
+                input.rows != arena.dflash2_end - input.position) {
+                err = "dflash2 capture: one-owner execution differs from the armed destination/interval"; return result;
+            }
+        }
         for (int i = 0; i < count; ++i) {
             const auto& input = owners[i];
             const auto* state = input.stages[stage_count];
@@ -6522,6 +6613,12 @@ SegmentedResult Prefill::run_segments(const OwnerSpan* owners, int count, std::s
             }
         }
     }
+    // An interruptible owner issues and arms one bounded physical chunk at a
+    // time. A whole-run capture cannot pretend its unissued suffix was read.
+    for (const Prefill* stage = this; stage; stage = stage->next_)
+        if (!stage->impl_->dflash2_capture.idle() && command_pending && owners[0].rows > capacity) {
+            err = "dflash2 capture: command-yield execution must arm each issued owner chunk"; return result;
+        }
     if (capacity < 1 || impl_->execution == UINT64_MAX || public_running_.exchange(true)) {
         err = "prefill: segmented execution unavailable or identity exhausted"; return result;
     }
@@ -6591,11 +6688,36 @@ SegmentedResult Prefill::run_segments(const OwnerSpan* owners, int count, std::s
     for (Prefill* stage = this; stage; stage = stage->next_)
         stage->impl_->gemm.flush_native_profile(okay);
     if (!okay) result.completion = PrefillCompletion::failed;
+    if (!okay)
+        for (Prefill* stage = this; stage; stage = stage->next_) stage->impl_->dflash2_capture.poison();
     if (okay) for (int i = 0; i < count; ++i)
         if (result.touched & (uint32_t(1) << i))
             for (Prefill* stage = this; stage; stage = stage->next_)
                 stage->impl_->owner_execution[owners[i].slot] = result.execution;
     return result;
+}
+
+SegmentedResult Prefill::run_owner(const OwnerSpan& owner, std::string& err,
+        const std::function<bool(Prefill*, int64_t, std::string&)>& step, bool layer_yields) {
+    if (!step) return run_segments(&owner, 1, err, {});
+    if (!retained_ready(owner.rows, &owner, err)) return {};
+    struct Reset {
+        Prefill* first;
+        ~Reset() {
+            for (Prefill* stage = first; stage; stage = stage->next_) {
+                stage->retained_step_ = nullptr;
+                stage->retained_layer_yields_ = true;
+                stage->impl_->retained_stop = nullptr;
+            }
+        }
+    } reset{this};
+    for (Prefill* stage = this; stage; stage = stage->next_) {
+        stage->retained_step_ = &step;
+        stage->retained_layer_yields_ = layer_yields;
+        stage->impl_->retained_stop = &should_stop;
+        stage->impl_->retained_cancel_requested = stage->impl_->retained_cancelled = false;
+    }
+    return run_segments(&owner, 1, err, {});
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
@@ -6679,37 +6801,51 @@ bool Prefill::retained_boundary(int64_t next_layer, std::string& err, bool bulk_
     return true;
 }
 
-bool Prefill::run_retained(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
-                          const std::function<bool(Prefill*, int64_t, std::string&)>& step, bool layer_yields) {
-    if (!step || n < 1) {
-        err = "prefill: retained run requires a callback and a chunk";
-        return false;
+bool Prefill::retained_ready(int64_t n, const OwnerSpan* selected, std::string& err) const {
+    if (n < 1) { err = "prefill: retained run requires a nonempty chunk"; return false; }
+    if (selected && (selected->slot < 0 || selected->slot >= kPrefillOwners)) {
+        err = "prefill: retained run requires a registered private owner slot"; return false;
     }
-    for (Prefill* owner = this; owner; owner = owner->next_) {
-        const auto& m = *owner->impl_;
+    size_t index = 0;
+    for (const Prefill* stage = this; stage; stage = stage->next_, ++index) {
+        const auto& m = *stage->impl_;
         // GPU streams can still belong to decode; the entry callback returns
         // that device's lease before run_impl submits any prompt operation.
-        if (owner->public_running_.load() || owner->next_packet_ || m.running.load() || m.poisoned) {
+        if (stage->public_running_.load() || stage->next_packet_ || m.running.load() || m.poisoned) {
             err = "prefill: retained bulk owner is already active or poisoned"; return false;
         }
-        if (m.T != 2048 || n > m.T || m.borrowed || owner->helper_ ||
+        const auto* state = selected && index < selected->stages.size() ? selected->stages[index] :
+                            selected ? nullptr : m.ss;
+        if (!m.initialized || !state || !state->qsa_states || !state->gdn_state || (selected &&
+            (!stage->capture_owner_matches({selected->request, selected->incarnation, 0}, selected->slot) ||
+             m.owner_sessions[size_t(selected->slot)] != state))) {
+            err = "prefill: retained run does not own its actual destination"; return false;
+        }
+        if (m.T != 2048 || n > m.T || m.borrowed || stage->helper_ ||
             m.help_pp || !m.pps.empty() || cpu_share_enabled() || !m.host_res) {
             err = "prefill: retained run requires owned 2048 scratch without helpers"; return false;
         }
-        for (int64_t l = owner->stage_lb_; l < owner->stage_le_; ++l)
+        for (int64_t l = stage->stage_lb_; l < stage->stage_le_; ++l)
             for (int64_t e = 0; e < m.g->n_expert; ++e)
                 if (m.host_res[l * m.g->n_expert + e] < 0) {
                     err = "prefill: retained run requires complete local expert residency"; return false;
                 }
-        for (int64_t j = 0; j < m.ss->qsa_alloc; ++j)
-            if (m.ss->qsa_states[m.ss->qsa_ord0 + j].kv_mode != 0) {
+        for (int64_t j = 0; j < state->qsa_alloc; ++j)
+            if (state->qsa_states[state->qsa_ord0 + j].kv_mode != 0) {
                 err = "prefill: retained run requires resident KV"; return false;
             }
-        for (Prefill* previous = this; previous != owner; previous = previous->next_)
-            if (previous->device() == owner->device()) {
+        for (const Prefill* previous = this; previous != stage; previous = previous->next_)
+            if (previous->device() == stage->device()) {
                 err = "prefill: retained run requires distinct stage devices"; return false;
             }
     }
+    return true;
+}
+
+bool Prefill::run_retained(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
+                          const std::function<bool(Prefill*, int64_t, std::string&)>& step, bool layer_yields) {
+    if (!step) { err = "prefill: retained run requires a callback"; return false; }
+    if (!retained_ready(n, nullptr, err)) return false;
     // A stackful continuation: no residual copy, re-preparation, changed layer
     // range, chunk subdivision, or extra device allocation. run() keeps its
     // existing public lease, failure poisoning and descendant drain.

@@ -37,14 +37,18 @@ struct ScratchUnavailable : Refusal { using Refusal::Refusal; };
 void require(bool condition, const char* message) {
     if (!condition) throw Refusal(message);
 }
-void validate_operation(const Operation& op) {
-    require(!op.request_id.empty() && op.request_id.size() <= 128, "invalid request identity");
-    for (char c : op.request_id)
+void validate_operation_fields(std::string_view request, int64_t incarnation, int64_t generation,
+                               int frontier, bool capture) {
+    require(!request.empty() && request.size() <= 128, "invalid request identity");
+    for (char c : request)
         require((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                 (c >= '0' && c <= '9') || c == '_' || c == '.' || c == ':' || c == '-',
                 "invalid request identity");
-    require(op.incarnation >= 0 && op.generation > 0 && op.frontier >= 0 &&
-            op.frontier <= max_position - block_size, "invalid operation extent/generation");
+    require(incarnation >= 0 && generation > 0 && frontier >= 0 &&
+            frontier <= max_position - (capture ? 0 : block_size), "invalid operation extent/generation");
+}
+void validate_operation(const Operation& op, bool capture = false) {
+    validate_operation_fields(op.request_id, op.incarnation, op.generation, op.frontier, capture);
 }
 void validate_identity(const TargetIdentity& id) {
     for (const auto* digest : {&id.pack_sha256, &id.embedding_sha256, &id.head_sha256, &id.tokenizer_sha256}) {
@@ -215,31 +219,61 @@ private:
 
 CaptureStore::CaptureStore(std::string request_id, int64_t incarnation, int origin, int capacity)
     : request_id_(std::move(request_id)), incarnation_(incarnation), origin_(origin), capacity_(capacity), end_(origin) {
-    validate_operation({request_id_, incarnation_, 1, origin});
+    validate_operation_fields(request_id_, incarnation_, 1, origin, true);
+    request_id_.reserve(128); operation_.request_id.reserve(128);
     require(capacity > 0 && capacity <= context_rows, "capture capacity must be in [1,2047]");
     ring_ = std::make_unique_for_overwrite<uint16_t[]>(size_t(context_rows) * feature_width);
     tentative_ = std::make_unique_for_overwrite<uint16_t[]>(size_t(capacity) * feature_width);
+    tentative_data_ = tentative_.get();
+    ring_generations_ = std::make_unique_for_overwrite<int64_t[]>(context_rows);
+}
+CaptureStore::CaptureStore(std::string request_id, int64_t incarnation, int origin,
+        std::span<uint16_t> staging, OperationLease& lease)
+    : request_id_(std::move(request_id)), incarnation_(incarnation), origin_(origin),
+      capacity_(int(staging.size() / feature_width)), end_(origin),
+      tentative_data_(staging.data()), shared_lease_(&lease) {
+    validate_operation_fields(request_id_, incarnation_, 1, origin, true);
+    request_id_.reserve(128); operation_.request_id.reserve(128);
+    require(staging.size() == size_t(context_rows) * feature_width,
+            "borrowed capture staging must contain exactly 2047 BF16 feature rows");
+    ring_ = std::make_unique_for_overwrite<uint16_t[]>(size_t(context_rows) * feature_width);
     ring_generations_ = std::make_unique_for_overwrite<int64_t[]>(context_rows);
 }
 CaptureStore::~CaptureStore() = default;
 size_t CaptureStore::storage_bytes() const noexcept {
-    return planned_bytes(capacity_);
+    return shared_lease_ ? committed_bytes() : planned_bytes(capacity_);
 }
 void CaptureStore::reset(std::string request_id, int64_t incarnation, int origin) {
-    validate_operation({request_id, incarnation, 1, origin});
+    validate_operation_fields(request_id, incarnation, 1, origin, true);
     require(!poisoned_ && !active_ && !bridge_attached_ && incarnation > incarnation_,
             "cannot rebind a stale/poisoned/busy/attached feature store");
     request_id_ = std::move(request_id); incarnation_ = incarnation; origin_ = origin;
     generation_ = 0; end_ = origin; retained_ = 0; head_ = 0; seen_ = 0;
 }
+void CaptureStore::resume(std::string_view request_id, int64_t incarnation, int origin, int frontier) {
+    validate_operation_fields(request_id, incarnation, 1, frontier, true);
+    require(!poisoned_ && !active_ && !bridge_attached_ && origin >= 0 && frontier >= origin && frontier <= max_position &&
+            incarnation >= incarnation_ && (incarnation > incarnation_ || request_id == request_id_),
+            "cannot resume a stale/poisoned/busy/foreign feature producer");
+    if (incarnation > incarnation_) generation_ = 0;
+    request_id_.assign(request_id); incarnation_ = incarnation; origin_ = origin;
+    end_ = frontier; retained_ = 0; head_ = 0; seen_ = 0; active_lease_ = nullptr;
+}
 bool CaptureStore::owns(const Operation& op) const {
     return op.request_id == request_id_ && op.incarnation == incarnation_;
 }
-void CaptureStore::abort() noexcept { poisoned_ = true; active_ = false; seen_ = 0; }
+void CaptureStore::abort() noexcept {
+    poisoned_ = true; active_ = false; seen_ = 0; active_lease_ = nullptr;
+}
 [[noreturn]] void CaptureStore::refuse(const char* message) { abort(); throw Refusal(message); }
-void CaptureStore::begin(const Operation& op, int start, int count, CapturePhase phase) {
+void CaptureStore::begin(const Operation& op, int start, int count, CapturePhase phase,
+                         const OperationLease::Guard* lease) {
+    if (shared_lease_ && (!owns(op) || op.generation <= generation_))
+        throw Refusal("stale capture request/incarnation/generation");
     try {
-        validate_operation(op);
+        validate_operation(op, true);
+        require(!shared_lease_ || (lease && lease->holds(*shared_lease_)),
+                "borrowed capture staging requires its held common operation lease");
         require(!poisoned_ && !active_ && owns(op) && op.generation > generation_,
                 "stale/unowned or busy capture");
         // A full retained prefill tail may replace all prior context atomically.
@@ -249,10 +283,11 @@ void CaptureStore::begin(const Operation& op, int start, int count, CapturePhase
                 count > 0 && count <= capacity_ && (start == end_ || replaces_context) &&
                 start <= max_position - count, "noncontiguous or oversized capture extent");
         require(phase == CapturePhase::prefill ? start + count == op.frontier :
-                (start == op.frontier && count <= block_size), "capture phase/frontier mismatch");
+                (start == op.frontier && count <= max_verify_rows), "capture phase/frontier mismatch");
         operation_ = op;
         start_ = start; count_ = count; phase_ = phase; generation_ = op.generation;
         seen_ = 0; active_ = true;
+        active_lease_ = lease;
     } catch (...) { abort(); throw; }
 }
 void CaptureStore::capture(const Operation& op, int layer, int materialized_layer,
@@ -260,6 +295,8 @@ void CaptureStore::capture(const Operation& op, int layer, int materialized_laye
                           std::span<const float> residuals) {
     try {
         require(!poisoned_ && active_ && op == operation_, "stale/unowned capture completion");
+        require(!shared_lease_ || (active_lease_ && active_lease_->holds(*shared_lease_)),
+                "capture completion outlived its common operation lease");
         const auto found = std::find(tap_layers.begin(), tap_layers.end(), layer);
         require(found != tap_layers.end(), "unknown capture tap layer");
         const size_t tap = size_t(found - tap_layers.begin());
@@ -275,7 +312,7 @@ void CaptureStore::capture(const Operation& op, int layer, int materialized_laye
         require_fp32_environment();
         for (int row = 0; row < count_; ++row) {
             const float* streams = residuals.data() + size_t(row) * 4 * hidden_size;
-            uint16_t* output = tentative_.get() + size_t(row) * feature_width + tap * hidden_size;
+            uint16_t* output = tentative_data_ + size_t(row) * feature_width + tap * hidden_size;
             for (int column = 0; column < hidden_size; ++column) {
                 const float s0 = streams[column], s1 = streams[hidden_size + column];
                 const float s2 = streams[2 * hidden_size + column], s3 = streams[3 * hidden_size + column];
@@ -296,6 +333,8 @@ void CaptureStore::capture(const Operation& op, int layer, int materialized_laye
     } catch (...) { abort(); throw; }
 }
 void CaptureStore::check_commit(const Operation& op, int keep) {
+    if (shared_lease_ && (!active_lease_ || !active_lease_->holds(*shared_lease_)))
+        refuse("capture publication outlived its common operation lease");
     if (poisoned_ || !active_ || op != operation_ || seen_ != all_taps ||
         keep < 1 || keep > count_ || (phase_ == CapturePhase::prefill && keep != count_))
         refuse("cannot publish incomplete/stale capture or invalid committed prefix");
@@ -305,17 +344,17 @@ void CaptureStore::commit(const Operation& op, int keep) {
     for (int row = 0; row < keep; ++row) {
         const int slot = (head_ + retained_) % context_rows;
         std::memcpy(ring_.get() + size_t(slot) * feature_width,
-                    tentative_.get() + size_t(row) * feature_width, feature_row_bytes);
+                    tentative_data_ + size_t(row) * feature_width, feature_row_bytes);
         ring_generations_[size_t(slot)] = op.generation;
         if (retained_ == context_rows) head_ = (head_ + 1) % context_rows;
         else ++retained_;
     }
     end_ = start_ + keep;
-    active_ = false; seen_ = 0;
+    active_ = false; seen_ = 0; active_lease_ = nullptr;
 }
 void CaptureStore::discard(const Operation& op) {
     if (poisoned_ || !active_ || op != operation_) refuse("cannot discard an unowned capture");
-    active_ = false; seen_ = 0;
+    active_ = false; seen_ = 0; active_lease_ = nullptr;
 }
 FeatureView CaptureStore::committed_since(int start) const {
     require(!poisoned_ && !active_ && start >= retained_start() && start <= end_,

@@ -7,8 +7,10 @@
 //   4. match-length buckets learn separately (short matches failing does not stop long ones);
 //   5. the policy never proposes a window beyond its cap.
 #include "strata/spec/draft_policy.hpp"
+#include "strata/core/spec_prob.hpp"
 
 #include <cstdio>
+#include <cmath>
 
 using strata::spec::DraftPolicy;
 
@@ -113,6 +115,68 @@ int main() {
         check(probes > 0 && probes <= 3 && spaced,
               "chain: stale full size is re-probed despite a profitable shorter chain");
         check(probes > 0 && confident, "chain: stale re-probes retain the MTP confidence gate");
+    }
+    {
+        using strata::spec::neural_window_width;
+        const float low_first[] = {0.25f, 0.95f};
+        const float low_second[] = {0.75f, 0.25f};
+        check(neural_window_width(low_first, 2, 3, 0.5f, true) == 2,
+              "sampled: low own probability cannot suppress the first draw");
+        check(neural_window_width(low_second, 2, 3, 0.5f, true) == 3,
+              "sampled: prior confidence authorizes the next draw, not its own");
+        check(neural_window_width(low_first, 2, 3, 0.5f, false) == 1 &&
+              neural_window_width(low_second, 2, 3, 0.5f, false) == 2,
+              "greedy: the existing own-row confidence threshold is unchanged");
+        check(neural_window_width(low_second, 2, 1, 0.5f, true) == 1,
+              "output/context allowance can independently exclude all drafts");
+    }
+    {
+        // Exact quadrature, not a stochastic frequency check. Suppressing the
+        // Q=0.25 draw at this threshold would produce (0.625,0.375), not P.
+        const int32_t ids[] = {0, 1};
+        const double p[] = {0.5, 0.5};
+        const float q[] = {0.75f, 0.25f};
+        const strata::core::SpecP target{ids, p, 2};
+        const strata::core::SpecQ draft{ids, q, 2};
+        double law[2] = {};
+        for (int d = 0; d < 2; ++d) {
+            const int width = strata::spec::neural_window_width(q + d, 1, 2, 0.5f, true);
+            for (int accept = 0; accept < 3; ++accept)
+                for (int plain = 0; plain < 2; ++plain) {
+                    const float ua = float(2 * accept + 1) / 6;
+                    const float up = float(2 * plain + 1) / 4;
+                    const int32_t token = width > 1
+                        ? strata::core::spec_verify_row(target, d, draft, ua, 0.5f).token
+                        : strata::core::spec_sample(target, up);
+                    law[token] += double(q[d]) / 6;
+                }
+        }
+        check(std::fabs(law[0] - p[0]) < 1e-12 && std::fabs(law[1] - p[1]) < 1e-12,
+              "sampled threshold plus rejection preserves the declared target law");
+    }
+    {
+        // If lookup eligibility depends on agreement with the current sample,
+        // the same target and Q would instead emit (0.375,0.625).
+        const int32_t ids[] = {0, 1};
+        const double p[] = {0.5, 0.5};
+        const float q[] = {0.75f, 0.25f};
+        const strata::core::SpecP target{ids, p, 2};
+        const strata::core::SpecQ draft{ids, q, 2}, point{nullptr, nullptr, -1};
+        double law[2] = {};
+        for (int d = 0; d < 2; ++d) {
+            const bool lookup = strata::spec::lookup_competes(true, true, 0, d);
+            for (int accept = 0; accept < 6; ++accept) {
+                const float ua = float(2 * accept + 1) / 12;
+                const int32_t token = strata::core::spec_verify_row(
+                    target, lookup ? 0 : d, lookup ? point : draft, ua, 0.5f).token;
+                law[token] += double(q[d]) / 6;
+            }
+        }
+        check(std::fabs(law[0] - p[0]) < 1e-12 && std::fabs(law[1] - p[1]) < 1e-12,
+              "sampled source competition cannot condition on current draft agreement");
+        check(!strata::spec::lookup_competes(false, true, 0, 1) &&
+              strata::spec::lookup_competes(false, true, 0, 0),
+              "greedy lookup retains its existing first-token agreement rule");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

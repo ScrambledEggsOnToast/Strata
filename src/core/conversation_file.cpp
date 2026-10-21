@@ -46,6 +46,8 @@ namespace {
 constexpr char kMagic[8] = {'S', 'T', 'R', 'S', 'E', 'S', 'S', '\x01'};
 constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
 constexpr uint32_t kVersion = 1;
+constexpr uint32_t kNeuralVersion = 2;
+constexpr uint64_t kNeuralMetadataBytes = 224;
 constexpr size_t kHeader = 64, kTrailer = 16;
 
 // Progress for a transfer: one report after every block that was handed to (or read from) the OS, whatever its size
@@ -686,9 +688,26 @@ void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
     o.u64(c.used);
 }
 
+bool neural_payload(const SavedConversation& image) {
+    return image.draft_identity.kind != DraftKind::none || image.draft_begin != -1 ||
+        image.draft_cells != -1 || image.draft_next_token != -1 || !image.draft_boundary_residual.empty();
+}
+void put_draft(Out& out, const SavedConversation& image) {
+    const auto& identity = image.draft_identity;
+    out.u64(uint64_t(identity.kind)); out.u64(identity.format);
+    out.raw(identity.weights.data(), identity.weights.size());
+    out.raw(identity.configuration.data(), identity.configuration.size());
+    out.raw(identity.borrowed_target.data(), identity.borrowed_target.size());
+    out.u64(0); // a persistent image never asserts a live allocation generation
+    for (auto dimension : identity.geometry) out.i64(dimension);
+    out.i64(image.draft_origin); out.i64(image.draft_begin); out.i64(image.draft_cells);
+    out.i64(image.draft_next_token); out.buffer(image.draft_boundary_residual);
+}
+
 void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
     for (int64_t g : s.geometry) o.i64(g);
     o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
+    if (neural_payload(s)) put_draft(o, s);
     put_checkpoint(o, s.live);
     o.u64(s.checkpoints.size());
     for (const auto& c : s.checkpoints) put_checkpoint(o, c);
@@ -762,7 +781,7 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
            in.vec(c.block_pos.write(), m[4]) && in.u64(c.used);
 }
 
-bool get_payload(In& in, SavedConversation& s) {
+bool get_payload(In& in, SavedConversation& s, uint32_t version) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
     if (in.limits.geometry && *in.limits.geometry != s.geometry)
@@ -774,6 +793,35 @@ bool get_payload(In& in, SavedConversation& s) {
         return in.fail("saved with another layer range than this runtime's");
     if (cvec > 1) return in.fail("invalid cvec flag");
     s.cvec = cvec == 1;
+    if (version == kNeuralVersion) {
+        uint64_t kind = 0, format = 0, generation = 0;
+        int64_t token = -1;
+        auto& identity = s.draft_identity;
+        if (!in.u64(kind) || kind > uint64_t(DraftKind::dflash2) ||
+            !in.u64(format) || format > UINT32_MAX ||
+            !in.raw(identity.weights.data(), identity.weights.size()) ||
+            !in.raw(identity.configuration.data(), identity.configuration.size()) ||
+            !in.raw(identity.borrowed_target.data(), identity.borrowed_target.size()) ||
+            !in.u64(generation) || generation)
+            return in.fail("invalid or truncated neural draft identity");
+        identity.kind = DraftKind(kind); identity.format = uint32_t(format);
+        for (auto& dimension : identity.geometry) if (!in.i64(dimension)) return false;
+        if (!in.i64(s.draft_origin) || !in.i64(s.draft_begin) || !in.i64(s.draft_cells) ||
+            !in.i64(token) || token < -1 || token > INT32_MAX)
+            return in.fail("invalid neural draft certification");
+        s.draft_next_token = int32_t(token);
+        if (identity.kind != DraftKind::none && !identity.bound())
+            return in.fail("neural draft has no immutable weight identity");
+        if (in.limits.draft_identity && identity.kind != DraftKind::none &&
+            !in.limits.draft_identity->content_matches(identity))
+            return in.fail("another neural draft kind/weights/borrowed target/geometry");
+        uint64_t boundary = 0;
+        if (!in.count(boundary, 1, in.limits.max_draft_boundary_bytes)) return false;
+        s.draft_boundary_residual.resize(size_t(boundary));
+        if (!s.draft_boundary_residual.visit(0, size_t(boundary),
+            [&](uint8_t* p, size_t n, size_t) { return in.raw(p, n); })) return false;
+        s.draft_boundary_residual.freeze();
+    }
     if (!get_checkpoint(in, s.live)) return false;
     uint64_t n = 0;
     // a checkpoint is at least 8 counts + used = 72 bytes; a K/V layer at least 7 + 5 = 96
@@ -801,12 +849,70 @@ bool has_stage_parts(const SavedConversation& s) {
     return false;
 }
 
+uint64_t session_kv_part(const ConversationKv& kv, size_t part) {
+    const ConversationBuffer* buffers[] = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled};
+    return buffers[part]->size();
+}
+uint64_t session_kv_part(const SessionKvSource& kv, size_t part) { return kv.sizes[part]; }
+template<class Kv>
+bool session_draft_validate(const SavedConversation& image, const Kv* kv, size_t count, std::string& error) {
+    const auto reject = [&](const char* why) { error = std::string("session file: ") + why; return false; };
+    const auto& id = image.draft_identity;
+    if (id.kind != DraftKind::none && id.kind != DraftKind::mtp && id.kind != DraftKind::dflash2)
+        return reject("unknown neural draft kind");
+    const bool unknown = image.draft_begin == -1 && image.draft_cells == -1 && image.draft_next_token == -1 &&
+                         image.draft_boundary_residual.empty();
+    if (id.kind == DraftKind::none && unknown) return true; // historical applicable target/MTP image
+    if (id.kind != DraftKind::none && (!id.bound() || id.format != 1))
+        return reject("absent draft weights or unsupported numerical format");
+    if (id.kind != DraftKind::dflash2 && unknown) return true; // absence remains absence
+    const int64_t live = int64_t(image.live.ids.size());
+    if (image.draft_begin < 0 || image.draft_cells < image.draft_begin || image.draft_cells > live ||
+        image.geometry[1] <= 0 || image.geometry[2] <= 0 || image.layer_lo < 0 ||
+        image.layer_hi != image.geometry[1] || image.layer_hi < image.layer_lo)
+        return reject("incoherent draft certificate or target carve");
+    const size_t main = size_t(std::max<int64_t>(
+        image.layer_hi / image.geometry[2] - image.layer_lo / image.geometry[2],
+        image.geometry[1] / image.geometry[2] ? 1 : 0));
+    if (id.kind == DraftKind::dflash2) {
+        const auto nonzero = [](const auto& digest) {
+            return std::any_of(digest.begin(), digest.end(), [](uint8_t value) { return value != 0; });
+        };
+        if (id.geometry != std::array<int64_t, 8>{5, 2560, 8, 128, 2047, 4, 262144, 16} ||
+            !nonzero(id.configuration) || !nonzero(id.borrowed_target) || image.draft_origin < 0 ||
+            image.draft_begin != std::max(image.draft_origin, image.draft_cells - int64_t(2047)) ||
+            image.draft_cells != live || image.draft_cells > 262144 || image.draft_next_token != -1 ||
+            !image.draft_boundary_residual.empty() || count != main + 5)
+            return reject("invalid native draft identity/origin/committed context certificate");
+        const uint64_t bytes = uint64_t(image.draft_cells - image.draft_begin) * 8 * 128 * sizeof(uint16_t);
+        for (size_t layer = main; layer < count; ++layer) {
+            const auto& state = kv[layer];
+            if (state.format != 0 || state.cells != image.draft_cells || state.heads != 8 || state.head_dim != 128 ||
+                state.page_size != 1 || state.pooled_rows || state.idx_dim ||
+                session_kv_part(state, 0) != bytes || session_kv_part(state, 1) != bytes ||
+                session_kv_part(state, 2) || session_kv_part(state, 3) || session_kv_part(state, 4))
+                return reject("native draft is not five compact BF16 8x128 K/V layers");
+        }
+        return true;
+    }
+    if (count != main + 1 || kv[count - 1].cells < image.draft_cells ||
+        (image.draft_cells == live ? image.draft_next_token < 0 : image.draft_next_token != -1))
+        return reject("invalid MTP private interval or next-token witness");
+    if (!image.draft_boundary_residual.empty()) {
+        if (image.draft_cells != live - 1 || image.geometry[0] <= 0 || image.geometry[14] <= 0 ||
+            uint64_t(image.geometry[0]) > UINT64_MAX / uint64_t(image.geometry[14]) / sizeof(float) ||
+            image.draft_boundary_residual.size() != uint64_t(image.geometry[0]) * uint64_t(image.geometry[14]) * sizeof(float))
+            return reject("invalid owned MTP portable boundary residual");
+    }
+    return true;
+}
+
 // header v1, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 reserved:u64[2]
 // header_hash:u64 (session_hash64 of bytes 0..55, seed 0)
-void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
+void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload, uint32_t version) {
     std::memset(h, 0, kHeader);
     std::memcpy(h, kMagic, 8);
-    const uint32_t version = kVersion, size = kHeader;
+    const uint32_t size = kHeader;
     std::memcpy(h + 8, &version, 4);
     std::memcpy(h + 12, &size, 4);
     std::memcpy(h + 16, &id.model, 8);
@@ -1007,6 +1113,7 @@ uint64_t session_read_max_file_bytes(const SessionReadLimits& l) {
     for (uint64_t b : l.max_state_bytes) cp = sat_add(cp, sat_add(8, b));
     cp = sat_add(cp, 8);
     uint64_t n = kHeader + kTrailer + 18 * 8 + 3 * 8;             // geometry, layer range, cvec
+    n = sat_add(n, sat_add(kNeuralMetadataBytes, l.max_draft_boundary_bytes));
     n = sat_add(n, cp);                                            // live
     n = sat_add(n, sat_add(8, sat_mul(l.max_checkpoints, cp)));    // checkpoints
     n = sat_add(n, 8);
@@ -1032,6 +1139,8 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     st.error = SessionError::invalid;   // refusals before any disk access
     if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
+    if (!(sources ? session_draft_validate(image, sources->data(), sources->size(), error) :
+                    session_draft_validate(image, image.kv.data(), image.kv.size(), error))) return false;
     Out sizing;
     put_payload(sizing, image, sources);
     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
@@ -1070,7 +1179,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     f.write_fault = injected(fault, "write");
     f.flush_fault = injected(fault, "file_flush");
     uint8_t h[kHeader];
-    header_bytes(h, id, payload);
+    header_bytes(h, id, payload, neural_payload(image) ? kNeuralVersion : kVersion);
     bool ok = f.write(h, kHeader);
     SessionHasher hash(0);
     Out out;
@@ -1205,7 +1314,13 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
     if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
     if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
-    if (version != kVersion) { error = "session file: unsupported version " + std::to_string(version); return false; }
+    if (version != kVersion && version != kNeuralVersion) {
+        error = "session file: unsupported version " + std::to_string(version); return false;
+    }
+    if (version == kVersion && limits.draft_identity &&
+        limits.draft_identity->kind == DraftKind::dflash2) {
+        error = "session file: historical v1 has no DFlash identity or producer certificate"; return false;
+    }
     if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
     if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return false; }
     if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
@@ -1224,7 +1339,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     }
     SavedConversation parsed;
     In in{&f, SessionHasher(0), payload, error, limits};
-    if (!get_payload(in, parsed)) { st.error = in.kind; return false; }
+    if (!get_payload(in, parsed, version)) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
     if (!f.read(t, kTrailer)) { st.error = f.kind(); error = "session file: trailer read error: " + f.error(); return false; }
@@ -1232,6 +1347,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     std::memcpy(&ph, t, 8);
     if (ph != in.hash.digest()) { error = "session file: payload checksum mismatch"; return false; }
     if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
+    if (!session_draft_validate(parsed, parsed.kv.data(), parsed.kv.size(), error)) return false;
     image = std::move(parsed);
     bytes = (size_t) size;
     st.error = SessionError::none;

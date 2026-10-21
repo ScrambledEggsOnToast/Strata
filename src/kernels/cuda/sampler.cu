@@ -25,6 +25,7 @@
 #include "strata/core/emulate.hpp"
 
 #include <cuda_runtime.h>
+#include "strata/kernels/philox.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -36,32 +37,6 @@
 namespace strata::kernels {
 namespace {
 
-// Philox 4x32-10, the counter-based generator the phase asks for.  Counter-based matters because it makes the
-// stream a function of (seed, position) rather than of how many draws came before - so a batch can be sampled
-// in any order and a run is reproducible.
-__device__ __forceinline__ uint32_t philox4x32_round(uint32_t& c0, uint32_t& c1, uint32_t& c2, uint32_t& c3,
-                                                     uint32_t k0, uint32_t k1) {
-    const uint32_t hi0 = __umulhi(0x9E3779B9u, c0);
-    const uint32_t hi1 = __umulhi(0xBB67AE85u, c2);
-    const uint32_t lo0 = 0x9E3779B9u * c0;
-    const uint32_t lo1 = 0xBB67AE85u * c2;
-    const uint32_t n0 = hi1 ^ c1 ^ k0;
-    const uint32_t n1 = lo1;
-    const uint32_t n2 = hi0 ^ c3 ^ k1;
-    const uint32_t n3 = lo0;
-    c0 = n0; c1 = n1; c2 = n2; c3 = n3;
-    return 0;
-}
-
-__device__ __forceinline__ float philox_uniform(uint64_t seed, uint64_t counter) {
-    uint32_t c0 = (uint32_t) counter, c1 = (uint32_t) (counter >> 32);
-    uint32_t c2 = (uint32_t) seed, c3 = (uint32_t) (seed >> 32);
-    for (int i = 0; i < 10; ++i) {
-        philox4x32_round(c0, c1, c2, c3, (uint32_t) i, 0u);
-    }
-    // 24 bits of mantissa, so the value is uniform in [0,1) with no rounding to 1.0
-    return (float) (c0 >> 8) * (1.0f / 16777216.0f);
-}
 
 // GUMBEL-MAX COUPLING (STRATA_SPEC_GUMBEL=1, ported from llama.cpp-lab's --spec-coupled, lab PRs #26/#30).  The pick
 // is argmax_i p_i / E_i with E_i = -log(u_i) ~ Exp(1) and u_i a hash of (seed, counter, TOKEN ID) - exactly
@@ -1004,11 +979,11 @@ spec_draft_merge_kernel(const int2* __restrict__ cand, int n_blocks, int nv, int
 
 /// THE VERIFIER (one warp per window row): the row's post-chain distribution p from the split sampler's block lists,
 /// then spec_prob.hpp's rule - accept the row's draft d with min(1, p(d)/q(d)) (q from the drafter's list for rows
-/// < n_q, a point mass otherwise), and write out[t] = d on an accept, the residual sample on a reject (never d), the
-/// plain sample on the window's last row.  The host's `while (window[a+1] == out[a]) ++a` is unchanged.  Rows are
-/// independent: each draws its own uniforms from its position (p.counter + t).  `dtok` holds the T-1 drafts.
+/// < n_q, a point mass otherwise), and write out[t] = d on an accept or the residual sample on a reject.
+/// Undrafted rows are plain target samples. The host's accepted-prefix loop is unchanged.
+/// Each row draws uniforms from its absolute predictor position (p.counter + t).
 __global__ void __launch_bounds__(32)
-spec_verify_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vocab, const SamplerParams p, int k, int T,
+spec_verify_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vocab, const SamplerParams p, int k, int n_drafts,
                          const int32_t* __restrict__ dtok, const int32_t* __restrict__ qbuf, int n_q,
                          int* __restrict__ out) {
     const int t = blockIdx.x;
@@ -1027,9 +1002,9 @@ spec_verify_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_voca
     __syncwarp();
     const int n_keep = sampled_probs_warp(sel_logit, k, p, ex);
     const uint64_t pos = p.counter + (uint64_t) t;
-    const int d = t < T - 1 ? dtok[t] : -1;
-    const int32_t* qid = qbuf + (size_t) t * strata::core::kSpecQStride;
-    const float* qpr = (const float*) (qid + strata::core::kSpecQEntries);
+    const int d = t < n_drafts ? dtok[t] : -1;
+    const int32_t* qid = qbuf ? qbuf + (size_t) t * strata::core::kSpecQStride : nullptr;
+    const float* qpr = qid ? (const float*) (qid + strata::core::kSpecQEntries) : nullptr;
     const bool has_q = t < n_q;
     // lane 0: p(d), q(d) and the accept decision.  dec: 0 plain sample, 1 accept, 2 reject; point: no usable q(d)
     int dec = 0, point = 1;
@@ -1345,9 +1320,11 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
 
 
 bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
-                        const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
+                        const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_drafts, int n_q, int* out,
                         void* stream) {
     if (n_tokens <= 0 || n_vocab <= 0 || p.greedy || p.temperature <= 0.0f) return false;
+    if (n_drafts < 0 || n_drafts > n_tokens || n_q < 0 || n_q > n_drafts ||
+        (n_drafts && dtok == nullptr) || (n_q && qbuf == nullptr)) return false;
     if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) return false;
     const int k = sampled_k(p.top_k, n_vocab);
     const int n_blocks = (n_vocab + kSplitBlockSpan - 1) / kSplitBlockSpan;
@@ -1359,7 +1336,7 @@ bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const in
     sampler_split_part_kernel<<<dim3((unsigned) n_blocks, (unsigned) n_tokens), kSplitWarps * 32, 0,
                                 (cudaStream_t) stream>>>(logits, n_vocab, history, history_len, p, k, n_blocks, scratch);
     spec_verify_merge_kernel<<<(unsigned) n_tokens, 32, 0, (cudaStream_t) stream>>>(scratch, n_blocks, n_vocab, p, k,
-                                                                                    n_tokens, dtok, qbuf, n_q, out);
+                                                                                    n_drafts, dtok, qbuf, n_q, out);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "sample_tokens_spec launch: %s\n", cudaGetErrorString(e));

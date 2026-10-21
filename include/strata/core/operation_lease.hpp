@@ -26,6 +26,9 @@ public:
         }
         explicit operator bool() const { return failure_ == Failure::none; }
         Failure failure() const { return failure_; }
+        bool holds(const OperationLease& owner) const {
+            return &owner_ == &owner && lock_.owns_lock() && failure_ == Failure::none;
+        }
         // Keep ownership through the caller's final scratch reads. Destruction
         // unlocks; draining or a timeout alone never repairs poisoned state.
         void complete() { complete_ = true; }

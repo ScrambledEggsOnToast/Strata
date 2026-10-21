@@ -75,13 +75,15 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
 void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub, int id_vocab,
                        const SamplerParams* params, int32_t* ring, int cap, int j, const int32_t* step_rec,
                        void* scratch, int32_t* out_id, float* out_prob, int32_t* qrows, int gate_pick, float tscale, void* stream);
-// The verify window's head under rejection sampling: row t (< n_tokens - 1) judges the draft dtok[t] (n_tokens - 1
-// ids, device); rows < n_q have the drafter's list at qbuf + t * kSpecQStride (device), the others are point masses.
-// out[t] = the draft when kept, the residual sample when not, a plain sample on the last row; `p.counter` is the
-// window's first position, as sample_tokens.  False (nothing launched) where the split sampler cannot run - the
-// caller then calls sample_tokens (exact match).
+// Rejection sampling for n_tokens target rows. Rows t<n_drafts judge dtok[t];
+// rows <n_q use sparse conditional q at qbuf+t*kSpecQStride, and other drafts
+// are point masses. Remaining rows are ordinary target samples. Serial windows
+// pass n_drafts=n_tokens-1; a packed resident predictor may pass one row with
+// n_drafts=1. No second acceptance implementation is used for that case.
+// p.counter is the first absolute predictor position. False means unsupported,
+// with nothing launched; callers requiring conditional q MUST refuse, not fall back.
 bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
-                        const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
+                        const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_drafts, int n_q, int* out,
                         void* stream);
 
 // The penalty-history rows of a verify window, on the host: row t of `out` (T rows of `h` slots) is the last `h`

@@ -34,10 +34,20 @@ public:
     static VerifiedDailyTarget verify(const DailyTargetFiles&, const ModelGeometry&,
                                       const NativeTensorIdentity& embedding, const NativeTensorIdentity& head,
                                       std::chrono::milliseconds timeout = std::chrono::seconds(300));
+    // Identify the actual selected native closure once, before comparing it with
+    // an independently pinned drafter manifest. No declared digest substitutes
+    // for the bytes or loaded embedding/head receipts.
+    static VerifiedDailyTarget identify(const std::string& pack, const std::string& tokenizer,
+                                        const std::array<std::string, 2>& shards, const ModelGeometry&,
+                                        const NativeTensorIdentity& embedding, const NativeTensorIdentity& head,
+                                        std::chrono::milliseconds timeout = std::chrono::seconds(300));
     const BorrowedBinding& binding() const { return binding_; }
     const NativeTensorIdentity& embedding() const { return embedding_; }
     const NativeTensorIdentity& head() const { return head_; }
 private:
+    static VerifiedDailyTarget verify_impl(const DailyTargetFiles&, const ModelGeometry&,
+                                           const NativeTensorIdentity&, const NativeTensorIdentity&,
+                                           std::chrono::milliseconds, bool check_digests);
     VerifiedDailyTarget(BorrowedBinding binding, NativeTensorIdentity embedding, NativeTensorIdentity head)
         : binding_(std::move(binding)), embedding_(std::move(embedding)), head_(std::move(head)) {}
     BorrowedBinding binding_;

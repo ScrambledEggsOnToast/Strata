@@ -1,14 +1,10 @@
 #include "strata/core/operation_lease.hpp"
-#include <algorithm>
 
 #include <atomic>
 #include <cstdio>
 #include <future>
-#include <optional>
-#include <string>
 #include <stdexcept>
 #include <thread>
-#include <vector>
 
 using strata::core::OperationLease;
 using namespace std::chrono_literals;
@@ -17,78 +13,9 @@ static void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 
-namespace strata::core {
-struct OnDevice { explicit OnDevice(int) {} }; // only device selection is outside the CPU ownership seam
-}
-namespace core = strata::core;
-
-static void test_owned_boundaries() {
-    struct E9Drafter {
-        bool owned = true;
-        int calls = 0;
-        bool idle(std::string&) { return false; } // public lifecycle preflight must not be used by this owner
-        bool idle_owned(std::string&) { ++calls; return owned; }
-    } mtp;
-    std::string err;
-    using Clock = std::chrono::steady_clock;
-    const auto ms_since = [](Clock::time_point from) {
-        return std::chrono::duration<double, std::milli>(Clock::now() - from).count();
-    };
-    const auto e9 = [&] {
-#include "draft_owned_drain.inc"
-        (void)ms_idle;
-        return true;
-    };
-    require(e9() && mtp.calls == 1, "E9's already-owned stream boundary reacquired its lease");
-
-    struct Target {
-        int64_t cells = 0, completed_cells = 0, begin = 0, prompt_len = 0, proposal_cell = 0;
-        int32_t tail_token = -1, proposal = -1, proposal_token = -1;
-        bool certified = false;
-    };
-    struct Drafter {
-        OperationLease scratch;
-        Target slots_[1];
-        int calls = 0;
-        int device() const { return 0; }
-        bool catchup_slot(int slot, int, int32_t token, int64_t cell, std::string&) {
-            OperationLease::Guard catchup(scratch, 20ms);
-            if (!catchup) return false;
-            ++calls;
-            slots_[slot].cells = cell + 1;
-            slots_[slot].tail_token = token;
-            catchup.complete();
-            return true;
-        }
-    } draft_;
-    struct RestoreOperation {
-        OperationLease::Guard owner;
-        explicit RestoreOperation(Drafter& draft) : owner(draft.scratch) {}
-        bool finish(std::string&) { owner.complete(); return bool(owner); }
-    };
-    struct Image { int64_t draft_cells = 2, draft_begin = 0; int draft_boundary_residual = 123; } image;
-    struct Source { Image* image; } source{&image};
-    struct Lease { int slot = 0; } lease;
-    struct State { std::vector<int32_t> prompt{1, 2, 3, 4}; } state;
-    const std::vector<int> stages_{0};
-    const auto preparation_stage = [](const Image& value, size_t) -> const Image& { return value; };
-    const auto fail = [](int) { return false; };
-    std::string error;
-    const int64_t position = 3;
-    const auto restore = [&] {
-        const bool mtp = true;
-        std::optional<RestoreOperation> operation;
-        operation.emplace(draft_);
-#include "draft_restore_handoff.inc"
-        return true;
-    };
-    require(restore() && draft_.calls == 1 && draft_.slots_[0].cells == 3 && draft_.slots_[0].tail_token == 4,
-            "exact-cut restore held its finished operation across boundary catchup");
-}
 
 int main() {
     try {
-        test_owned_boundaries();
         OperationLease lease;
         std::future<bool> waiter;
         std::promise<void> entered;

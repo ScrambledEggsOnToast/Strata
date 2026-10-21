@@ -79,6 +79,8 @@ struct ContainerMeta {
     int64_t draft_begin = -1, draft_cells = -1;
     int32_t draft_next_token = -1;
     uint64_t draft_boundary_bytes = 0;
+    DraftIdentity draft_identity;
+    int64_t draft_origin = -1;
 };
 
 // One restorable token/image prefix of a whole image tree, with the exact prefix-chain digest that proves a query's
@@ -163,6 +165,7 @@ struct ImageShape {
     uint64_t max_stream_bytes = 0;     // the longest single stream: the largest chunk one read can produce
     uint64_t max_record_images = 0;    // the largest image-key list in one record: the PrefixChain's own scratch
     bool certified = false;           // MAN2 adds explicit metadata to every container
+    bool kind_tagged = false;        // MAN3 adds immutable numerical identity/geometry
 };
 
 // Counts what image_layout() would build, and refuses exactly what it would refuse (an unrepresentable stage depth,
@@ -226,6 +229,7 @@ struct ManifestShape {
     uint64_t objects = 0;
     uint64_t cuts = 0;
     bool certified = false;
+    bool kind_tagged = false;
 };
 uint64_t manifest_encoded_size_of(const ManifestShape& shape);
 ManifestShape manifest_shape(const ManifestMeta& meta);

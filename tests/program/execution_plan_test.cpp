@@ -7,6 +7,9 @@
 //   5. packed mode keeps its seat (in-place suspension); legacy batch resends; single-request serving has neither;
 //   6. the concurrent reader names the first option-level reason it is off;
 //   7. the JSON report is a single machine-readable line carrying those values.
+//   8. native block proposals keep three positions/four neural rows separate from eight target rows;
+//   9. fitted native groups price one physical eight-row verifier each and two disjoint handoff windows;
+//  10. native retained preparation composes without the legacy MTP opt-in; packed prompt unions do not.
 #include "strata/program/execution_plan.hpp"
 #include "strata/program/native_admission.hpp"
 #include <array>
@@ -45,9 +48,9 @@ ep::batch_groups::Input group_input(const ep::ExecutionPlanInput& in) {
     bin.given = in.groups_given;
     bin.batch = ep::batch_groups::normalized_slots(in.batch_requested, 8);
     bin.later_stages = in.later_stages;
-    bin.batch_mtp = in.batch_mtp;
+    bin.batch_mtp = in.batch_mtp || (in.dflash2_configured && bin.batch > 0);
     bin.adapt_async = in.adapt_async;
-    bin.mtp_serial = in.mtp_serial;
+    bin.mtp_serial = in.mtp_serial || (in.dflash2_configured && !in.batch_mtp_pipeline);
     return bin;
 }
 ep::ExecutionPlanInput resident_batch() {
@@ -66,6 +69,15 @@ ep::ExecutionPlanInput resident_batch() {
     in.piped_concurrent = true;
     return in;
 }
+ep::ExecutionPlanInput dflash2_plan(int slots = 0) {
+    ep::ExecutionPlanInput in;
+    in.serve = true;
+    in.batch_requested = slots;
+    in.later_stages = 1;
+    in.dflash2_configured = true;
+    in.spec_requested = 4;
+    return in;
+}
 }  // namespace
 
 int main() {
@@ -79,6 +91,9 @@ int main() {
         check(p.spec_requested == 4 && p.spec == 8 && p.mtp_max_t == 4,
               "suffix and chaining resolve the effective speculative widths once");
         check(p.proposal == ep::ProposalShape::batched_pipeline, "the proposal shape is the pipelined batch MTP");
+        check(p.draft_kind == strata::core::DraftKind::mtp && p.proposal_positions == 1 &&
+              p.verifier_max_rows == 8 && p.draft_handoff_rows == 8,
+              "legacy MTP keeps single-position batch proposals and its original physical/transport capacities");
         check(p.suspension.support == ep::Support::conditional, "legacy batch suspension is a resend, not in place");
         check(p.lookup.support == ep::Support::conditional && has(p.lookup.reason, "solo serial") &&
               has(p.lookup.reason, "resident decode"),
@@ -90,6 +105,9 @@ int main() {
         check(has(json, "\"mode\":\"resident\"") && has(json, "\"proposal\":\"batched_pipeline\""),
               "the JSON report carries the resolved mode and proposal");
         check(has(json, "\"suspension\":{\"mode\":\"resend\""), "the JSON report carries the suspension mode");
+        check(has(json, "\"speculation\":{\"requested\":4,\"spec\":8,\"mtp_max\":4,\"proposal\":\"batched_pipeline\"}") &&
+              !has(json, "\"kind\"") && !has(json, "\"draft_handoff_rows\""),
+              "legacy speculation JSON keeps its existing keys and values without native block geometry");
     }
     {
         for (bool mtp : {false, true}) {
@@ -429,6 +447,247 @@ int main() {
         in.batch_requested = 3;
         const ep::ExecutionPlan r = ep::resolve_execution_plan(in);
         check(r.refused, "the third owner without four slots is refused");
+    }
+    {
+        const auto in = dflash2_plan();
+        const auto p = ep::resolve_execution_plan(in);
+        check(!p.refused && p.mode == ep::ServeMode::streaming &&
+              p.draft_kind == strata::core::DraftKind::dflash2 &&
+              p.proposal == ep::ProposalShape::serial_block_draft,
+              "native serial execution reports its canonical kind and block proposal, never serial MTP");
+        check(p.draft_max_t == 4 && p.mtp_max_t == 4 && p.proposal_positions == 3 &&
+              p.verifier_max_rows == 8 && p.draft_handoff_rows == 8,
+              "three native proposals plus their anchor do not inflate the eight-row physical target verifier");
+        check(p.drafting.support == ep::Support::conditional && p.memory_classes.empty() &&
+              p.admission.support == ep::Support::off,
+              "a no-load native plan claims neither successful graph capture nor retained admission");
+        const auto text = report(p, 0);
+        check(has(text, "\"kind\":\"dflash2\"") && has(text, "\"draft_max\":4,\"proposal_positions\":3") &&
+              has(text, "\"verifier_max_rows\":8,\"draft_handoff_rows\":8") &&
+              has(text, "\"execution\":{\"support\":\"conditional\"") && !has(text, "\"mtp_max\""),
+              "native JSON separates actual block geometry and conditional execution from legacy MTP sizing");
+    }
+    {
+        auto in = dflash2_plan();
+        for (int width : {2, 3, 4}) {
+            in.spec_requested = width;
+            const auto p = ep::resolve_execution_plan(in);
+            check(!p.refused && p.spec == width && p.mtp_max_t == width && p.draft_max_t == 4 &&
+                  p.proposal_positions == width - 1,
+                  "short target windows consume only their native proposal prefix without resizing the forward block");
+        }
+        in.spec_requested = 4;
+        in.suffix_draft = 12;
+        const auto suffix = ep::resolve_execution_plan(in);
+        check(!suffix.refused && suffix.spec == 6 && suffix.mtp_max_t == 4 && suffix.draft_max_t == 4 &&
+              suffix.proposal_positions == 3 && suffix.lookup.support == ep::Support::on,
+              "native suffix lookup expands only the serial target window from four to six");
+        in.lookup_chain = 2;
+        const auto chain = ep::resolve_execution_plan(in);
+        check(!chain.refused && chain.spec == 8 && chain.mtp_max_t == 4 && chain.draft_max_t == 4 &&
+              chain.proposal_positions == 3 && chain.verifier_max_rows == 8,
+              "native lookup chaining reaches eight target rows without inventing neural proposals four through seven");
+        in.lookup_chain = 20;
+        check(ep::resolve_execution_plan(in).spec == 8,
+              "lookup target expansion saturates at the unchanged physical verifier capacity");
+        in.suffix_draft = in.lookup_chain = 0;
+        in.mtp_max_requested = 8;
+        const auto capped = ep::resolve_execution_plan(in);
+        check(!capped.refused && capped.mtp_max_t == 4 && capped.proposal_positions == 3,
+              "a legacy prefix override cannot expand the native four-row block");
+        for (int width : {0, 1, 5, 8}) {
+            in.spec_requested = width;
+            const auto p = ep::resolve_execution_plan(in);
+            check(p.refused && p.drafting.support == ep::Support::refused &&
+                  p.proposal == ep::ProposalShape::none,
+                  "an out-of-range native neural width is refused instead of advertised as an executable proposal");
+        }
+    }
+    for (int slots : {1, 2, 3, 4}) {
+        auto in = dflash2_plan(slots);
+        const auto p = ep::resolve_execution_plan(in);
+        check(!in.batch_mtp && !in.mtp_configured && !p.refused &&
+              p.proposal == ep::ProposalShape::batched_block_draft && p.groups == 1 &&
+              p.batch_slots == slots && !p.batch_slots_resolved && p.groups_conditional,
+              "native resident drafting is effective without --batch-mtp and defaults to bounded synchronous waves");
+        check(p.proposal_positions == 3 && p.verifier_max_rows == 8 && p.draft_handoff_rows == 8 &&
+              p.drafting.support == ep::Support::conditional,
+              "admitting up to four logical native owners never claims a sixteen-row physical frame");
+    }
+    {
+        auto in = dflash2_plan(4);
+        in.groups_set = true;
+        in.groups_given = 2;
+        const auto explicit_groups = ep::resolve_execution_plan(in);
+        check(explicit_groups.refused && explicit_groups.drafting.support == ep::Support::refused,
+              "explicit native multi-group drafting needs the pipeline owner rather than silently dropping drafts");
+        in.groups_auto = true;
+        check(ep::resolve_execution_plan(in).refused,
+              "an explicit native auto-group request is not silently changed to synchronous ownership");
+        in.groups_auto = false;
+        in.groups_given = 3;
+        const auto fallback = ep::resolve_execution_plan(in);
+        check(!fallback.refused && fallback.groups == 1 && fallback.groups_requested == 3 &&
+              fallback.notes.size() == 1 && fallback.proposal == ep::ProposalShape::batched_block_draft,
+              "a nondividing native group request uses the canonical serial fallback and retains request attribution");
+        for (int slots : {5, 6, 8, 9}) {
+            in = dflash2_plan(slots);
+            const auto p = ep::resolve_execution_plan(in);
+            check(p.refused && p.drafting.support == ep::Support::refused &&
+                  p.proposal == ep::ProposalShape::none && p.draft_handoff_rows == 8,
+                  "native admission explicitly refuses more than four owners, even before generic slot normalization");
+        }
+        in = dflash2_plan();
+        in.mtp_configured = true;
+        check(ep::resolve_execution_plan(in).refused,
+              "the plan refuses simultaneous MTP and native kind selection");
+        in = dflash2_plan();
+        in.serve = false;
+        check(ep::resolve_execution_plan(in).refused,
+              "native non-serving execution is not advertised as a supported serving configuration");
+    }
+    for (int slots : {1, 2, 3, 4}) {
+        auto in = dflash2_plan(slots);
+        in.batch_mtp_pipeline = true;
+        in.groups_set = true;
+        in.groups_given = 2;
+        const auto p = ep::resolve_execution_plan(in);
+        const bool even = slots % 2 == 0;
+        check(p.refused != even && (even
+                  ? p.proposal == ep::ProposalShape::batched_block_pipeline && p.groups == 2 &&
+                    p.verifier_max_rows == 8 && p.draft_handoff_rows == 16 &&
+                    p.drafting.support == ep::Support::conditional
+                  : p.proposal == ep::ProposalShape::none && p.draft_handoff_rows == 8),
+              "only native even two/four-owner pipelines have two bounded eight-row handoff windows");
+    }
+    {
+        auto in = dflash2_plan(4);
+        in.groups_set = true;
+        in.groups_given = 2;
+        in.batch_mtp_pipeline = in.batch_mtp_floating = in.retained_prompt = in.prompt_cache = true;
+        in.foreground_budget_ms = 1000;
+        const auto p = ep::resolve_execution_plan(in);
+        check(!p.refused && !in.batch_mtp && p.proposal == ep::ProposalShape::batched_block_floating &&
+              p.groups == 2 && p.proposal_positions == 3 && p.verifier_max_rows == 8 && p.draft_handoff_rows == 16,
+              "native floating retains four logical owners with two physical eight-row verifier windows");
+        check(p.budget.support == ep::Support::on && p.suspension_mode == ep::Suspension::in_place &&
+              p.suspension.support == ep::Support::conditional && p.admission.support == ep::Support::conditional &&
+              p.drafting.support == ep::Support::conditional,
+              "native floating and private retained preparation compose without claiming allocation or graph success");
+        in.batch_mtp_third = true;
+        const auto third = ep::resolve_execution_plan(in);
+        check(third.refused && has(third.refusal, "--batch-mtp-third") &&
+              third.drafting.support == ep::Support::refused && third.proposal == ep::ProposalShape::none,
+              "native optional third-owner execution is an explicit refusal, not a legacy-MTP capability claim");
+    }
+    {
+        auto in = dflash2_plan(1);
+        in.retained_prompt = in.prompt_cache = true;
+        in.foreground_budget_ms = 1000;
+        const auto p = ep::resolve_execution_plan(in);
+        check(!p.refused && p.proposal == ep::ProposalShape::batched_block_draft &&
+              p.suspension_mode == ep::Suspension::in_place && p.suspension.support == ep::Support::conditional &&
+              p.admission.support == ep::Support::conditional && p.budget.support == ep::Support::on,
+              "one native retained owner satisfies common neural preparation and budget eligibility without MTP");
+        in.prefill_chunk = 1024;
+        check(ep::resolve_execution_plan(in).refused,
+              "native retained preparation keeps the fixed scratch-geometry contract");
+        in.prefill_chunk = 2048;
+        in.private_preparation_static = false;
+        check(ep::resolve_execution_plan(in).refused,
+              "native retained preparation keeps the static text-owner contract");
+        in = dflash2_plan(4);
+        in.packed_prefill = true;
+        const auto packed = ep::resolve_execution_plan(in);
+        check(packed.refused && packed.suspension.support == ep::Support::refused &&
+              packed.drafting.support == ep::Support::refused,
+              "native packed multi-owner prompt arithmetic is refused instead of reported as in-place support");
+        in = dflash2_plan(4);
+        in.retained_prefill = in.piped_concurrent = true;
+        const auto layers = ep::resolve_execution_plan(in);
+        check(!layers.refused && layers.drafting.support == ep::Support::conditional &&
+              layers.concurrent_reader.support == ep::Support::off,
+              "standalone native retained-layer preparation keeps its conditional execution and reader exclusion");
+        in.retained_prompt = true;
+        check(ep::resolve_execution_plan(in).refused,
+              "native private retained prompts still exclude the independent retained-layer experiment");
+    }
+    {
+        auto in = dflash2_plan(4);
+        in.suffix_draft = 12;
+        in.piped_concurrent = true;
+        auto p = ep::resolve_execution_plan(in);
+        p.memory_classes.push_back({"CUDA0", "draft_graphs", "admission", 256ULL << 20, false});
+        auto bin = group_input(in);
+        const auto before = ep::batch_groups::resolve(bin);
+        bin.batch = 3;
+        ep::resolve_batch_fit(p, 3, 1, ep::batch_groups::resolve_after_fit(bin, before));
+        check(!p.refused && p.batch_slots_requested == 4 && p.batch_slots == 3 && p.batch_slots_resolved &&
+              !p.groups_conditional && p.proposal == ep::ProposalShape::batched_block_draft &&
+              p.verifier_max_rows == 8 && p.draft_handoff_rows == 8 &&
+              p.drafting.support == ep::Support::conditional,
+              "native synchronous fit finalizes logical seats while graph success remains independently conditional");
+        check(p.memory_classes.size() == 1 && p.memory_classes.front().bytes == (256ULL << 20),
+              "resolving native fit neither multiplies nor replaces admitted per-verifier graph allowances");
+        bin.batch = 0;
+        ep::resolve_batch_fit(p, 0, 1, ep::batch_groups::resolve_after_fit(bin, before));
+        check(!p.refused && p.mode == ep::ServeMode::streaming && p.batch_slots_requested == 4 &&
+              p.batch_slots == 0 && p.proposal == ep::ProposalShape::serial_block_draft &&
+              p.suspension_mode == ep::Suspension::none && p.suspension.support == ep::Support::off &&
+              p.lookup.support == ep::Support::on && p.concurrent_reader.support == ep::Support::off &&
+              p.draft_handoff_rows == 8 && p.drafting.support == ep::Support::conditional,
+              "zero native synchronous fit reports the actual serial lookup/proposal lifecycle with no stale seat claim");
+    }
+    for (int fitted : {0, 1, 2, 3, 4}) {
+        auto in = dflash2_plan(4);
+        in.batch_mtp_pipeline = true;
+        in.groups_set = true;
+        in.groups_given = 2;
+        auto p = ep::resolve_execution_plan(in);
+        auto bin = group_input(in);
+        const auto before = ep::batch_groups::resolve(bin);
+        bin.batch = fitted;
+        ep::resolve_batch_fit(p, fitted, 1, ep::batch_groups::resolve_after_fit(bin, before));
+        const bool valid = fitted == 2 || fitted == 4;
+        check(p.batch_slots_resolved && !p.groups_conditional && p.refused != valid &&
+              p.verifier_max_rows == 8 && (valid
+                  ? p.proposal == ep::ProposalShape::batched_block_pipeline && p.draft_handoff_rows == 16 &&
+                    p.drafting.support == ep::Support::conditional
+                  : p.proposal == ep::ProposalShape::none && p.draft_handoff_rows == 8 &&
+                    p.drafting.support == ep::Support::refused),
+              "native pipeline fit preserves only actual even two-group geometry and refuses all unsupported shrinks");
+    }
+    {
+        auto in = dflash2_plan(4);
+        in.batch_mtp_pipeline = true;
+        in.groups_set = true;
+        in.groups_given = 2;
+        auto p = ep::resolve_execution_plan(in);
+        auto bin = group_input(in);
+        const auto before = ep::batch_groups::resolve(bin);
+        bin.later_stages = 0;
+        ep::resolve_batch_fit(p, 4, 0, ep::batch_groups::resolve_after_fit(bin, before));
+        check(p.refused && p.stages == 1 && p.draft_handoff_rows == 8 &&
+              p.drafting.support == ep::Support::refused,
+              "a fitted native pipeline cannot retain two-group transport after losing the distinct-device split");
+        in.batch_mtp_floating = true;
+        p = ep::resolve_execution_plan(in);
+        bin = group_input(in);
+        const auto floating_before = ep::batch_groups::resolve(bin);
+        bin.batch = 2;
+        ep::resolve_batch_fit(p, 2, 1, ep::batch_groups::resolve_after_fit(bin, floating_before));
+        check(p.refused && p.draft_handoff_rows == 8 && p.drafting.support == ep::Support::refused,
+              "native floating fit refuses loss of its four stationary owners instead of silently becoming fixed pipeline");
+        in = dflash2_plan(1);
+        in.retained_prompt = true;
+        p = ep::resolve_execution_plan(in);
+        bin = group_input(in);
+        const auto retained_before = ep::batch_groups::resolve(bin);
+        bin.batch = 0;
+        ep::resolve_batch_fit(p, 0, 1, ep::batch_groups::resolve_after_fit(bin, retained_before));
+        check(p.refused && p.admission.support == ep::Support::refused &&
+              p.suspension.support == ep::Support::refused && p.drafting.support == ep::Support::refused,
+              "retained native fit cannot advertise in-place admission after every resident owner fails to fit");
     }
     {
         int hint = -2;

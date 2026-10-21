@@ -75,6 +75,9 @@ using conversation_store_detail::StreamRecord;
 using conversation_store_detail::StreamWrite;
 
 constexpr uint64_t kObjectBytesEstimate = 64;  // the RAM one object-table entry costs, at most
+// Victim selection under a global ceiling (byte quota, free-space floor, metadata): every execution domain is a
+// candidate.  A domain index always comes from Catalog::domains, so it is never this value.
+constexpr uint32_t kAnyDomain = UINT32_MAX;
 constexpr size_t kMaxReaderThreads = 8;
 constexpr uint64_t kBlockBytes = 4096;         // conservative allocation granularity of the cache filesystem
 constexpr uint64_t kDirectoryCharge = 4096;    // one block per file for its directory entry and inode
@@ -97,11 +100,12 @@ constexpr uint64_t kReaderFloorWorkspace = kIssuerEnvelopeBytes + 2 * kAllocSlac
 
 // Existing authority, not a second catalog: legacy readers require exactly 32 bytes and stop in open_root().
 // Original key bytes and all derived authorization identities remain unchanged.
-std::array<uint8_t, kIssuerEnvelopeBytes> issuer_envelope(const std::array<uint8_t, 32>& key) {
+std::array<uint8_t, kIssuerEnvelopeBytes> issuer_envelope(const std::array<uint8_t, 32>& key,
+                                                       uint32_t minimum_reader = 2) {
     std::array<uint8_t, kIssuerEnvelopeBytes> out{};
     std::memcpy(out.data(), kIssuerEnvelopeTag, 8);
     out[8] = 2;  // little-endian envelope version
-    out[12] = 2; // little-endian minimum reader
+    out[12] = uint8_t(minimum_reader); // little-endian minimum reader (2 or 3)
     std::memcpy(out.data() + 16, key.data(), key.size());
     const auto checksum = sha256(out.data(), 48);
     std::memcpy(out.data() + 48, checksum.data(), 16);
@@ -853,7 +857,7 @@ struct ConversationStore::Impl {
     std::condition_variable cv_durable;
     std::condition_variable cv_shutdown;
     std::array<uint8_t, 32> issuer_key{};
-    bool certified_reader_floor = false; // sticky existing issuer authority, never reset by catalog transactions
+    uint32_t certified_reader_floor = 1; // sticky issuer authority; never reset by catalog transactions
     Catalog catalog;
     uint64_t catalog_charge = 0;
     uint64_t epoch = 0;
@@ -1093,9 +1097,14 @@ struct ConversationStore::Impl {
     uint64_t retire_head_locked(uint64_t head_id);
     void touch_recency_locked(uint64_t head_id);
     uint64_t recency_of_locked(const CatalogHead& head) const;
-    uint64_t choose_victim_locked(const Catalog& candidate, const std::set<uint64_t>& excluded, bool want_protected);
+    uint64_t domain_head_count_locked(const Catalog& candidate, uint32_t domain) const;
+    // Oldest unpinned, unleased head with the requested protection class.  `domain` restricts the candidates to one
+    // execution domain's heads; kAnyDomain selects under a global ceiling.
+    uint64_t choose_victim_locked(const Catalog& candidate, const std::set<uint64_t>& excluded, bool want_protected,
+                                  uint32_t domain);
     void cap_protected_locked(Catalog& candidate);
-    bool obtain_head_slot_locked(Catalog& candidate, uint64_t keep_head, std::vector<uint64_t>& retiring);
+    bool obtain_head_slot_locked(Catalog& candidate, uint32_t domain, uint64_t keep_head,
+                                 std::vector<uint64_t>& retiring);
     bool head_manifest_locked(uint64_t head_id, Digest& manifest_id, uint64_t& bytes) const;
     // How one stored manifest was read.  `invalid` is a defect in the record and the only outcome that may retire it;
     // `unreadable` means this run's own preparation ceiling or published allowance could not hold the read and decode,
@@ -1227,7 +1236,7 @@ struct ConversationStore::Impl {
     // Reads and decodes the durable catalog and decides this domain's epoch.  It may not write anything: the first
     // catalog transaction happens only once the whole physical ledger has been accounted (see reconcile()).
     bool read_catalog(std::string& why);
-    bool ensure_certified_reader_floor(std::string& why);
+    bool ensure_certified_reader_floor(std::string& why, uint32_t minimum_reader = 2);
     bool reconcile(std::string& why);
     bool write_intent(bool present, std::string& why);
 };
@@ -1457,14 +1466,15 @@ bool ConversationStore::Impl::open_root(std::string& why) {
             std::array<uint8_t, 32> original{};
             if (key.size() == kIssuerEnvelopeBytes)
                 std::memcpy(original.data(), key.data() + 16, original.size());
-            const auto recognized = issuer_envelope(original);
-            if (key.size() != recognized.size() ||
+            const uint32_t minimum = key.size() == kIssuerEnvelopeBytes ? key[12] : 0;
+            const auto recognized = issuer_envelope(original, minimum);
+            if (minimum < 2 || minimum > 3 || key.size() != recognized.size() ||
                 std::memcmp(key.data(), recognized.data(), recognized.size()) != 0) {
                 why = "unsupported or malformed issuer-key minimum-reader envelope";
                 return false;
             }
             issuer_key = original;
-            certified_reader_floor = true;
+            certified_reader_floor = minimum;
         }
         return true;
     }
@@ -1488,15 +1498,15 @@ bool ConversationStore::Impl::open_root(std::string& why) {
     return true;
 }
 
-bool ConversationStore::Impl::ensure_certified_reader_floor(std::string& why) {
+bool ConversationStore::Impl::ensure_certified_reader_floor(std::string& why, uint32_t minimum_reader) {
     // Everything that can allocate is prepared before the reservation is taken: a failure here must not leave the
     // ledger charged for a temporary that was never created.
-    const auto envelope = issuer_envelope(issuer_key);
+    const auto envelope = issuer_envelope(issuer_key, minimum_reader);
     std::string temp = temp_name();
     uint64_t reservation = 0;
     {
         std::lock_guard<std::mutex> guard(mutex);
-        if (certified_reader_floor) return true;
+        if (certified_reader_floor >= minimum_reader) return true;
         if (faulted || !lock_owned) {
             why = "the minimum-reader floor cannot change without healthy authority ownership";
             return false;
@@ -1591,9 +1601,10 @@ bool ConversationStore::Impl::ensure_certified_reader_floor(std::string& why) {
             return false;
         }
         std::lock_guard<std::mutex> guard(mutex);
-        certified_reader_floor = true;
-        // Only now is the old key's replaced inode durably gone.
-        charged -= std::min(charged, allocated_charge(issuer_key.size()));
+        // Only now is the previous authority inode durably gone.
+        charged -= std::min(charged, allocated_charge(
+            certified_reader_floor > 1 ? kIssuerEnvelopeBytes : issuer_key.size()));
+        certified_reader_floor = minimum_reader;
     } catch (...) {
         uncertain();
         throw;
@@ -1715,7 +1726,7 @@ bool ConversationStore::Impl::read_catalog(std::string& why) {
 
 // Read only the bounded schema header before recovery performs any cleanup.
 // Unsupported manifests are not corrupt histories and may belong to a different profile.
-static bool manifest_versions_supported(int directory, const Catalog& catalog, bool floor, std::string& why) {
+static bool manifest_versions_supported(int directory, const Catalog& catalog, uint32_t floor, std::string& why) {
     for (const auto& head : catalog.heads) {
         const std::string name = sha256_hex(head.manifest_id);
         const int fd = ::openat(directory, name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -1729,8 +1740,9 @@ static bool manifest_versions_supported(int directory, const Catalog& catalog, b
         ::close(fd);
         // Only the ordering invariant is decided here: a certified record must never be reachable through legacy
         // authority, because the legacy reader would reclaim it. A damaged tag stays an ordinary corrupt record.
-        if (got == ssize_t(tag.size()) && std::memcmp(tag.data(), "STCSMAN2", 8) == 0 && !floor) {
-            why = "a certified record exists without the established minimum reader";
+        if (got == ssize_t(tag.size()) && std::memcmp(tag.data(), "STCSMAN", 7) == 0 &&
+            tag[7] >= '2' && (tag[7] > '3' || floor < uint32_t(tag[7] - '0'))) {
+            why = "a neural/certified record exists without its established supported minimum reader";
             return false;
         }
     }
@@ -1942,22 +1954,28 @@ bool ConversationStore::Impl::reconcile(std::string& why) {
         counters.deferred_reclaims++;
     }
 
-    // Enforce the head and index ceilings before serving anything.
+    // Enforce the head ceiling per execution domain and the index ceiling globally, before serving anything.  Each
+    // domain keeps its own allowance, so one profile's publications can never retire another profile's completed
+    // head; the byte quota, the filesystem floor and the metadata ceiling below stay global because they describe
+    // the one shared device and its one in-RAM index.
     std::vector<uint64_t> retiring;
-    while (catalog.heads.size() > options.head_limit) {
-        const uint64_t victim = choose_victim_locked(catalog, {}, false);
-        if (victim == 0) break;
-        for (size_t i = 0; i < catalog.heads.size(); ++i)
-            if (catalog.heads[i].head_id == victim) {
-                retiring.push_back(victim);
-                retiring_trace(catalog.heads[i], "startup_head_limit");
-                catalog.heads.erase(catalog.heads.begin() + std::ptrdiff_t(i));
-                break;
-            }
+    const size_t domains = catalog.domains.size();
+    for (uint32_t domain = 0; domain < domains; ++domain) {
+        while (domain_head_count_locked(catalog, domain) > options.head_limit) {
+            const uint64_t victim = choose_victim_locked(catalog, {}, false, domain);
+            if (victim == 0) break;
+            for (size_t i = 0; i < catalog.heads.size(); ++i)
+                if (catalog.heads[i].head_id == victim) {
+                    retiring.push_back(victim);
+                    retiring_trace(catalog.heads[i], "startup_head_limit");
+                    catalog.heads.erase(catalog.heads.begin() + std::ptrdiff_t(i));
+                    break;
+                }
+        }
     }
     recount_metadata_locked();
     while (metadata > options.metadata_bytes && catalog.heads.size() > 1) {
-        const uint64_t victim = choose_victim_locked(catalog, {}, false);
+        const uint64_t victim = choose_victim_locked(catalog, {}, false, kAnyDomain);
         if (victim == 0) break;
         for (size_t i = 0; i < catalog.heads.size(); ++i)
             if (catalog.heads[i].head_id == victim) {
@@ -2151,14 +2169,22 @@ uint64_t ConversationStore::Impl::recency_of_locked(const CatalogHead& head) con
     return found == head_recency.end() ? head.published_order : found->second;
 }
 
+uint64_t ConversationStore::Impl::domain_head_count_locked(const Catalog& candidate, uint32_t domain) const {
+    uint64_t count = 0;
+    for (const auto& head : candidate.heads)
+        if (head.domain == domain) ++count;
+    return count;
+}
+
 uint64_t ConversationStore::Impl::choose_victim_locked(const Catalog& candidate, const std::set<uint64_t>& excluded,
-                                                       bool want_protected) {
+                                                       bool want_protected, uint32_t domain) {
     uint64_t victim = 0;
     uint64_t oldest = 0;
     for (const auto& head : candidate.heads) {
         if (head.pinned) continue;
         if (excluded.count(head.head_id)) continue;
         if (head_leases.count(head.head_id)) continue;
+        if (domain != kAnyDomain && head.domain != domain) continue;
         if (bool(head.protected_seg) != want_protected) continue;
         const uint64_t recency = recency_of_locked(head);
         if (victim == 0 || recency < oldest) {
@@ -2170,34 +2196,40 @@ uint64_t ConversationStore::Impl::choose_victim_locked(const Catalog& candidate,
 }
 
 void ConversationStore::Impl::cap_protected_locked(Catalog& candidate) {
+    // The protected segment is three quarters of *one domain's* head allowance: protection is part of the same
+    // per-domain allocation as the ceiling itself, so one profile's promoted heads never demote another profile's.
     const uint64_t limit = uint64_t(options.head_limit) * 3 / 4;
-    for (;;) {
-        uint64_t count = 0;
-        uint64_t demote = 0;
-        uint64_t oldest = 0;
-        for (const auto& head : candidate.heads) {
-            if (!head.protected_seg) continue;
-            ++count;
-            const uint64_t recency = recency_of_locked(head);
-            if (demote == 0 || recency < oldest) {
-                demote = head.head_id;
-                oldest = recency;
+    for (uint32_t domain = 0; domain < candidate.domains.size(); ++domain) {
+        for (;;) {
+            uint64_t count = 0;
+            uint64_t demote = 0;
+            uint64_t oldest = 0;
+            for (const auto& head : candidate.heads) {
+                if (head.domain != domain || !head.protected_seg) continue;
+                ++count;
+                const uint64_t recency = recency_of_locked(head);
+                if (demote == 0 || recency < oldest) {
+                    demote = head.head_id;
+                    oldest = recency;
+                }
             }
+            if (count <= limit || demote == 0) break;   // this domain is within its share; the next still needs capping
+            for (auto& head : candidate.heads)
+                if (head.head_id == demote) head.protected_seg = false;
         }
-        if (count <= limit || demote == 0) return;
-        for (auto& head : candidate.heads)
-            if (head.head_id == demote) head.protected_seg = false;
     }
 }
 
-bool ConversationStore::Impl::obtain_head_slot_locked(Catalog& candidate, uint64_t keep_head,
+bool ConversationStore::Impl::obtain_head_slot_locked(Catalog& candidate, uint32_t domain, uint64_t keep_head,
                                                       std::vector<uint64_t>& retiring) {
-    while (candidate.heads.size() > options.head_limit) {
+    // One execution domain's heads share this ceiling.  Another profile's completed heads are never candidates, so
+    // filling this profile's allowance cannot cost the other profile its latest checkpoint.
+    while (domain_head_count_locked(candidate, domain) > options.head_limit) {
         std::set<uint64_t> excluded = eviction_excluded;
         if (keep_head) excluded.insert(keep_head);
-        uint64_t victim = choose_victim_locked(candidate, excluded, false);
-        if (victim == 0) victim = choose_victim_locked(candidate, excluded, true);
-        if (victim == 0) return false;   // every head is pinned or leased: refuse rather than overrun the ceiling
+        uint64_t victim = choose_victim_locked(candidate, excluded, false, domain);
+        if (victim == 0) victim = choose_victim_locked(candidate, excluded, true, domain);
+        if (victim == 0) return false;   // every head of this domain is pinned or leased: refuse, never overrun
         for (size_t i = 0; i < candidate.heads.size(); ++i)
             if (candidate.heads[i].head_id == victim) {
                 retiring.push_back(victim);
@@ -2341,7 +2373,7 @@ WriterWorkspace ConversationStore::Impl::writer_workspace_locked(const Conversat
     work.buffer = std::min(chunk_limit, shape.max_stream_bytes);
     const auto manifest_shape = conversation_store_detail::ManifestShape{
         shape.containers, shape.records - shape.containers, shape.kv_layers, shape.streams,
-        chunks, chunks, shape.cuts, shape.certified};
+        chunks, chunks, shape.cuts, shape.certified, shape.kind_tagged};
     work.manifest = conversation_store_detail::manifest_encoded_size_of(manifest_shape);
     work.catalog_apply = catalog_apply_bytes_locked(chunks);
     return work;
@@ -3087,8 +3119,10 @@ bool ConversationStore::Impl::make_room(uint64_t incoming_bytes, bool& floor_lim
             if (read_timing)
                 retirement_reason = over_quota ? (over_floor ? "quota_and_floor" : "byte_quota") : "free_space_floor";
             std::set<uint64_t> blocked = eviction_excluded;
-            victim = choose_victim_locked(catalog, blocked, false);
-            if (victim == 0) victim = choose_victim_locked(catalog, blocked, true);
+            // The byte quota and the free-space floor are global: they describe the one shared device, so any
+            // execution domain's head may be the victim here.
+            victim = choose_victim_locked(catalog, blocked, false, kAnyDomain);
+            if (victim == 0) victim = choose_victim_locked(catalog, blocked, true, kAnyDomain);
             if (victim == 0) {
                 if (over_quota) counters.refusals_quota++;
                 if (over_floor) counters.refusals_floor++;
@@ -4649,7 +4683,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         fail(ConversationStorePublishStatus::refused_limits, why);
         return;
     }
-    if (job->shape.certified && !ensure_certified_reader_floor(why)) {
+    if (job->shape.certified && !ensure_certified_reader_floor(why, job->shape.kind_tagged ? 3 : 2)) {
         fail(ConversationStorePublishStatus::failed, why);
         return;
     }
@@ -4730,7 +4764,8 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
     actual.buffer = chunk_buffer;
     const auto manifest_counts = conversation_store_detail::ManifestShape{
         job->shape.containers, job->shape.records - job->shape.containers, job->shape.kv_layers,
-        job->shape.streams, peak_chunks, peak_chunks, job->shape.cuts, job->shape.certified};
+        job->shape.streams, peak_chunks, peak_chunks, job->shape.cuts,
+        job->shape.certified, job->shape.kind_tagged};
     actual.manifest = conversation_store_detail::manifest_encoded_size_of(manifest_counts);
     actual.catalog_apply = job->catalog_apply_bytes;
     if (!reserve_writer_workspace(job, actual.peak(), why)) {
@@ -5346,7 +5381,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         for (const auto& entry : referenced) plan.new_objects.push_back(entry.first);
         for (const auto& entry : charged_objects) plan.new_object_charges[entry.first] = entry.second;
         plan.new_manifest_bytes = allocated_charge(encoded.size());
-        bool room = obtain_head_slot_locked(plan.candidate, head_id, plan.retiring);
+        bool room = obtain_head_slot_locked(plan.candidate, head.domain, head_id, plan.retiring);
         if (room) {
             cap_protected_locked(plan.candidate);
             // Counted, not encoded: this is a measurement, and a measurement must never be the reason bytes are
@@ -5369,7 +5404,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
             plan.candidate.heads.pop_back();
             counters.refused_limits++;
             fail(ConversationStorePublishStatus::refused_limits,
-                 "every retained head is pinned or leased, so no head slot can be obtained");
+                 "every retained head of this execution domain is pinned or leased, so no head slot can be obtained");
         }
         if (!room) return;
     }
@@ -6451,9 +6486,12 @@ std::string ConversationStore::describe() const {
     text += "domain index: " + std::to_string(impl_->domain_index) + " of " +
             std::to_string(impl_->catalog.domains.size()) + ", epoch " + std::to_string(impl_->epoch) +
             ", catalog version " + std::to_string(impl_->catalog_version) + "\n";
-    text += "heads: " + std::to_string(impl_->catalog.heads.size()) + " of " +
-            std::to_string(impl_->options.head_limit) + ", objects " + std::to_string(impl_->objects.size()) +
-            ", pub order " + std::to_string(impl_->catalog.published_order_counter) + "\n";
+    text += "heads: " + std::to_string(impl_->catalog.heads.size()) + " in " +
+            std::to_string(impl_->catalog.domains.size()) + " domain(s), " +
+            std::to_string(impl_->domain_head_count_locked(impl_->catalog, impl_->domain_index)) + " here of " +
+            std::to_string(impl_->options.head_limit) + " per domain, objects " +
+            std::to_string(impl_->objects.size()) + ", pub order " +
+            std::to_string(impl_->catalog.published_order_counter) + "\n";
     text += "disk: charged " + std::to_string(impl_->charged) + " of quota " +
             std::to_string(impl_->options.quota_bytes) + ", reserved for the catalog's own copy " +
             std::to_string(impl_->catalog_reserve_locked()) + ", reclaimable " + std::to_string(impl_->reclaimable) +

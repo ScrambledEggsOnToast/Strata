@@ -39,7 +39,7 @@ public:
                    int64_t hidden, int64_t streams, int64_t layers, std::string& err) {
         if (configured_ || hidden != hidden_size || streams != 4 || layers != 48 ||
             lb < 0 || lb >= le || le > layers || capacity < 1 ||
-            capacity > (phase == CapturePhase::verify ? block_size : context_rows))
+            capacity > (phase == CapturePhase::verify ? max_verify_rows : context_rows))
             return refuse(err, "invalid or already configured capture geometry");
         unsigned mask = 0;
         for (size_t i = 0; i < tap_layers.size(); ++i) {
@@ -169,15 +169,19 @@ private:
 struct CaptureAllocation {
     size_t prefill = 0, verify = 0, flags = 0;
     size_t mapped_bytes() const { return prefill + verify + flags; }
-    static bool stage(int64_t lb, int64_t le, CaptureAllocation& out, std::string& err) {
+    static bool stage(int64_t lb, int64_t le, CaptureAllocation& out, std::string& err,
+                       int verify_rows = block_size) {
+        if (verify_rows < block_size || verify_rows > max_verify_rows) {
+            err = "dflash2 capture: physical verifier rows must be in [4,8]"; return false;
+        }
         TapCaptureState pf, vr;
         if (!pf.configure(CapturePhase::prefill, context_rows, lb, le, hidden_size, 4, 48, err) ||
-            !vr.configure(CapturePhase::verify, block_size, lb, le, hidden_size, 4, 48, err)) return false;
+            !vr.configure(CapturePhase::verify, verify_rows, lb, le, hidden_size, 4, 48, err)) return false;
         auto pages = [](size_t n) { return (n + 4095) / 4096 * 4096; };
         out = {};
         for (size_t i = 0; i < tap_layers.size(); ++i) {
             if (pf.owns_tap(int(i))) out.prefill += pages(size_t(context_rows) * residual_row_bytes);
-            if (vr.owns_tap(int(i))) out.verify += pages(size_t(block_size) * residual_row_bytes);
+            if (vr.owns_tap(int(i))) out.verify += pages(size_t(verify_rows) * residual_row_bytes);
         }
         out.flags = 2 * pages(sizeof(uint32_t));
         return true;
@@ -191,16 +195,22 @@ struct CaptureAllocation {
 class CaptureProducer {
 public:
     CaptureProducer();
+    CaptureProducer(std::span<uint16_t> shared_tentative, OperationLease& shared_lease);
+    bool resume(uint64_t request, uint64_t incarnation, int origin, int frontier, std::string& error);
     bool reset(uint64_t request, uint64_t incarnation, int origin, std::string& err);
-    bool begin(CapturePhase, int64_t start, int64_t count, std::string& err);
-    bool consume(const TapView&, std::string& err);
+    bool begin(CapturePhase, int64_t start, int64_t count, std::string& err,
+               const OperationLease::Guard* lease = nullptr);
+    bool consume(const TapView&, std::string& err, const OperationLease::Guard* lease = nullptr);
     bool publish(std::string& err);
     CaptureOwner owner() const { return owner_; }
+    bool cancel(std::string& error);
     const CaptureStore& store() const { return store_; }
     int frontier() const { return frontier_; }
+    bool active() const { return active_; }
     int64_t committed_rows() const { return committed_rows_; }
     int64_t rejected_rows() const { return rejected_rows_; }
-    void abort() noexcept { poisoned_ = true; active_ = false; store_.abort(); }
+    bool cancellable() const { return !poisoned_ && active_ && !seen_ && !store_.capturing(); }
+    void abort() noexcept { poisoned_ = true; active_ = false; lease_ = nullptr; store_.abort(); }
 private:
     CaptureStore store_;
     CaptureOwner owner_;
@@ -211,5 +221,6 @@ private:
     unsigned seen_ = 0;
     bool active_ = false, poisoned_ = false;
     std::array<int, context_rows> positions_{};
+    const OperationLease::Guard* lease_ = nullptr;
 };
 } // namespace strata::core::dflash2

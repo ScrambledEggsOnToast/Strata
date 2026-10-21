@@ -289,6 +289,19 @@ void producer_refusals() {
         if (fault == 5) view.materialized_layer = 5;
         if (fault == 6) view.keep = 0;
         if (fault <= 6) check(!producer.consume(view, err), "wrong tags/position/seam/commit refuse");
+        if (fault >= 1 && fault <= 3) {
+            check(!producer.store().poisoned() && producer.frontier() == 37,
+                  "foreign completion cannot damage the current owner's pending capture");
+            view.owner = producer.owner();
+            for (int tap : d::tap_layers) {
+                view.tap_layer = tap; view.materialized_layer = tap + 1;
+                check(producer.consume(view, err), "current owner still completes every genuine tap");
+            }
+            check(producer.publish(err) && producer.frontier() == 39 &&
+                  producer.store().committed_since(37).count == 2,
+                  "current owner publishes exactly its committed prefix after rejecting foreign work");
+            continue;
+        }
         if (fault >= 7) {
             check(producer.consume(view, err), "first correct global tap");
             if (fault == 8) { view.tap_layer = 15; view.materialized_layer = 16; view.keep = 3; }

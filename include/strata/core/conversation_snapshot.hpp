@@ -148,6 +148,8 @@ struct ConversationView {
     const ConversationBuffer* draft_boundary_residual = nullptr;
     int64_t draft_boundary_position = -1;
     uint64_t draft_boundary_owner = 0;
+    DraftIdentity draft_identity;
+    int64_t draft_origin = -1;
 };
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& session,
                                  const ModelGeometry& g, const QsaState& draft, size_t& bytes, std::string& error);
@@ -214,14 +216,16 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
 // Ordinary private callers deliberately use the signatures above.
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft,
-                                    ConversationSnapshotExpectation expectation, std::string& error);
+                                    ConversationSnapshotExpectation expectation, std::string& error,
+                                    const DraftIdentity* identity = nullptr);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft,
                                     ConversationSnapshotExpectation expectation, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState* draft,
                                                    ConversationSnapshotExpectation expectation, std::string& error,
-                                                   const ConversationCheckpoint* selected = nullptr);
+                                                   const ConversationCheckpoint* selected = nullptr,
+                                                   const DraftIdentity* identity = nullptr);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState& draft,
                                                    ConversationSnapshotExpectation expectation, std::string& error);

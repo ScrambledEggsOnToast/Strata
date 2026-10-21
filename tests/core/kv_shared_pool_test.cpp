@@ -1,15 +1,18 @@
 // Device feasibility gate, deliberately separate from full-model/client acceptance.
 #include "strata/core/kv_shared_pool.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/plan/kv_share_topology.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include <cuda_runtime.h>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 using namespace strata;
@@ -572,16 +575,168 @@ void pending_retirement(int device, bool destroy_pending) {
     std::fflush(stdout);
 }
 }
+void stage_contract(int count) {
+    struct StageDevice {
+        plan::KvDeviceUuid uuid{};
+        uint64_t capacity = 0;
+    };
+    std::array<StageDevice, 3> devices{};
+    for (int device = 0; device < count; ++device) {
+        cudaDeviceProp properties{};
+        check(cudaGetDeviceProperties(&properties, device), "device properties");
+        std::memcpy(devices[device].uuid.data(), properties.uuid.bytes, devices[device].uuid.size());
+        devices[device].capacity = uint64_t(properties.totalGlobalMem);
+    }
+    std::array<plan::KvTopologyKey, 3> keys{};
+    for (int device = 0; device < count; ++device)
+        keys[device] = {devices[device].uuid, uint32_t(device), plan::KvLayerFamily::target_k8v4, 1};
+    // The key is the real device UUID, not the visible ordinal: a same-key alias passes, and a
+    // different UUID, stage or allocation generation is refused structurally.
+    const std::array same{plan::KvStageAlias{keys[0], keys[0]}};
+    const auto allowed = plan::kv_share_topology(plan::KvShareMode::alias, same, 1);
+    require(allowed.alias && std::strcmp(allowed.refusal, "none") == 0, "same-key stage alias refused");
+    auto cross_device = keys[0]; cross_device.device_uuid = devices[1].uuid;
+    auto cross_stage = keys[0]; cross_stage.stage = 1;
+    auto cross_generation = keys[0]; cross_generation.allocation_generation = 2;
+    const std::array<std::pair<const char*, plan::KvTopologyKey>, 3> refusals{{
+        {"cross_device", cross_device}, {"cross_stage", cross_stage}, {"cross_generation", cross_generation}}};
+    for (const auto& [label, target] : refusals) {
+        const std::array alias{plan::KvStageAlias{keys[0], target}};
+        const auto decision = plan::kv_share_topology(plan::KvShareMode::alias, alias, 1);
+        require(!decision.alias && std::strcmp(decision.refusal, "topology_mismatch") == 0 &&
+                decision.refused_stage == 0, "cross-identity alias was not structurally refused");
+        std::printf("KV_SHARE_STAGE_TOPOLOGY device=0 check=%s decision=refused refusal=%s refused_stage=%u\n",
+            label, decision.refusal, decision.refused_stage);
+    }
+    // Per-stage quote against the device's real capacity: a small demand admits, a demand over this
+    // device alone refuses at that stage, with no credit from another device.
+    std::array<plan::KvDeviceBudget, 3> budgets{};
+    for (int device = 0; device < count; ++device)
+        budgets[device] = {devices[device].uuid, devices[device].capacity, 0, 0};
+    const plan::KvShareHostBudget host{uint64_t(128) << 30, 0, 0, 0, 0, 0};
+    for (int device = 0; device < count; ++device) {
+        std::array<plan::KvStageDemand, 1> demand{};
+        demand[0].key = keys[device];
+        demand[0].shared_bytes = devices[device].capacity / 8;
+        const auto fit = plan::kv_share_stage_quote(plan::KvShareMode::alias, budgets, demand, host);
+        require(fit.known && fit.admitted, "small per-stage demand refused");
+        demand[0].shared_bytes = devices[device].capacity + 1;
+        const auto over = plan::kv_share_stage_quote(plan::KvShareMode::alias, budgets, demand, host);
+        require(over.known && !over.admitted && std::strcmp(over.refusal, "stage_capacity") == 0 &&
+                over.refused_stage == uint32_t(device), "over-budget stage did not refuse independently");
+        std::printf("KV_SHARE_STAGE_QUOTE device=%d capacity_bytes=%llu fit_shared_bytes=%llu fit_admitted=%d "
+            "over_shared_bytes=%llu over_refusal=%s refused_stage=%u\n",
+            device, (unsigned long long) devices[device].capacity,
+            (unsigned long long) (devices[device].capacity / 8), int(fit.admitted),
+            (unsigned long long) demand[0].shared_bytes, over.refusal, over.refused_stage);
+    }
+    // One minimal measured pair per stage: immediate and deferred reclamation on the real device.
+    for (int device = 0; device < count; ++device) {
+        PairStats warm;
+        screen(device, device * 4, false, false, warm);
+        PairStats immediate;
+        screen(device, device * 4, false, true, immediate, false, true);
+        PairStats deferred;
+        screen(device, device * 4, false, true, deferred, true, true);
+        require(immediate.release_chunks == 25 && deferred.release_chunks == 25,
+                "per-stage measured release incomplete");
+        std::printf("KV_SHARE_STAGE device=%d immediate_release_chunks=%llu deferred_release_chunks=%llu "
+            "measured_release_bytes=%llu immediate_handoff_ms=%.6f deferred_handoff_ms=%.6f "
+            "immediate_host_metadata_bytes=%llu deferred_host_metadata_bytes=%llu capacity_bytes=%llu "
+            "scope=stage_fixture_not_full_model\n",
+            device, (unsigned long long) immediate.release_chunks, (unsigned long long) deferred.release_chunks,
+            (unsigned long long) (immediate.release_chunks * plan::kKvShareChunk), immediate.handoff_ms,
+            deferred.handoff_ms, (unsigned long long) immediate.host_bytes,
+            (unsigned long long) deferred.host_bytes, (unsigned long long) devices[device].capacity);
+    }
+    // Batch-policy measurement on real device chunks: synchronous 2 MiB calls versus coalesced 8-chunk runs
+    // and one deferred 32-chunk worker batch. Each policy frees a fresh 32-chunk VA range on this device.
+    for (int device = 0; device < count; ++device) {
+        check(cudaSetDevice(device), "stage device");
+        struct PolicyRun {
+            const char* name;
+            plan::KvDeviceReclaimPolicy policy;
+            bool worker;
+        };
+        const std::array policies{
+            PolicyRun{"synchronous", {devices[device].uuid, plan::KvReclaimMode::synchronous, 1, 1}, false},
+            PolicyRun{"coalesced", {devices[device].uuid, plan::KvReclaimMode::coalesced, 8, 8}, false},
+            PolicyRun{"deferred", {devices[device].uuid, plan::KvReclaimMode::deferred, 8, 32}, true}};
+        constexpr int64_t chunks = 32;
+        const core::KvOwnerKey owner{701, 1, uint64_t(device + 1)};
+        const core::KvPipelineKey pipeline{owner, 1};
+        for (const auto& selected : policies) {
+            core::VmmRange range;
+            require(range.reserve(uint64_t(chunks) * plan::kKvShareChunk) &&
+                range.map_range(0, chunks, [] { return core::VmmChunk{0}; }),
+                "batch-policy chunks did not map on this stage");
+            std::array<uint64_t, plan::kKvShareMaxStages> charged{};
+            charged[size_t(device)] = uint64_t(chunks) * plan::kKvShareChunk;
+            core::KvPipelineLifetime lifetime(pipeline, 1u << device, charged);
+            require(lifetime.local_drain(pipeline, uint32_t(device)) && lifetime.terminal_drain(pipeline),
+                "batch-policy pipeline did not drain");
+            core::KvReclaimRun run(keys[device], selected.policy, pipeline, 0, uint64_t(chunks));
+            const auto unmap = [&](const plan::KvTopologyKey&, uint64_t index) { return range.unmap(int64_t(index)); };
+            const auto release = [&](const plan::KvTopologyKey&, core::VmmChunk chunk) { return core::vmm_chunk_free(chunk); };
+            const auto started = std::chrono::steady_clock::now();
+            uint64_t calls = 0, released = 0;
+            if (selected.worker) {
+                // A deferred policy only hands the run over; the worker then releases it in its own batch.
+                const auto queued = run.reclaim(lifetime, devices[device].uuid, false, true, unmap, release);
+                ++calls;
+                require(queued.success && queued.action == plan::KvReclaimAction::enqueue,
+                    "deferred batch policy did not hand off the run");
+            }
+            while (run.released_bytes() < uint64_t(chunks) * plan::kKvShareChunk) {
+                const auto progress = run.reclaim(lifetime, devices[device].uuid, selected.worker, true, unmap, release);
+                ++calls;
+                require(progress.success, "batch-policy reclaim failed");
+                released += progress.released_chunks;
+                require(calls <= uint64_t(chunks) + 2, "batch-policy reclaim did not terminate");
+            }
+            const double cost_us = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - started).count();
+            require(run.released_bytes() == uint64_t(chunks) * plan::kKvShareChunk && run.charged_bytes() == 0 &&
+                released == uint64_t(chunks), "batch-policy release accounting is not exact");
+            std::printf("KV_SHARE_STAGE_BATCH device=%d policy=%s calls=%llu released_chunks=%llu "
+                "released_bytes=%llu unmap_release_us=%.3f\n", device, selected.name,
+                (unsigned long long) calls, (unsigned long long) (released),
+                (unsigned long long) run.released_bytes(), cost_us);
+            range.release();
+        }
+    }
+    // The per-UUID policy plans, keyed by the real device identity.
+    for (int device = 0; device < count; ++device) {
+        const plan::KvDeviceReclaimPolicy synchronous{devices[device].uuid, plan::KvReclaimMode::synchronous, 1, 1};
+        const plan::KvDeviceReclaimPolicy coalesced{devices[device].uuid, plan::KvReclaimMode::coalesced, 4, 8};
+        const plan::KvDeviceReclaimPolicy deferred{devices[device].uuid, plan::KvReclaimMode::deferred, 8, 32};
+        const auto sync = plan::kv_reclaim_plan(synchronous, keys[device], 25, true, false);
+        const auto coal = plan::kv_reclaim_plan(coalesced, keys[device], 25, true, false);
+        const auto def = plan::kv_reclaim_plan(deferred, keys[device], 25, true, false);
+        auto foreign = keys[device];
+        foreign.device_uuid = devices[(device + 1) % count].uuid;
+        const auto refused = plan::kv_reclaim_plan(deferred, foreign, 25, true, false);
+        require(sync.action == plan::KvReclaimAction::release_inline && sync.chunks == 1 &&
+                coal.action == plan::KvReclaimAction::release_inline && coal.chunks == 8 &&
+                def.action == plan::KvReclaimAction::enqueue && def.chunks == 25 &&
+                refused.action == plan::KvReclaimAction::refuse,
+                "per-UUID reclaim policy did not select the expected action");
+        std::printf("KV_SHARE_STAGE_POLICY device=%d synchronous=release_inline:1 coalesced=release_inline:8 "
+            "deferred=enqueue:25 foreign_uuid=refuse\n", device);
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "--help") == 0) {
-        std::puts("kv_shared_pool_test [--preflight|--image-contract|--pair-contract|--deferred-contract]: selected devices; no model loaded; exit78=required VMM unavailable");
+        std::puts("kv_shared_pool_test [--preflight|--image-contract|--pair-contract|--deferred-contract|--stage-contract]: selected devices; no model loaded; exit78=required VMM unavailable");
         return 0;
     }
     int count = 0;
     try {
         require(argc <= 2 && (argc == 1 || std::strcmp(argv[1], "--preflight") == 0 ||
             std::strcmp(argv[1], "--image-contract") == 0 || std::strcmp(argv[1], "--pair-contract") == 0 ||
-            std::strcmp(argv[1], "--deferred-contract") == 0),
+            std::strcmp(argv[1], "--deferred-contract") == 0 ||
+            std::strcmp(argv[1], "--stage-contract") == 0),
             "unknown fixture option");
         const char* window_ticket = std::getenv("STRATA_KV_SHARE_TEST_WINDOW");
         if (!window_ticket || !*window_ticket) {
@@ -637,6 +792,7 @@ int main(int argc, char** argv) {
             image_contract(); image_contract(true);
             return 0;
         }
+        if (argc > 1 && std::strcmp(argv[1], "--stage-contract") == 0) { stage_contract(count); return 0; }
         if (argc > 1 && std::strcmp(argv[1], "--pair-contract") == 0) {
             for (int device = 0; device < count; ++device) {
                 PairStats warm; screen(device, device * 4, false, false, warm);

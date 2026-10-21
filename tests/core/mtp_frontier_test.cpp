@@ -5,19 +5,46 @@
 // draft rows were not certified, so the chain legitimately began at the resume point. The admission's
 // initial proposal was refused ("certified=1 covers=0 slot_begin=11756") and the engine exited.
 #include "strata/core/mtp.hpp"
+#include "strata/program/draft_kv_plan.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 
 namespace strata::core {
 struct MtpDraftFrontierFixture {
+    static void shared_prompt_horizon(void (*check)(bool, const char*)) {
+        // Exercise the real production horizon and MTP pruning predicate, not copied
+        // source statements or simulated row writers. No projection/transfer is run.
+        const auto shared = strata::program::draft_kv::prompt_horizon(
+            DraftKind::mtp, 65536, 16384, 16384, true, 8192, true);
+        const auto private_prompt = strata::program::draft_kv::prompt_horizon(
+            DraftKind::mtp, 65536, 16384, 16384, false, 8192, true);
+        struct Example { int64_t window, shared_frontier, private_frontier; };
+        const Example examples[] = {{2048, 6081, 63424}, {32768, 0, 32704}};
+        MtpDrafter draft;
+        for (const auto& example : examples) {
+            draft.window_ = example.window;
+            draft.set_prompt_len(private_prompt.prompt_len);
+            const int64_t private_frontier = draft.first_needed();
+            draft.set_prompt_len(shared.prompt_len);
+            const int64_t shared_frontier = draft.first_needed();
+            check(shared_frontier == example.shared_frontier && private_frontier == example.private_frontier,
+                  "actual MTP pruning uses the shared-cut horizon for both retained window sizes");
+            check(shared_frontier < 8191 && private_frontier > 8191 && shared_frontier != private_frontier,
+                  "a private suffix would prune required shared-prefix rows that the production horizon retains");
+        }
+    }
+
     static void run(void (*check)(bool, const char*)) {
+        shared_prompt_horizon(check);
         MtpDrafter draft;
         draft.window_ = 32768;
         draft.slots_.resize(1);
         auto& slot = draft.slots_[0];
         slot.state.max_cells = 262144;
         slot.request = 9;
+        draft.owners_[0] = {0, 9, 1, 0};
+        slot.producer = draft.owners_[0];
         slot.certified = true;
         slot.begin = 11756;
         slot.cells = slot.completed_cells = 12375;
@@ -58,6 +85,8 @@ struct MtpResumedParkFixture {
         auto& slot = draft.slots_[0];
         slot.state.max_cells = 262144;
         slot.request = 11;
+        draft.owners_[0] = {0, 11, 1, 0};
+        slot.producer = draft.owners_[0];
         slot.certified = true;
         slot.begin = 53201;
         slot.cells = 55249;              // the parked copy's extent

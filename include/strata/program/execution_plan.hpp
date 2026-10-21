@@ -6,6 +6,7 @@
 // reason a capability is off. Facts that need hardware or allocation (which slots fit, a same-GPU split, runtime
 // helper caches) stay explicit inputs and are reported as conditional, never as observed capabilities.
 #pragma once
+#include "strata/core/draft_state.hpp"
 #include "strata/program/batch_groups.hpp"
 #include "strata/program/time_budget.hpp"
 
@@ -17,7 +18,10 @@
 namespace strata::program {
 
 enum class ServeMode { streaming, resident };
-enum class ProposalShape { none, serial_single_draft, batched_single_draft, batched_pipeline, batched_third, batched_floating };
+enum class ProposalShape {
+    none, serial_single_draft, batched_single_draft, batched_pipeline, batched_third, batched_floating,
+    serial_block_draft, batched_block_draft, batched_block_pipeline, batched_block_floating
+};
 enum class Suspension { none, resend, in_place };
 // off: not requested; on: resolved and available; conditional: still depends on an input not known before allocation;
 // refused: the composition is unsupported (the engine must exit before allocating).
@@ -37,6 +41,7 @@ struct ExecutionPlanInput {
     bool same_device_split = false; ///< a split exists, but owns no distinct-device group pipeline
     bool batch_mtp = false, batch_mtp_pipeline = false, batch_mtp_third = false, batch_mtp_floating = false;
     bool mtp_configured = false;
+    bool dflash2_configured = false;
     int spec_requested = 0, mtp_max_requested = 0;
     int suffix_draft = 0, lookup_chain = 0;
     bool adapt_async = false, mtp_serial = false;
@@ -73,6 +78,12 @@ struct ExecutionPlan {
     bool groups_from_auto = false;
     int spec_requested = 0, spec = 0, mtp_max_t = 0;
     ProposalShape proposal = ProposalShape::none;
+    core::DraftKind draft_kind = core::DraftKind::none;
+    int draft_max_t = 0;             ///< native neural forward/prefix capacity, independent of target lookup width
+    int proposal_positions = 0;      ///< maximum neural proposal positions consumed per owner, excluding its anchor
+    int verifier_max_rows = 8;       ///< capacity of each physical target verifier, not logical admitted slots
+    int draft_handoff_rows = 8;      ///< shared transport capacity; native two-group windows use disjoint bases 0/8
+    PlanDecision drafting;          ///< native allocation/residency/capture readiness, not inferred from row capacity
     PlanDecision lookup;             ///< on only where the selected execution path consumes the suffix drafter
     PlanDecision budget;
     Suspension suspension_mode = Suspension::none;
@@ -111,6 +122,10 @@ inline const char* proposal_name(ProposalShape p) {
     case ProposalShape::batched_pipeline: return "batched_pipeline";
     case ProposalShape::batched_third: return "batched_third";
     case ProposalShape::batched_floating: return "batched_floating";
+    case ProposalShape::serial_block_draft: return "serial_block_draft";
+    case ProposalShape::batched_block_draft: return "batched_block_draft";
+    case ProposalShape::batched_block_pipeline: return "batched_block_pipeline";
+    case ProposalShape::batched_block_floating: return "batched_block_floating";
     case ProposalShape::none: break;
     }
     return "none";
@@ -135,6 +150,53 @@ inline const char* support_name(Support s) {
     return "off";
 }
 
+namespace detail {
+// Re-evaluate native geometry from the actual selected schedule, including post-allocation slot/stage fit.
+// Eight physical verifier rows never become sixteen: only the shared handoff owns both group windows.
+inline void resolve_dflash2_geometry(ExecutionPlan& p) {
+    if (p.draft_kind != core::DraftKind::dflash2) return;
+    const bool floating = p.proposal == ProposalShape::batched_block_floating;
+    const bool pipeline = floating || p.proposal == ProposalShape::batched_block_pipeline;
+    p.draft_handoff_rows = 8;
+    if (!p.refused) {
+        const char* refusal = nullptr;
+        if (p.batch_slots < 0 || p.batch_slots > 4)
+            refusal = "native DFlash2 supports at most four resident slots";
+        else if (pipeline && (p.mode != ServeMode::resident || p.stages < 2 || p.groups != 2 ||
+                             !batch_groups::pipeline_slots_supported(p.batch_slots, 4)))
+            refusal = "native DFlash2 pipeline needs two fitted resident groups with effective even --batch 2 or 4";
+        else if (floating && p.batch_slots != 4)
+            refusal = "native DFlash2 floating needs four fitted resident slots";
+        else if (!pipeline && p.batch_slots > 0 && p.groups != 1)
+            refusal = "native DFlash2 synchronous drafting needs one fitted resident group";
+        else if (p.admission.support != Support::off && p.batch_slots == 0)
+            refusal = "native DFlash2 retained prompt needs at least one fitted resident slot";
+        if (refusal) { p.refused = true; p.refusal = refusal; }
+    }
+    if (p.refused) {
+        p.proposal = ProposalShape::none;
+        p.drafting = {Support::refused, p.refusal};
+        if (p.admission.support != Support::off) p.admission = {Support::refused, p.refusal};
+        if (p.suspension_mode == Suspension::in_place) p.suspension = {Support::refused, p.refusal};
+        return;
+    }
+    if (p.batch_slots == 0) {
+        p.proposal = ProposalShape::serial_block_draft;
+        p.suspension_mode = Suspension::none;
+        p.suspension = {Support::off, "single-request serving has no yield boundary"};
+        if (p.concurrent_reader.support == Support::conditional)
+            p.concurrent_reader = {Support::off, "--batch"};
+        if (p.lookup.support == Support::conditional) p.lookup = {Support::on, {}};
+    } else if (pipeline) {
+        p.draft_handoff_rows = 16;
+    } else {
+        p.proposal = ProposalShape::batched_block_draft;
+    }
+    p.drafting = {Support::conditional, "pending native allocation, complete residency and successful graph capture"};
+}
+} // namespace detail
+
+
 // Resolve the option-level contract. The caller supplies values that already passed their own type/syntax checks;
 // this function owns the composition rules that decide whether the selected mode can run at all.
 inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
@@ -146,12 +208,16 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
     // A slot's session must fit before the count is effective; keep the request and label the fit conditional.
     p.batch_slots_resolved = in.batch_requested <= 0;
     p.spec_requested = in.spec_requested;
+    p.draft_kind = in.dflash2_configured ? core::DraftKind::dflash2
+        : in.mtp_configured ? core::DraftKind::mtp : core::DraftKind::none;
+    const bool neural_configured = in.mtp_configured || in.dflash2_configured;
+    const bool batch_drafting = in.batch_mtp || (in.dflash2_configured && p.batch_slots > 0);
 
     // ---- speculative width (the existing suffix/lookup sizing, resolved once) --------------------------------
     int spec = in.spec_requested;
-    int mtp_max = in.mtp_max_requested;
+    int mtp_max = in.dflash2_configured ? std::min(in.mtp_max_requested, 4) : in.mtp_max_requested;
     if (in.suffix_draft > 0 && spec >= 2 && mtp_max == 0) {
-        mtp_max = spec;                       // the MTP keeps its own windows; lookup may go two longer
+        mtp_max = spec;                       // neural prefix stays bounded; target lookup may go two longer
         spec = std::min(spec + 2, 8);         // kVerifyMaxT
     }
     if (in.lookup_chain > 0 && spec >= 2) {
@@ -160,6 +226,15 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
     }
     p.spec = spec;
     p.mtp_max_t = std::min(mtp_max, spec);
+    if (in.dflash2_configured) {
+        // Keep the legacy caller's prefix field bounded too; lookup only expands the target verifier window.
+        p.mtp_max_t = std::min({mtp_max > 0 ? mtp_max : in.spec_requested, spec, 4});
+        p.draft_max_t = 4;
+        p.proposal_positions = std::clamp(p.mtp_max_t - 1, 0, 3);
+    } else if (in.mtp_configured) {
+        p.draft_max_t = p.mtp_max_t > 0 ? p.mtp_max_t : spec;
+        p.proposal_positions = spec >= 2 ? 1 : 0;
+    }
 
     // ---- slot groups --------------------------------------------------------------------------------------
     batch_groups::Input bin;
@@ -168,9 +243,9 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
     bin.given = in.groups_given;
     bin.batch = p.batch_slots;
     bin.later_stages = in.later_stages;
-    bin.batch_mtp = in.batch_mtp;
+    bin.batch_mtp = batch_drafting;
     bin.adapt_async = in.adapt_async;
-    bin.mtp_serial = in.mtp_serial;
+    bin.mtp_serial = in.mtp_serial || (in.dflash2_configured && !in.batch_mtp_pipeline);
     const batch_groups::Result groups = batch_groups::resolve(bin);
     p.groups = groups.groups;
     p.groups_from_auto = groups.from_auto;
@@ -181,12 +256,19 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
     p.groups_conditional = p.batch_slots > 0 && !p.batch_slots_resolved;
 
     // ---- proposal shape -----------------------------------------------------------------------------------
-    const bool mtp_shape = in.mtp_configured && p.spec >= 2;
-    if (mtp_shape && p.batch_slots > 0 && in.batch_mtp_third) p.proposal = ProposalShape::batched_third;
-    else if (mtp_shape && p.batch_slots > 0 && in.batch_mtp_floating) p.proposal = ProposalShape::batched_floating;
-    else if (mtp_shape && p.batch_slots > 0 && in.batch_mtp_pipeline) p.proposal = ProposalShape::batched_pipeline;
-    else if (mtp_shape && p.batch_slots > 0 && in.batch_mtp) p.proposal = ProposalShape::batched_single_draft;
-    else if (mtp_shape) p.proposal = ProposalShape::serial_single_draft;
+    const bool neural_shape = neural_configured && p.spec >= 2;
+    if (neural_shape && in.dflash2_configured) {
+        if (p.batch_slots > 0 && in.batch_mtp_floating) p.proposal = ProposalShape::batched_block_floating;
+        else if (p.batch_slots > 0 && in.batch_mtp_pipeline) p.proposal = ProposalShape::batched_block_pipeline;
+        else if (p.batch_slots > 0) p.proposal = ProposalShape::batched_block_draft;
+        else p.proposal = ProposalShape::serial_block_draft;
+    } else if (neural_shape) {
+        if (p.batch_slots > 0 && in.batch_mtp_third) p.proposal = ProposalShape::batched_third;
+        else if (p.batch_slots > 0 && in.batch_mtp_floating) p.proposal = ProposalShape::batched_floating;
+        else if (p.batch_slots > 0 && in.batch_mtp_pipeline) p.proposal = ProposalShape::batched_pipeline;
+        else if (p.batch_slots > 0 && in.batch_mtp) p.proposal = ProposalShape::batched_single_draft;
+        else p.proposal = ProposalShape::serial_single_draft;
+    }
 
     // ---- lookup -------------------------------------------------------------------------------------------
     p.lookup.support = Support::off;
@@ -242,8 +324,9 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
         std::string refusal;
         if (!in.serve) refusal = "retained prompt needs --serve";
         else if (p.batch_slots < 1 || p.batch_slots > 4) refusal = "retained prompt needs 1..4 resident slots";
-        else if (!in.mtp_configured || !in.batch_mtp || p.spec < 2)
-            refusal = "retained prompt needs batch MTP and --spec >= 2";
+        else if (!neural_configured || !batch_drafting || p.spec < 2)
+            refusal = in.dflash2_configured ? "retained prompt needs batch neural drafting and --spec >= 2"
+                : "retained prompt needs batch MTP and --spec >= 2";
         else if (in.packed_prefill || in.retained_prefill)
             refusal = "retained prompt excludes packed and retained-layer execution";
         else if (in.prefill_chunk != 2048 || !in.private_preparation_static)
@@ -260,9 +343,15 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
             p.admission.reason = "retained lifecycle pending allocation and residency validation";
         }
     } else if (in.packed_prefill) {
-        p.suspension.support = Support::on;
-        p.suspension_mode = Suspension::in_place;
-        p.suspension.reason = "packed preparation keeps its destination and frontier";
+        if (in.dflash2_configured) {
+            p.refused = true;
+            p.refusal = "native DFlash2 does not support packed multi-owner prompt arithmetic; use retained prompt";
+            p.suspension = {Support::refused, p.refusal};
+        } else {
+            p.suspension.support = Support::on;
+            p.suspension_mode = Suspension::in_place;
+            p.suspension.reason = "packed preparation keeps its destination and frontier";
+        }
     } else if (p.batch_slots > 0) {
         p.suspension.support = Support::conditional;
         p.suspension_mode = Suspension::resend;
@@ -272,6 +361,15 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
     }
 
     // ---- composition refusals -----------------------------------------------------------------------------
+    if (!p.refused && in.dflash2_configured) {
+        if (in.mtp_configured) p.refusal = "--dflash2 and --mtp are mutually exclusive";
+        else if (!in.serve) p.refusal = "native DFlash2 needs --serve";
+        else if (in.spec_requested < 2 || in.spec_requested > 4)
+            p.refusal = "native DFlash2 needs neural --spec 2 through 4; lookup may expand only the target window";
+        else if (in.batch_requested > 4) p.refusal = "native DFlash2 supports at most four resident slots";
+        else if (in.batch_mtp_third) p.refusal = "native DFlash2 does not support --batch-mtp-third";
+        if (!p.refusal.empty()) p.refused = true;
+    }
     if (!p.refused && in.resident_multiplex) {
         if (!in.serve) p.refusal = "--resident-multiplex needs --serve";
         else if (p.batch_slots < 2) p.refusal = "--resident-multiplex needs --batch >= 2";
@@ -280,10 +378,10 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
         else if (p.groups != 1) p.refusal = "--resident-multiplex needs one group";
         if (!p.refusal.empty()) { p.refused = true; p.concurrent_reader.support = Support::off; }
     }
-    if (!p.refused && in.batch_mtp) {
-        const int min_slots = in.packed_prefill || in.retained_prompt ? 1 : 2;
+    if (!p.refused && batch_drafting) {
+        const int min_slots = in.dflash2_configured || in.packed_prefill || in.retained_prompt ? 1 : 2;
         if (p.batch_slots < min_slots) p.refusal = "--batch-mtp needs --batch " + std::to_string(min_slots) + " or more";
-        else if (!in.mtp_configured) p.refusal = "--batch-mtp needs --mtp";
+        else if (!neural_configured) p.refusal = "--batch-mtp needs --mtp";
         else if (p.spec < 2) p.refusal = "--batch-mtp needs --spec T (T >= 2)";
         else if (in.same_device_split) p.refusal = "--batch-mtp needs each layer-split stage on its own GPU";
         else if (!in.serve) p.refusal = "--batch-mtp needs --serve";
@@ -295,10 +393,12 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
         if (!p.refusal.empty()) p.refused = true;
     }
     if (!p.refused && in.batch_mtp_pipeline) {
-        if (!in.batch_mtp) p.refusal = "--batch-mtp-pipeline needs --batch-mtp";
+        if (!batch_drafting) p.refusal = in.dflash2_configured
+            ? "native DFlash2 pipeline needs resident batch drafting" : "--batch-mtp-pipeline needs --batch-mtp";
         else if (in.later_stages <= 0) p.refusal = "--batch-mtp-pipeline needs a distinct-device layer split";
-        else if (!batch_groups::pipeline_slots_supported(p.batch_slots, 8))
-            p.refusal = "--batch-mtp-pipeline needs effective even --batch 2 through 8";
+        else if (!batch_groups::pipeline_slots_supported(p.batch_slots, in.dflash2_configured ? 4 : 8))
+            p.refusal = in.dflash2_configured ? "native DFlash2 pipeline needs effective even --batch 2 or 4"
+                : "--batch-mtp-pipeline needs effective even --batch 2 through 8";
         else if (p.groups != 2) p.refusal = "--batch-mtp-pipeline needs --batch-groups 2";
         else if (in.resident_multiplex) p.refusal = "--batch-mtp-pipeline excludes resident multiplexing";
         if (!p.refusal.empty()) p.refused = true;
@@ -313,6 +413,7 @@ inline ExecutionPlan resolve_execution_plan(const ExecutionPlanInput& in) {
             p.refusal = "--batch-mtp-third needs serving floating four-slot/two-group MTP";
         if (!p.refusal.empty()) p.refused = true;
     }
+    detail::resolve_dflash2_geometry(p);
     return p;
 }
 
@@ -332,6 +433,7 @@ inline void resolve_batch_fit(ExecutionPlan& p, int slots, int later_stages, con
     }), p.notes.end());
     const auto note = batch_groups::fallback_message(groups, slots);
     if (!note.empty()) p.notes.push_back(note);
+    detail::resolve_dflash2_geometry(p);
 }
 
 inline std::string ExecutionPlan::batch_group_info() const {
@@ -379,9 +481,17 @@ inline std::string ExecutionPlan::to_json() const {
            ",\"groups\":" + std::to_string(groups) +
            ",\"groups_conditional\":" + (groups_conditional ? "true" : "false") + '}';
     out += ",\"speculation\":{\"requested\":" + std::to_string(spec_requested) +
-           ",\"spec\":" + std::to_string(spec) +
-           ",\"mtp_max\":" + std::to_string(mtp_max_t) +
-           ",\"proposal\":" + detail::json_quote(proposal_name(proposal)) + '}';
+           ",\"spec\":" + std::to_string(spec);
+    if (draft_kind == core::DraftKind::dflash2) {
+        out += ",\"kind\":\"dflash2\",\"draft_max\":" + std::to_string(draft_max_t) +
+               ",\"proposal_positions\":" + std::to_string(proposal_positions) +
+               ",\"verifier_max_rows\":" + std::to_string(verifier_max_rows) +
+               ",\"draft_handoff_rows\":" + std::to_string(draft_handoff_rows) +
+               ",\"execution\":" + detail::decision_json(drafting);
+    } else {
+        out += ",\"mtp_max\":" + std::to_string(mtp_max_t);
+    }
+    out += ",\"proposal\":" + detail::json_quote(proposal_name(proposal)) + '}';
     out += ",\"lookup\":" + detail::decision_json(lookup);
     out += ",\"budget\":" + detail::decision_json(budget);
     out += ",\"concurrent_reader\":" + detail::decision_json(concurrent_reader);

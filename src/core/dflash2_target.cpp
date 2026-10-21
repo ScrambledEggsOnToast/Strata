@@ -51,8 +51,9 @@ struct Verification {
     std::map<std::string, NativeSourceIdentity> checked;
     explicit Verification(Clock::time_point deadline) : deadline(deadline) {}
     void remaining() const { require(Clock::now() < deadline, "daily target artifact verification timed out"); }
-    std::string file(const TargetFile& value) {
-        remaining(); digest(value.sha256);
+    std::string file(const TargetFile& value, bool check_digest) {
+        remaining();
+        if (check_digest) digest(value.sha256);
         const auto before = native_source_identity(value.path);
         std::ifstream input(before.path, std::ios::binary);
         require(bool(input), "daily target artifact is unreadable");
@@ -68,7 +69,7 @@ struct Verification {
         const auto after = native_source_identity(value.path);
         require(before == after && count == before.stamp[2], "daily target artifact changed during verification");
         const std::string actual = sha256_hex(hash.digest());
-        require(actual == value.sha256, "daily target artifact SHA-256 mismatch");
+        require(!check_digest || actual == value.sha256, "daily target artifact SHA-256 mismatch");
         const auto [at, inserted] = checked.emplace(before.path, before);
         require(inserted || at->second == before, "daily target artifact was replaced");
         return actual;
@@ -110,10 +111,13 @@ void native_sources(const std::filesystem::path& pack, const std::set<std::strin
             for (;;) {
                 const auto end = names.find(',', begin);
                 const auto name = names.substr(begin, end - begin);
-                require(!name.empty() && std::filesystem::path(name).filename() == name,
-                        "native expert source must be a resolved shard filename");
-                const auto path = std::filesystem::canonical(std::filesystem::path(*shards.begin()).parent_path() / name);
-                require(shards.contains(path.string()), "native expert backing shard is outside verified daily target");
+                // Empty v4 roles use the selected --native shard, already verified above.
+                if (!name.empty()) {
+                    require(std::filesystem::path(name).filename() == name,
+                            "native expert source must be a resolved shard filename");
+                    const auto path = std::filesystem::canonical(std::filesystem::path(*shards.begin()).parent_path() / name);
+                    require(shards.contains(path.string()), "native expert backing shard is outside verified daily target");
+                }
                 ++roles;
                 if (end == std::string::npos) break;
                 begin = end + 1;
@@ -128,6 +132,25 @@ void native_sources(const std::filesystem::path& pack, const std::set<std::strin
 VerifiedDailyTarget VerifiedDailyTarget::verify(const DailyTargetFiles& files, const ModelGeometry& g,
                                                const NativeTensorIdentity& embedding, const NativeTensorIdentity& head,
                                                std::chrono::milliseconds timeout) {
+    return verify_impl(files, g, embedding, head, timeout, true);
+}
+VerifiedDailyTarget VerifiedDailyTarget::identify(const std::string& pack, const std::string& tokenizer,
+                                                 const std::array<std::string, 2>& shards, const ModelGeometry& g,
+                                                 const NativeTensorIdentity& embedding, const NativeTensorIdentity& head,
+                                                 std::chrono::milliseconds timeout) {
+    DailyTargetFiles files;
+    files.profile_name = daily_profile; files.pack_path = pack; files.tokenizer_path = tokenizer;
+    for (size_t i = 0; i < shards.size(); ++i) files.shards[i].path = shards[i];
+    for (const char* name : {"index.txt", "conversions.json", "native_experts.txt", "dense.bin"})
+        files.pack_sha256.emplace(name, "");
+    for (const char* name : {"chat_template.jinja", "vocab.json", "merges.txt", "token_type.json", "tokenizer.json"})
+        files.tokenizer_sha256.emplace(name, "");
+    files.embedding_sha256 = embedding.sha256; files.head_sha256 = head.sha256;
+    return verify_impl(files, g, embedding, head, timeout, false);
+}
+VerifiedDailyTarget VerifiedDailyTarget::verify_impl(const DailyTargetFiles& files, const ModelGeometry& g,
+                                                    const NativeTensorIdentity& embedding, const NativeTensorIdentity& head,
+                                                    std::chrono::milliseconds timeout, bool check_digests) {
     try {
         require(files.profile_name == daily_profile && timeout.count() > 0 && timeout <= std::chrono::seconds(1800),
                 "unselected daily target profile or invalid verification deadline");
@@ -140,7 +163,7 @@ VerifiedDailyTarget VerifiedDailyTarget::verify(const DailyTargetFiles& files, c
         std::map<std::string, std::string> pack_roles, tokenizer_roles;
         std::set<std::string> shards;
         for (size_t index = 0; index < files.shards.size(); ++index) {
-            pack_roles.emplace("native-shard:" + std::to_string(index), verification.file(files.shards[index]));
+            pack_roles.emplace("native-shard:" + std::to_string(index), verification.file(files.shards[index], check_digests));
             require(shards.insert(std::filesystem::canonical(files.shards[index].path).string()).second,
                     "duplicate daily target shard");
         }
@@ -149,12 +172,12 @@ VerifiedDailyTarget VerifiedDailyTarget::verify(const DailyTargetFiles& files, c
         for (const char* name : pack_names) {
             require(files.pack_sha256.contains(name), "missing daily target pack artifact");
             pack_roles.emplace(std::string("pack:") + name,
-                verification.file({(std::filesystem::path(files.pack_path) / name).string(), files.pack_sha256.at(name)}));
+                verification.file({(std::filesystem::path(files.pack_path) / name).string(), files.pack_sha256.at(name)}, check_digests));
         }
         for (const char* name : tokenizer_names) {
             require(files.tokenizer_sha256.contains(name), "missing daily target tokenizer artifact");
             tokenizer_roles.emplace(name, verification.file({(std::filesystem::path(files.tokenizer_path) / name).string(),
-                                                             files.tokenizer_sha256.at(name)}));
+                                                             files.tokenizer_sha256.at(name)}, check_digests));
         }
         native_sources(files.pack_path, shards);
         for (const auto* tensor : {&embedding, &head}) {

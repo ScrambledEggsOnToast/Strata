@@ -150,17 +150,20 @@ public:
     bool owns_work_buffers() const;
     bool bind_request(uint64_t request, std::string& err);
     /// Capture-only, enabled before init. Arm EVERY split stage with the same
-    /// owner and whole run interval. Retains the final <=2047 absolute rows across
-    /// chunks in owned mapped staging; no mixed/normed activations are exposed.
-    /// Views are host-complete after successful run + chain drain, and borrowed
-    /// until release/reset/destruction. No proposal or CaptureStore publication.
+    /// owner and exact absolute run interval. slot=8 selects the working session;
+    /// a private/resident slot selects its registered request/incarnation/session.
+    /// Retains the final <=2047 rows across chunks in shared owned staging.
+    /// Views require successful run + chain drain and stay borrowed until release.
+    /// Multi-owner packed prompts are explicitly refused while capture is enabled.
     bool enable_dflash2_capture(std::string& err);
     bool arm_dflash2_capture(core::dflash2::CaptureOwner owner, int64_t frontier, int64_t start, int64_t count,
-                            std::string& err);
+                            std::string& err, int slot = 8);
     bool dflash2_tap(core::dflash2::CaptureOwner owner, int tap_layer, core::dflash2::TapView& out,
                      std::string& err) const;
     bool release_dflash2_capture(core::dflash2::CaptureOwner owner, std::string& err);
     bool context_idle(std::string& err) const;
+    /// Actual page-rounded mapped payload plus flag for this physical stage.
+    uint64_t dflash2_staging_bytes() const;
 
     void* stream() const;
     /// Last chunk's complete local residual output. Borrowed device storage,
@@ -317,6 +320,14 @@ public:
     /// preparation writes. Each owner's next_tokens certifies the residual/position+1-token pair for MTP.
     SegmentedResult run_segments(const OwnerSpan* owners, int count, std::string& err,
                                  const std::function<bool()>& command_pending);
+    /// One registered private/resident owner, using the same segmented target
+    /// arithmetic and lifecycle callbacks. An optional retained step holds one
+    /// <=2048-row chunk at layer yields; arm that chunk's absolute interval on
+    /// every stage before entry. Owner descriptors do not outlive the drained
+    /// call; completed capture views remain reserved until explicit release.
+    SegmentedResult run_owner(const OwnerSpan& owner, std::string& err,
+                              const std::function<bool(Prefill*, int64_t, std::string&)>& step = {},
+                              bool layer_yields = true);
     bool bind_owner(int slot, uint64_t request, uint64_t incarnation,
                     const std::array<core::SessionState*, 4>& sessions, std::string& err);
     // Read-only drained owner/operation witness; no rebind, upload or allocation.
@@ -456,7 +467,10 @@ private:
     const std::function<bool(Prefill*, int64_t, std::string&)>* retained_step_ = nullptr;
     bool retained_layer_yields_ = true;
     bool retained_boundary(int64_t next_layer, std::string& err, bool bulk_complete = true);
-    bool local_idle(std::string& err) const;
+    bool local_idle(std::string& err, bool allow_armed = false) const;
+    bool operation_idle(std::string& err, bool allow_armed) const;
+    bool capture_owner_matches(core::dflash2::CaptureOwner owner, int slot) const;
+    bool retained_ready(int64_t n, const OwnerSpan* owner, std::string& err) const;
     std::atomic<bool> public_running_{false};
     Prefill* segment_root_ = nullptr;
     SegmentedResult* segment_result_ = nullptr;

@@ -26,7 +26,7 @@ inline uint64_t session_arena_bytes(const SessionLayerCounts& layers, uint64_t s
 
 // Conservative ABI envelopes, enforced against the source types by core/resident_memory.hpp.
 // These are payload bounds, not measured allocator/driver/graph overhead.
-inline constexpr uint64_t kResidentOwnerBytes = 4096;
+inline constexpr uint64_t kResidentOwnerBytes = 8192; // includes bounded neural proposal/q ownership
 inline constexpr uint64_t kResidentQsaBytes = 4096;
 inline constexpr uint64_t kResidentMaxSlots = 8;
 // Fresh checkpoint/vector copies allocate their logical extents. Add 12.5% of

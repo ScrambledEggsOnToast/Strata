@@ -33,9 +33,13 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <span>
+#include <string>
 
 namespace strata::core {
 
@@ -79,6 +83,59 @@ inline constexpr int kSpecQStride = 2 * kSpecQEntries;
 inline constexpr uint64_t kSpecCtrAccept = 1ull << 62;
 inline constexpr uint64_t kSpecCtrResid = 1ull << 63;
 inline constexpr uint64_t kSpecCtrDraft = 1ull << 61;
+// A declared conditional distribution must never silently degrade to the
+// legacy "no list means point mass" path. Validate its wire representation
+// before a proposal or a verifier may publish/consume it.
+inline bool validate_spec_q_row(const int32_t* row, int32_t proposed, int64_t vocabulary,
+                                std::string& error) {
+    if (!row || vocabulary <= 0 || proposed < 0 || proposed >= vocabulary) {
+        error = "conditional q: missing row or invalid proposed token"; return false;
+    }
+    int count = 0;
+    double total = 0;
+    bool ended = false, selected = false;
+    for (int i = 0; i < kSpecQEntries; ++i) {
+        const int32_t id = row[i];
+        float probability;
+        std::memcpy(&probability, row + kSpecQEntries + i, sizeof(probability));
+        if (id == -1) ended = true;
+        if (ended) {
+            if (id != -1 || probability != 0.0f) {
+                error = "conditional q: hidden support after terminator"; return false;
+            }
+            continue;
+        }
+        if (id < 0 || id >= vocabulary || !std::isfinite(probability) || probability < 0.0f) {
+            error = "conditional q: invalid candidate or probability"; return false;
+        }
+        for (int j = 0; j < i; ++j) if (row[j] == id) {
+            error = "conditional q: duplicate candidate"; return false;
+        }
+        ++count; total += probability;
+        selected = selected || (id == proposed && probability > 0.0f);
+    }
+    if (!count || !selected ||
+        std::fabs(total - 1.0) > count * double(std::numeric_limits<float>::epsilon())) {
+        error = "conditional q: unnormalized support or selected token has no positive mass"; return false;
+    }
+    return true;
+}
+
+// The selected sampled-neural prefix is declared independently of available q
+// rows. Following deterministic lookup rows have point-mass laws, never leftover
+// neural distributions. Callers with no sampled-neural prefix use the legacy path.
+inline bool validate_spec_q_prefix(const int32_t* q, int n_q, int required_neural_rows,
+                                   std::span<const int32_t> proposed, int64_t vocabulary,
+                                   std::string& error) {
+    if (required_neural_rows <= 0 || n_q != required_neural_rows || !q ||
+        !proposed.data() || size_t(required_neural_rows) > proposed.size()) {
+        error = "conditional q: selected neural prefix and available rows disagree"; return false;
+    }
+    for (int row = 0; row < required_neural_rows; ++row)
+        if (!validate_spec_q_row(q + size_t(row) * kSpecQStride, proposed[size_t(row)], vocabulary, error))
+            return false;
+    return true;
+}
 
 /// The post-chain distribution of a row: `n` ids and their probabilities (double, the sampler's own `ex`).
 struct SpecP {

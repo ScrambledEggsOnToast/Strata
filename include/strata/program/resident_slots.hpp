@@ -1,6 +1,7 @@
 // Resident request transitions. SessionOwner, Verifier and MTP retain resource ownership.
 #pragma once
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/neural_drafter.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/program/prefix_selection.hpp"
 #include "strata/program/continuation.hpp"
@@ -13,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-namespace strata::core { class Verifier; class MtpDrafter; struct ExpertDispatch; }
+namespace strata::core { class Verifier; struct ExpertDispatch; }
 namespace strata::prefill { class Prefill; }
 namespace strata::program {
 
@@ -97,7 +98,7 @@ struct ResidentSlot {
     uint64_t request = 0;
     uint64_t incarnation = 0;
     int32_t x = 0;
-    int32_t draft = -1;
+    core::DraftProposal proposal;
     int64_t p = 0, produced = 0, max_new = 0;
     std::chrono::steady_clock::time_point t0;
     std::vector<int32_t> ids;
@@ -145,6 +146,8 @@ public:
     const ResidentSlot& owner;
     std::vector<core::ConversationCheckpoint>& checkpoints;
     const core::QsaState* draft;
+    core::NeuralDrafter& neural;
+    const int draft_slot;
     const int64_t draft_begin, draft_cells;
     const int32_t draft_next_token;
     // The certified committed cut this source may publish. Speculative scratch is not part of it.
@@ -156,9 +159,10 @@ public:
 private:
     friend class ResidentSlots;
     ResidentSnapshotSource(ResidentSlot& owner, const std::vector<ResidentStage>& stages,
-                           const core::QsaState* draft, int slot, int64_t begin, int64_t cells, int32_t next)
-        : owner(owner), checkpoints(owner.checks), draft(draft), draft_begin(begin), draft_cells(cells),
-          draft_next_token(next), stages_(stages), slot_(slot) {}
+                           core::NeuralDrafter& neural, const core::QsaState* draft, int slot,
+                           int64_t begin, int64_t cells, int32_t next)
+        : owner(owner), checkpoints(owner.checks), draft(draft), neural(neural), draft_slot(slot),
+          draft_begin(begin), draft_cells(cells), draft_next_token(next), stages_(stages), slot_(slot) {}
     const std::vector<ResidentStage>& stages_;
     int slot_;
 };
@@ -212,7 +216,7 @@ enum class ResidentSourceRefusal { none, uncertified_interval, incoherent_bounda
 class ResidentSlots {
 public:
     ResidentSlots(const core::ModelGeometry& geometry, std::vector<ResidentStage> stages,
-                  core::MtpDrafter& draft, prefill::Prefill& prompt, core::ExpertDispatch& dispatch,
+                  core::NeuralDrafter& draft, prefill::Prefill& prompt, core::ExpertDispatch& dispatch,
                   int64_t context, bool cache, int64_t checkpoint_chain_limit, uint64_t checkpoint_byte_limit);
     ~ResidentSlots();
     ResidentSlots(const ResidentSlots&) = delete;
@@ -341,7 +345,7 @@ private:
     bool fail(int slot);
     const core::ModelGeometry& geometry_;
     std::vector<ResidentStage> stages_;
-    core::MtpDrafter& draft_;
+    core::NeuralDrafter& draft_;
     prefill::Prefill& prompt_;
     core::ExpertDispatch& dispatch_;
     std::vector<ResidentSlot> slots_;

@@ -3,7 +3,9 @@
 // present at that cut, and the separately owned draft readiness. Speculative scratch is deliberately absent: it is
 // borrowed only while a consumer drains and never becomes committed history.
 #pragma once
+#include "strata/core/draft_state.hpp"
 #include <cstdint>
+#include <algorithm>
 
 
 namespace strata::program {
@@ -66,6 +68,9 @@ struct ContinuationInput {
     int64_t draft_frontier = -1;
     int32_t draft_boundary = -1;
     int32_t token_at_frontier = -1;
+    core::DraftKind draft_kind = core::DraftKind::mtp;
+    uint64_t draft_incarnation = 0;
+    int64_t draft_origin = 0;
 };
 
 struct ContinuationCertificate {
@@ -78,6 +83,8 @@ struct ContinuationCertificate {
     bool draft_ready = false;
     int64_t draft_begin = 0, draft_end = 0;
     int64_t draft_frontier = -1;
+    core::DraftKind draft_kind = core::DraftKind::none;
+    int64_t draft_origin = 0;
 
     const char* reason() const { return continuation_refusal_name(refusal); }
 };
@@ -112,7 +119,8 @@ inline ContinuationCertificate certify_continuation(const ContinuationInput& in)
     if (in.needs_ple && !in.has_ple) { out.refusal = ContinuationRefusal::missing_ple; return out; }
     if (in.needs_stages && !in.has_stages) { out.refusal = ContinuationRefusal::missing_stage; return out; }
     if (in.draft_present) {
-        if (in.draft_request != in.request) {
+        if (in.draft_request != in.request ||
+            (in.draft_incarnation && in.draft_incarnation != in.incarnation)) {
             out.refusal = ContinuationRefusal::draft_owner;
             return out;
         }
@@ -123,9 +131,16 @@ inline ContinuationCertificate certify_continuation(const ContinuationInput& in)
             return out;
         }
         // An empty certified interval has no row that consumed a boundary token.
-        if (in.draft_frontier > in.draft_begin && (in.draft_boundary < 0 || in.token_at_frontier < 0 ||
-            in.draft_boundary != in.token_at_frontier)) {
+        if (in.draft_kind == core::DraftKind::mtp && in.draft_frontier > in.draft_begin &&
+            (in.draft_boundary < 0 || in.token_at_frontier < 0 || in.draft_boundary != in.token_at_frontier)) {
             out.refusal = ContinuationRefusal::draft_boundary;
+            return out;
+        }
+        if (in.draft_kind == core::DraftKind::dflash2 &&
+            (in.draft_origin < 0 || in.draft_begin < in.draft_origin ||
+             in.draft_end - in.draft_begin > 2047 ||
+             in.draft_frontier != cut || in.draft_begin != std::max(in.draft_origin, cut - 2047))) {
+            out.refusal = ContinuationRefusal::draft_interval;
             return out;
         }
     }
@@ -140,6 +155,8 @@ inline ContinuationCertificate certify_continuation(const ContinuationInput& in)
     out.draft_begin = in.draft_present ? in.draft_begin : 0;
     out.draft_end = in.draft_present ? in.draft_end : 0;
     out.draft_frontier = in.draft_present ? in.draft_frontier : -1;
+    out.draft_kind = in.draft_present ? in.draft_kind : core::DraftKind::none;
+    out.draft_origin = in.draft_origin;
     return out;
 }
 
@@ -169,7 +186,9 @@ inline DraftReadinessDecision decide_draft_readiness(const ContinuationCertifica
         out.refusal = ContinuationRefusal::draft_interval;
         return out;
     }
-    const int64_t needed = window > 0 && prompt_tokens > window ? prompt_tokens - window : 0;
+    const int64_t needed = cut.draft_kind == core::DraftKind::dflash2
+        ? std::max(cut.draft_origin, cut.valid_end - int64_t(2047))
+        : window > 0 && prompt_tokens > window ? prompt_tokens - window : 0;
     const int64_t frontier = cut.draft_ready ? cut.draft_frontier : cut.valid_end;
     const int64_t begin = frontier < needed ? frontier : needed;
     if (cut.draft_ready && cut.draft_begin <= begin) {

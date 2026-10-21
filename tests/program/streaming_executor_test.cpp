@@ -129,6 +129,27 @@ int main() {
     }
     {
         Fixture f;
+        ExecutionPlanInput input;
+        input.serve = true;
+        input.dflash2_configured = true;
+        input.spec_requested = 4;
+        f.plan = resolve_execution_plan(input);
+        f.resolve_prices();
+        StreamingExecutor executor;
+        const auto work = f.submit(executor);
+        check(bool(work) && executor.prefilled(work, 2, f.error) &&
+              executor.committed(work, 7, 3, f.error),
+              "serial native block drafting reaches the existing committed-token owner");
+        const auto token = executor.observe(work, f.error);
+        check(token.event == StreamingEvent::committed_token && token.token == 7 && token.committed == 1,
+              "serial native block output is delivered once through the existing stream");
+        const auto terminal = executor.drain(work, receipt(work, 3, 1), f.error);
+        check(terminal.event == StreamingEvent::terminal && terminal.fresh &&
+              !executor.observe(work, f.error).fresh,
+              "serial native block drafting drains to exactly one terminal");
+    }
+    {
+        Fixture f;
         StreamingExecutor executor;
         const size_t before = allocations;
         const auto work = f.submit(executor);

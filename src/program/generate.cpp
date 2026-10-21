@@ -46,6 +46,13 @@
 #include "strata/core/resident_memory.hpp"
 #include "strata/core/verify_ownership.hpp"
 #include "strata/core/weights.hpp"
+#if defined(STRATA_DFLASH2_CAPTURE)
+#include "strata/core/dflash2_drafter.hpp"
+#include "strata/core/dflash2_weights.hpp"
+#include "strata/program/dflash2_parity_capture.hpp"
+#include "strata/program/dflash2_serving.hpp"
+#include "strata/kernels/philox.hpp"
+#endif
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -178,6 +185,12 @@ int resident_model_checks(strata::program::ResidentSlots&, strata::core::ExpertD
 int resident_host_model_checks(strata::program::ResidentSlots&, strata::core::ExpertDispatch&,
                                const strata::core::ModelGeometry&, const std::vector<strata::program::ResidentStage>&,
                                strata::core::MtpDrafter&);
+#if defined(STRATA_DFLASH2_CAPTURE)
+int resident_native_model_checks(strata::program::ResidentSlots&, strata::core::ExpertDispatch&,
+                                 const strata::core::ModelGeometry&,
+                                 const std::vector<strata::program::ResidentStage>&,
+                                 strata::core::dflash2::DflashNativeDrafter&);
+#endif
 #endif
 #ifdef STRATA_RESIDENCY_MODEL_TEST
 #include "strata/platform/protected_test.hpp"
@@ -673,7 +686,8 @@ struct Options {
     /// publishes exactly this much to pinned memory.
     std::string dump_routing;
     bool no_capture = false;          // run the layers directly instead of replaying graphs
-    bool dflash2_capture = false;     // opt-in committed feature producer; no drafter/proposal cutover
+    bool dflash2_capture = false;     // opt-in committed feature producer, also required by the native drafter
+    std::string dflash2, dflash2_manifest_sha256, dflash2_tokenizer;
     /// Issue #60: the enforced MPS client ceiling this configuration is launched under, and
     /// the finite allowances the operator commits for the two classes that have no size API.
     /// The declared caps and outside-client allowance are explicit. Opaque-class allowances
@@ -948,8 +962,9 @@ struct Options {
     int64_t conversation_cache_disk_mib = 131072;
     /// --conversation-cache-disk-min-free-mib N: filesystem space a new reservation must leave free (default 131072).
     int64_t conversation_cache_disk_min_free_mib = 131072;
-    /// --conversation-cache-disk-heads N: retained branch heads across the whole store, independent of the RAM slots
-    /// (default 128).
+    /// --conversation-cache-disk-heads N: retained branch heads per execution domain, independent of the RAM slots
+    /// (default 128).  One profile's publications never retire another profile's heads; the byte quota and floor stay
+    /// global.
     int64_t conversation_cache_disk_heads = 128;
     /// Verified identities (64 hex digits each) from the release artifacts, never a profile name, an alias or a
     /// sampled fingerprint: --conversation-cache-model-id is the common model/pack identity (draft and layout
@@ -1095,6 +1110,9 @@ void usage() {
                  "  --max-new N          tokens to generate (default 16)\n"
                  "  --max-context N      KV/state capacity (default 4096)\n"
                  "  --dflash2-capture   own the five committed target taps (opt-in CUDA build; serial fresh serve only)\n"
+                 "  --dflash2 DIR       select the strict native DFlash2 drafter instead of --mtp (CUDA opt-in)\n"
+                 "  --dflash2-manifest-sha256 SHA  independently pinned converted-directory manifest identity\n"
+                 "  --dflash2-tokenizer DIR  actual selected tokenizer/template directory for borrowed-target binding\n"
                  "  --rope-scaling T     extend the context past the trained one: none, linear\n"
                  "                       (position interpolation) or yarn - llama.cpp's types and names.\n"
                  "                       Default: the model file's rope keys, else none. Fixed at startup:\n"
@@ -1145,8 +1163,9 @@ void usage() {
                  "                       (default 131072 = 128 GiB), lazily allocated and never split per profile\n"
                  "  --conversation-cache-disk-min-free-mib N  --serve persistence: filesystem space a new reservation\n"
                  "                       must leave free (default 131072); a refusal is an ordinary cache miss\n"
-                 "  --conversation-cache-disk-heads N  --serve persistence: retained branch heads across the whole\n"
-                 "                       store (default 128), independent of --conversation-cache-slots\n"
+                 "  --conversation-cache-disk-heads N  --serve persistence: retained branch heads per execution domain\n"
+                 "                       (default 128), independent of --conversation-cache-slots; one profile's\n"
+                 "                       publications never retire another profile's heads\n"
                  "  --conversation-cache-model-id HEX64  --serve persistence: the verified common model/pack identity\n"
                  "                       (64 hex digits) from the release artifacts, never a profile name or alias\n"
                  "  --conversation-cache-engine-id HEX64  --serve persistence: the verified execution domain (state\n"
@@ -2986,6 +3005,9 @@ int main(int argc, char** argv) {
         }
         else if (a == "--remote-expert-opt") o.remote_expert_opt = true;
         else if (a == "--dflash2-capture") o.dflash2_capture = true;
+        else if (a == "--dflash2") o.dflash2 = next("--dflash2");
+        else if (a == "--dflash2-manifest-sha256") o.dflash2_manifest_sha256 = next("--dflash2-manifest-sha256");
+        else if (a == "--dflash2-tokenizer") o.dflash2_tokenizer = next("--dflash2-tokenizer");
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
@@ -3406,17 +3428,20 @@ int main(int argc, char** argv) {
         pin.groups_given = batch_groups_requested;
         pin.later_stages = later_stages;
         pin.same_device_split = same_device_split;
-        pin.batch_mtp = o.batch_mtp || (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
+        pin.batch_mtp = (!o.dflash2.empty() && o.batch > 0) || o.batch_mtp ||
+            (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
         pin.batch_mtp_pipeline = o.batch_mtp_pipeline;
         pin.batch_mtp_third = o.batch_mtp_third;
         pin.batch_mtp_floating = o.batch_mtp_floating;
         pin.mtp_configured = !o.mtp.empty();
+        pin.dflash2_configured = !o.dflash2.empty();
         pin.spec_requested = o.spec;
         pin.mtp_max_requested = o.mtp_max_t;
         pin.suffix_draft = o.suffix_draft;
         pin.lookup_chain = o.lookup_chain;
         pin.adapt_async = o.adapt_async != 0;
-        pin.mtp_serial = mtp_serial_env != nullptr && mtp_serial_env[0] != '\0' && mtp_serial_env[0] != '0';
+        pin.mtp_serial = (!o.dflash2.empty() && !o.batch_mtp_pipeline) ||
+            (mtp_serial_env != nullptr && mtp_serial_env[0] != '\0' && mtp_serial_env[0] != '0');
         pin.resident_multiplex = o.resident_multiplex;
         pin.prompt_cache = o.prompt_cache > 0;
         pin.packed_prefill = packed_prefill;
@@ -3482,11 +3507,11 @@ int main(int argc, char** argv) {
     }
     const size_t packed_frame_bytes = private_preparation
         ? size_t(4) * (size_t(std::max<int64_t>(o.max_context, 1)) * 11 + 4096) + 16 : 0;
-    if (private_preparation && (!o.serve || o.batch < 1 || o.batch > 4 || o.mtp.empty() ||
+    if (private_preparation && (!o.serve || o.batch < 1 || o.batch > 4 || (o.mtp.empty() && o.dflash2.empty()) ||
         o.spec < 2 || o.prefill_chunk != 2048 || o.prefill_auto || o.vision || o.kv_grow ||
         o.vram_elastic || o.pipeline_windows > 0 || o.adapt_async ||
         o.adapt_swaps != 0 || o.peer_device >= 0 || o.prefill_helpers || o.spec_split)) {
-        std::fprintf(stderr, "strata packed prefill: requires --serve, 1..4 resident slots, MTP/spec, "
+        std::fprintf(stderr, "strata private prefill: requires --serve, 1..4 resident slots, neural drafting/spec, "
                              "fixed 2048 scratch and static text-only owners; no elastic/adaptive/helper composition\n");
         return 2;
     }
@@ -4307,7 +4332,67 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: invalid sampling or resource parameter\n");
         return 2;
     }
-    if (o.dflash2_capture) {
+    if (o.dflash2.empty() && (!o.dflash2_manifest_sha256.empty() || !o.dflash2_tokenizer.empty())) {
+        std::fprintf(stderr, "strata dflash2: manifest/tokenizer binding requires --dflash2\n"); return 2;
+    }
+    const char* dflash_capture_dir = std::getenv("DFLASH2_CAPTURE_DIR");
+    if (dflash_capture_dir && (!*dflash_capture_dir || o.dflash2.empty())) {
+        std::fprintf(stderr, "strata dflash2: DFLASH2_CAPTURE_DIR requires the native drafter and a fresh directory\n");
+        return 2;
+    }
+    if (dflash_capture_dir && o.batch > 0) {
+        std::fprintf(stderr, "strata dflash2: proposal bundle capture is a single serial eight-output request, not a batch speed arm\n");
+        return 2;
+    }
+    if (!o.dflash2.empty()) {
+#if !defined(STRATA_DFLASH2_CAPTURE) || defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_USE_SYCL) || defined(STRATA_GPU_METAL)
+        std::fprintf(stderr, "strata dflash2: requires the CUDA STRATA_BUILD_DFLASH2_BRIDGE build\n"); return 2;
+#endif
+        if (!o.mtp.empty() || o.dflash2_manifest_sha256.size() != 64 || o.dflash2_tokenizer.empty() ||
+            !std::all_of(o.dflash2_manifest_sha256.begin(), o.dflash2_manifest_sha256.end(), [](char c) {
+                return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+            })) {
+            std::fprintf(stderr, "strata dflash2: --mtp is mutually exclusive; an independent lowercase manifest "
+                                 "SHA-256 and selected tokenizer directory are required\n"); return 2;
+        }
+        if (o.batch > 4) {
+            std::fprintf(stderr, "strata dflash2: the native resident owner/key bound is one through four logical seats\n");
+            return 2;
+        }
+        if (!strata::core::kDflash2BatchGraphHostPricingSupported) {
+            std::fprintf(stderr, "strata dflash2: native graph bookkeeping has no finite price for this host ABI\n");
+            return 2;
+        }
+        if (packed_prefill || o.batch_mtp_third || o.spec_corrupt > 0) {
+            std::fprintf(stderr, "strata dflash2: union-row PACKED_PROMPT, the depth-one third replay owner "
+                "and draft corruption do not preserve the native proposal contract; use private/retained owner "
+                "prefill and bounded serial or two-owner replay frames\n"); return 2;
+        }
+        if (!o.serve || o.spec < 2 || o.spec > strata::kernels::kVerifyMaxT ||
+            o.pipeline_windows != 0 || o.spec_split ||
+            o.prefill_chunk < 1 || o.prefill_auto || !o.no_prefill_borrow ||
+            o.prefill_head_alias || o.adapt_swaps || o.adapt_async || o.peer_device >= 0 || remote_caches ||
+            o.prefill_helpers || o.kv_grow || o.vram_elastic || o.vision || !o.cvec_files.empty() ||
+            o.no_capture || o.no_token_graph || o.no_pool || o.expert_profile.empty() ||
+            split_auto || split_same || o.split_skip_if_fits || o.native_shards.size() != 2) {
+            std::fprintf(stderr, "strata dflash2: requires native two-shard serving, bounded --spec 2..8 target windows, fixed owned prefill "
+                                 "and complete fixed expert residency; helper/elastic/image/steering paths "
+                                 "are not a native-drafter configuration "
+                                 "(serve=%d spec=%d pipeline=%d spec_split=%d prefill_chunk=%lld prefill_auto=%d borrow=%d alias=%d "
+                                 "swaps=%d async=%d peer=%d remote=%d helpers=%d kv_grow=%d elastic=%d vision=%d cvec=%zu "
+                                 "no_capture=%d no_token_graph=%d no_pool=%d profile=%zu split_auto=%d split_same=%d skip=%d shards=%zu)\n",
+                                 int(o.serve), o.spec, o.pipeline_windows, int(o.spec_split), (long long) o.prefill_chunk,
+                                 int(o.prefill_auto), int(o.no_prefill_borrow), int(o.prefill_head_alias),
+                                 o.adapt_swaps, int(o.adapt_async), o.peer_device, int(remote_caches),
+                                 int(o.prefill_helpers), int(o.kv_grow), int(o.vram_elastic), int(o.vision),
+                                 o.cvec_files.size(), int(o.no_capture), int(o.no_token_graph), int(o.no_pool),
+                                 o.expert_profile.size(), int(split_auto), int(split_same),
+                                 int(o.split_skip_if_fits), o.native_shards.size());
+            return 2;
+        }
+        o.dflash2_capture = true;
+    }
+    if (o.dflash2_capture && o.dflash2.empty()) {
 #if !defined(STRATA_DFLASH2_CAPTURE) || defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_USE_SYCL) || defined(STRATA_GPU_METAL)
         std::fprintf(stderr, "strata dflash2 capture: requires the CUDA STRATA_BUILD_DFLASH2_BRIDGE build\n");
         return 2;
@@ -4993,14 +5078,32 @@ int main(int argc, char** argv) {
         for (size_t st = 0; st <= split_devs.size(); ++st) {
             strata::core::dflash2::CaptureAllocation part;
             if (!strata::core::dflash2::CaptureAllocation::stage(
-                    st ? split_at[st - 1] : 0, st < split_at.size() ? split_at[st] : g.n_layers, part, err)) {
+                    st ? split_at[st - 1] : 0, st < split_at.size() ? split_at[st] : g.n_layers, part, err,
+                    !o.dflash2.empty() || o.batch > 0 ? strata::kernels::kVerifyMaxT
+                        : std::max(o.spec, strata::core::dflash2::block_size))) {
                 std::fprintf(stderr, "strata dflash2 capture: %s\n", err.c_str()); return 2;
             }
             capture_allocation.prefill += part.prefill;
-            capture_allocation.verify += part.verify;
-            capture_allocation.flags += part.flags;
+            const size_t verifiers = 1 + size_t(o.batch_mtp_pipeline) + size_t(o.batch_mtp_third);
+            capture_allocation.verify += part.verify * verifiers;
+            capture_allocation.flags += part.flags * (verifiers + 1) / 2;
         }
     }
+#if defined(STRATA_DFLASH2_CAPTURE)
+    strata::core::DraftAllocationPlan dflash_allocation;
+    uint64_t dflash_dense_bytes = 0;
+    const int dflash_device = split_devs.empty() ? primary_device : split_devs.back();
+    const size_t dflash_head_scratch = strata::kernels::native_q8_1_bytes(int(g.n_embd), 1);
+    if (!o.dflash2.empty()) {
+        std::error_code error;
+        dflash_dense_bytes = std::filesystem::file_size(std::filesystem::path(o.dflash2) / "dense.bin", error);
+        if (error || !dflash_dense_bytes || dflash_dense_bytes > SIZE_MAX) {
+            std::fprintf(stderr, "strata dflash2: cannot price the converted dense weight file\n"); return 2;
+        }
+        dflash_allocation = strata::core::dflash2::DflashNativeDrafter::planned_allocation(
+            dflash_device, size_t(dflash_dense_bytes), primary_device, dflash_device, dflash_head_scratch);
+    }
+#endif
 
     // ---- HET-017: the pre-allocation admission gate ------------------------------------------
     // Everything the accounting names is priced from the artifact or from the very functions the
@@ -5182,6 +5285,11 @@ int main(int argc, char** argv) {
                                  "reason=resolved resident-role pricing failed\n", unpriced_class);
             return 1;
         }
+#if defined(STRATA_DFLASH2_CAPTURE)
+        if (!o.dflash2.empty() && requested_slots)
+            resident.checkpoints = byte_add(resident.checkpoints, byte_mul(dflash_allocation.snapshot_host,
+                byte_mul(uint64_t(requested_slots), uint64_t(std::max(o.prompt_cache, 1)))));
+#endif
         if (requested_slots)
             admitted_checkpoint_bytes = resident.checkpoints / (uint64_t) requested_slots /
                                         (uint64_t) std::max(o.prompt_cache, 1);
@@ -5359,8 +5467,10 @@ int main(int argc, char** argv) {
                        "opaque CUDA/cuBLAS handle and first-use storage is separate from explicit prefill allocator bytes and remains unqualified");
         }
         const char* batch = std::getenv("STRATA_BATCH_MTP");
-        const bool grouped_draft = o.batch_mtp || (batch && batch[0] && batch[0] != '0');
-        const int grouped_rows = o.batch_mtp_pipeline ? std::max(o.spec, std::min(o.batch, 4)) : strata::kernels::kVerifyMaxT;
+        const bool grouped_draft = !o.dflash2.empty() || o.batch_mtp ||
+            (batch && batch[0] && batch[0] != '0');
+        const int grouped_rows = !o.dflash2.empty() ? strata::kernels::kVerifyMaxT :
+            o.batch_mtp_pipeline ? std::max(o.spec, std::min(o.batch, 4)) : strata::kernels::kVerifyMaxT;
         if (o.spec > 0) {
             const uint64_t windows = grouped_draft
                 ? strata::core::Verifier::planned_device_bytes(g, o.max_context, n_vocab, grouped_rows)
@@ -5588,6 +5698,35 @@ int main(int argc, char** argv) {
                                 "serving sampler history on head device");
             }
         }
+#if defined(STRATA_DFLASH2_CAPTURE)
+        if (!o.dflash2.empty()) {
+            const uint64_t owners = uint64_t(requested_slots) + 1;
+            for (size_t stage = 0; stage <= split_devs.size(); ++stage) {
+                const int id = stage ? split_devs[stage - 1] : primary_device;
+                const std::string name = "CUDA" + std::to_string(id);
+                const auto found = std::find_if(devs.begin(), devs.end(),
+                    [&](const auto& device) { return device.name == name; });
+                if (found == devs.end()) {
+                    std::fprintf(stderr, "strata dflash2: missing resolved device admission scope\n"); return 2;
+                }
+                if (id == dflash_device) {
+                    found->vram.add("dflash2_weights_and_scratch", dflash_allocation.shared_device,
+                        "strict converted dense bytes, five-layer scratch, selector and borrowed native-head scratch");
+                    found->vram.add("dflash2_owner_contexts", byte_mul(owners, dflash_allocation.owner_device),
+                        "one real five-layer 2047-row KV context per allocated working/resident owner");
+                    found->vram.add("dflash2_verifier_q", byte_mul(
+                        1 + uint64_t(o.batch_mtp_pipeline) + uint64_t(o.batch_mtp_third),
+                        strata::core::Verifier::planned_spec_q_bytes()),
+                        "independent conditional-q/proposed-token transport per physical head verifier");
+                }
+                const auto transfer = strata::core::dflash2::DflashNativeDrafter::planned_target_allocation(
+                    id, dflash_device, primary_device, dflash_device, dflash_head_scratch);
+                if (transfer.shared_device)
+                    found->vram.add("dflash2_native_target_transfer", transfer.shared_device,
+                        "actual cross-device embedding/head buffers, no second target allocation");
+            }
+        }
+#endif
 
         // Dedicated resident expert owners use the same resolved device IDs as open().
         // A helper never shares CUDA0, a stage device or another helper's allocation.
@@ -5780,6 +5919,11 @@ int main(int argc, char** argv) {
             }
             v0.add("expert_cache", admitted_cache_bytes,
                    "auto: floor((min(driver total, free) - fixed classes - headroom)/max_blob) slots");
+            std::fprintf(stderr, "strata generate: primary expert cache admission: budget %llu B "
+                                 "(ceiling %llu B, fixed %llu B, headroom %llu B, blob_gate %llu B)\n",
+                         (unsigned long long) admitted_cache_bytes, (unsigned long long) ceiling,
+                         (unsigned long long) fixed, (unsigned long long) d0.headroom_bytes,
+                         (unsigned long long) blob_gate);
         }
         if (o.dflash2_capture) {
             // The observer may refuse admission; it may NEVER buy its buffers by
@@ -5798,7 +5942,13 @@ int main(int argc, char** argv) {
                     [&](const auto& row) { return row.name == name; });
                 if (!layout.native || cache == demand.classes.end() || cache->bytes < full) {
                     std::fprintf(stderr, "strata dflash2 capture: BLOCKED full expert residency does not fit "
-                        "on stage %zu; no spill or placement fallback\n", st); return 1;
+                        "on stage %zu; no spill or placement fallback (full %llu B, admitted cache %llu B)\n", st,
+                        (unsigned long long) full,
+                        (unsigned long long) (cache == demand.classes.end() ? 0 : cache->bytes));
+                    for (const auto& row : demand.classes)
+                        std::fprintf(stderr, "strata dflash2 residency: stage %zu class %s bytes %llu\n", st,
+                                     std::string(row.name).c_str(), (unsigned long long) row.bytes);
+                    return 1;
                 }
             }
         }
@@ -5856,12 +6006,28 @@ int main(int argc, char** argv) {
             ram("dflash2_raw_prefill", capture_allocation.prefill,
                 "five stage-owned FP32 four-stream 2047-row tap buffers; not BF16 features");
             ram("dflash2_raw_verify", capture_allocation.verify,
-                "five stage-owned FP32 four-stream four-row tap buffers");
+                "five stage-owned FP32 four-stream bounded verifier-row tap buffers");
             ram("dflash2_replay_flags", capture_allocation.flags,
-                "two mapped replay words per stage, each page-rounded");
-            ram("dflash2_committed_features", strata::core::dflash2::CaptureStore::planned_bytes() +
-                sizeof(strata::core::dflash2::CaptureProducer) + 4096,
-                "2047 committed + 2047 tentative BF16 rows at 25600 B/row, generation tags and fixed producer metadata");
+                "one page-rounded replay flag per prefill/physical-verifier stage owner");
+            if (o.dflash2.empty())
+                ram("dflash2_committed_features", strata::core::dflash2::CaptureStore::planned_bytes() +
+                    sizeof(strata::core::dflash2::CaptureProducer) + 4096,
+                    "capture-only committed/tentative BF16 rings, generation tags and fixed producer metadata");
+#if defined(STRATA_DFLASH2_CAPTURE)
+            else {
+                ram("dflash2_mapped_weights", dflash_dense_bytes,
+                    "sole immutable read-only dense file map used for native upload", ByteMeaning::clean_file);
+                ram("dflash2_shared_host", byte_add(dflash_allocation.shared_host,
+                    byte_add(dflash_allocation.transfer_host, dflash_allocation.snapshot_host)),
+                    "shared tentative features, selector/canary staging, snapshot transfer and one working image");
+                ram("dflash2_owner_features", byte_mul(uint64_t(requested_slots) + 1, dflash_allocation.owner_host),
+                    "per-owner committed feature rings, generation tags and capture metadata");
+                if (dflash_capture_dir)
+                    ram("dflash2_proposal_observer",
+                        strata::program::dflash2_parity::ProposalBundleWriter::planned_host_bytes(),
+                        "optional real-input proposal bundle writer; never enabled on speed arms");
+            }
+#endif
         }
         ram("session_host_pinned", session_host_pinned,
             "SessionAllocationBytes QSA mapped staging and streamed KV; explicit split sums actual layer ranges");
@@ -6191,7 +6357,8 @@ int main(int argc, char** argv) {
             ram("prefix_cost_model", sizeof(strata::program::PrefixCosts),
                 "bounded process-local prefix transfer and context/prefill observations");
         const char* grouped_env = std::getenv("STRATA_BATCH_MTP");
-        const bool grouped_requested = o.batch_mtp || (grouped_env && grouped_env[0] && grouped_env[0] != '0');
+        const bool grouped_requested = (!o.dflash2.empty() && o.batch > 0) || o.batch_mtp ||
+            (grouped_env && grouped_env[0] && grouped_env[0] != '0');
         // Eight rows of mapped inputs, misses and the two expert-plan halves; retain the existing
         // conservative runtime envelope as the minimum instead of claiming it is an exact arena.
         const uint64_t grouped_host = byte_add(byte_mul(8, byte_add(byte_mul((uint64_t) g.n_embd, 4 * (12 + 2)),
@@ -6207,6 +6374,22 @@ int main(int argc, char** argv) {
                 byte_add(resident.verifier_pinned, byte_add(resident.verifier_history,
                     byte_add(strata::core::kVerifyCanaryHostBytes, 262144))))),
                 "second owner per stage: conservative mapped/runtime staging envelope, slot controls/history and canary/diagnostic staging");
+#if defined(STRATA_DFLASH2_CAPTURE)
+        if (!o.dflash2.empty()) {
+            if (o.batch_mtp_pipeline)
+                ram("dflash2_decode_handoff_extra", byte_mul(stage_count - 1,
+                    byte_mul(8, byte_mul(uint64_t(strata::core::Verifier::handoff_floats(g)), sizeof(float)))),
+                    "eight extra actual mapped handoff rows per physical stage boundary; two disjoint eight-row frames");
+            ram("dflash2_serving_frames", byte_add(
+                byte_mul(5, sizeof(strata::program::dflash2_serving::CaptureFrame)),
+                byte_mul(3, strata::kernels::kVerifyMaxT * (1 + strata::core::kSpecQStride) * sizeof(int32_t))),
+                "five bounded pending-capture frames and three stable packed-q transports; no per-window allocation");
+            ram("dflash2_batch_graph_metadata", byte_mul(stage_count,
+                byte_mul(1 + uint64_t(o.batch_mtp_pipeline),
+                    strata::core::kDflash2BatchGraphHostBytes)),
+                "prospective 1088-key graphmap bookkeeping accounting allowance per physical native verifier/stage; opaque CUDA allowances unchanged");
+        }
+#endif
         if (o.batch_mtp_third)
             ram("batch_mtp_third_host", byte_mul(stage_count,
                 byte_add(std::max(grouped_host, (uint64_t) kWindowMib << 20),
@@ -6498,9 +6681,11 @@ int main(int argc, char** argv) {
     }
 #if defined(STRATA_DFLASH2_CAPTURE)
     // Owned BF16 storage is allocated once after admission and BEFORE expert sizing.
-    std::unique_ptr<strata::core::dflash2::CaptureProducer> feature_capture;
-    if (o.dflash2_capture) {
-        feature_capture = std::make_unique<strata::core::dflash2::CaptureProducer>();
+    std::unique_ptr<strata::core::dflash2::CaptureProducer> scalar_capture;
+    strata::core::dflash2::CaptureProducer* feature_capture = nullptr;
+    if (o.dflash2_capture && o.dflash2.empty()) {
+        scalar_capture = std::make_unique<strata::core::dflash2::CaptureProducer>();
+        feature_capture = scalar_capture.get();
         std::fprintf(stderr, "DFLASH2_ALLOCATION feature_row_bytes=%zu committed_payload_bytes=%zu "
             "store_bytes=%zu raw_prefill_planned_bytes=%zu raw_verify_planned_bytes=%zu replay_flag_planned_bytes=%zu\n",
             strata::core::dflash2::feature_row_bytes, strata::core::dflash2::max_feature_bytes,
@@ -6532,7 +6717,7 @@ int main(int argc, char** argv) {
     if (native_pack) {
         const auto embed_t0 = std::chrono::steady_clock::now();
         if (!native_embed.load(o.embd_gguf.empty() ? o.native_shards : std::vector<std::string>{o.embd_gguf}, g.n_embd,
-                               g.n_vocab, err)) {
+                               g.n_vocab, err, !o.dflash2.empty())) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -7949,7 +8134,8 @@ int main(int argc, char** argv) {
         const bool last = i + 1 == stages.size();
         const strata::core::WeightRef* wo_s = st.wt.find("output.weight");
         if (wo_s == nullptr ||
-            (last && !o.native_head_gguf.empty() && !st.head.load(o.native_head_shards, g.n_embd, wo_s->ne1, err))) {
+            (last && !o.native_head_gguf.empty() &&
+             !st.head.load(o.native_head_shards, g.n_embd, wo_s->ne1, err, !o.dflash2.empty()))) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d head: %s%s\n", st.dev,
                          wo_s == nullptr ? "output.weight is missing" : err.c_str(),
                          wo_s == nullptr ? "" : vram_free_note().c_str());
@@ -7986,19 +8172,23 @@ int main(int argc, char** argv) {
         bin.later_stages = (int) stages.size();
         bin.batch_mtp = mtp_on;
         bin.adapt_async = o.adapt_async != 0;
-        { const char* ms = std::getenv("STRATA_BATCH_MTP_SERIAL"); bin.mtp_serial = ms != nullptr && ms[0] != '\0' && ms[0] != '0'; }
+        { const char* ms = std::getenv("STRATA_BATCH_MTP_SERIAL");
+          bin.mtp_serial = (!o.dflash2.empty() && !o.batch_mtp_pipeline) ||
+              (ms != nullptr && ms[0] != '\0' && ms[0] != '0'); }
         return bin;
     };
     auto batch_groups_for = [&](bool mtp_on) {
         return strata::program::batch_groups::resolve(batch_group_input(mtp_on));
     };
     const char* batch_mtp_env = std::getenv("STRATA_BATCH_MTP");
-    bool batch_mtp = o.batch_mtp || (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
+    bool batch_mtp = (!o.dflash2.empty() && o.batch > 0) || o.batch_mtp ||
+        (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
     const bool split_batch_mtp = batch_mtp && !stages.empty();
     const bool batch_mtp_pipeline = split_batch_mtp && o.batch_mtp_pipeline;
     if (batch_mtp) {
         // (--pipeline-windows is already off with --batch slots)
-        const char* why = o.batch < (private_preparation ? 1 : 2) ? "it needs --batch 2 or more" : o.mtp.empty() ? "it needs --mtp"
+        const char* why = o.batch < (private_preparation || !o.dflash2.empty() ? 1 : 2) ? "it needs resident slots"
+                        : o.mtp.empty() && o.dflash2.empty() ? "it needs a neural drafter"
                         : o.spec < 2 ? "it needs --spec T (T >= 2)" : split_same
                         ? "it needs each layer-split stage on its own GPU" : !o.serve ? "it needs --serve" : nullptr;
         // Multiple resolved groups refuse synchronous MTP rather than silently dropping the feature.
@@ -8020,7 +8210,7 @@ int main(int argc, char** argv) {
         }
     }
     const bool synchronous_batch_mtp = split_batch_mtp && !batch_mtp_pipeline;
-    const int min_batch_slots = private_preparation ? 1 : 2;
+    const int min_batch_slots = private_preparation || !o.dflash2.empty() ? 1 : 2;
     // The most slots, up to n, whose windows hold at most kVerifyMaxT rows each: n itself up to that, more only as
     // pipelined groups on a layer split - the groups as resolved below (a number given, auto, or the default's one
     // group for --adapt-async 1), dividing the slots, each at most kVerifyMaxT, all at most one group's worth per
@@ -8101,7 +8291,7 @@ int main(int argc, char** argv) {
             for (int b = 0; b < fit; ++b) {
                 auto u = std::make_unique<strata::core::SessionOwner>();
                 if (!u->init(g, o.max_context, K, err, lo, hi, &kv_roles.slot_main)) {
-                    if (o.slot_kv_window || kv_roles.slot_main.kv.mode != 0) {
+                    if (o.slot_kv_window || kv_roles.slot_main.kv.mode != 0 || !o.dflash2.empty()) {
                         std::fprintf(stderr, "strata generate: --batch slot placement cannot be honoured for slot %d "
                                              "on CUDA%d: %s\n", b, dev, err.c_str());
                         return 1; // no silent shrink or fallback for explicit or streamed slot intent
@@ -8158,6 +8348,10 @@ int main(int argc, char** argv) {
         o.batch_groups = resolved_groups.groups;
     }
     strata::program::resolve_batch_fit(execution_plan, o.batch, (int) stages.size(), resolved_groups);
+    if (execution_plan.refused) {
+        strata::program::report_execution_plan(stderr, execution_plan);
+        return 1;
+    }
     const auto group_fallback = strata::program::batch_groups::fallback_message(resolved_groups, o.batch);
     if (!group_fallback.empty())
         std::fprintf(stderr, "strata generate: WARNING: %s\n", group_fallback.c_str());
@@ -8223,7 +8417,7 @@ int main(int argc, char** argv) {
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
-        if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
+        if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err, !o.dflash2.empty())) {
             std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str());
             return 1;
         }
@@ -8231,6 +8425,60 @@ int main(int argc, char** argv) {
                      (unsigned long long) native_head.weight_bytes(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
+    strata::core::NeuralDrafter* neural = &mtp;
+#if defined(STRATA_DFLASH2_CAPTURE)
+    std::unique_ptr<strata::core::dflash2::RuntimeWeights> dflash_weights;
+    std::unique_ptr<strata::program::dflash2_parity::ProposalBundleWriter> dflash_observer;
+    std::unique_ptr<strata::core::dflash2::DflashNativeDrafter> dflash;
+    if (!o.dflash2.empty()) {
+        try {
+            const auto& target_head = last_st ? last_st->head : native_head;
+            auto target = strata::core::dflash2::VerifiedDailyTarget::identify(
+                o.pack, o.dflash2_tokenizer, {o.native_shards[0], o.native_shards[1]}, g,
+                native_embed.identity(), target_head.identity());
+            dflash_weights = std::make_unique<strata::core::dflash2::RuntimeWeights>(
+                o.dflash2, o.dflash2_manifest_sha256, target.binding().identity);
+            if (dflash_weights->dense().size_bytes() != dflash_dense_bytes)
+                throw strata::core::dflash2::Refusal("runtime extent changed after admission");
+            if (dflash_capture_dir)
+                dflash_observer = std::make_unique<strata::program::dflash2_parity::ProposalBundleWriter>(
+                    dflash_capture_dir, target.binding().identity, o.dflash2_manifest_sha256);
+            if (dflash_observer) {
+                const size_t actual = dflash_observer->allocated_host_bytes();
+                const size_t planned = strata::program::dflash2_parity::ProposalBundleWriter::planned_host_bytes();
+                if (actual != planned) throw strata::core::dflash2::Refusal("proposal observer extent differs from admission");
+                std::fprintf(stderr, "DFLASH2_PARITY_ALLOCATION planned_host_bytes=%zu allocated_host_bytes=%zu\n",
+                    planned, actual);
+            }
+            dflash = std::make_unique<strata::core::dflash2::DflashNativeDrafter>(
+                *dflash_weights, std::move(target), native_embed, target_head, target_head.device());
+            if (dflash_observer)
+                dflash->set_proposal_observer(
+                    &strata::program::dflash2_parity::ProposalBundleWriter::observe, dflash_observer.get());
+            dflash->set_batch_drafting(batch_mtp);
+            dflash->set_prompt_len(int64_t(o.tokens.size()));
+            if (o.batch > 0) {
+                std::vector<strata::core::SessionState*> owners;
+                for (auto& state : bslot_ss.back()) owners.push_back(&state->state());
+                if (!dflash->init_slots(owners, err)) throw strata::core::dflash2::Refusal(err);
+            }
+            neural = dflash.get();
+            feature_capture = &dflash->capture_producer();
+            const auto allocation = dflash->allocation_plan();
+            std::fprintf(stderr, "DFLASH2_NATIVE_ALLOCATION device=%d shared_device=%llu owner_device=%llu "
+                "owners=%d shared_host=%llu owner_host=%llu transfer_host=%llu snapshot_host=%llu\n",
+                allocation.device, (unsigned long long) allocation.shared_device,
+                (unsigned long long) allocation.owner_device, o.batch + 1,
+                (unsigned long long) allocation.shared_host, (unsigned long long) allocation.owner_host,
+                (unsigned long long) allocation.transfer_host, (unsigned long long) allocation.snapshot_host);
+        } catch (const std::exception& failure) {
+            std::fprintf(stderr, "strata dflash2: native initialization refused: %s\n", failure.what());
+            return 1;
+        }
+    }
+#endif
+    const bool use_neural = neural->enabled();
+    const bool use_dflash = !o.dflash2.empty();
     std::vector<float> logits((size_t) n_vocab);
     mem_mark("the native head");
     float* d_logits = nullptr;
@@ -9531,13 +9779,20 @@ int main(int argc, char** argv) {
                      st.dev, (long long) st.lb, (long long) (st.le - 1), (long long) st.cache.slots(), st.cache.gib(),
                      (long long) filled, st.profile.size());
     }
-    if (o.dflash2_capture) {
+    if (o.dflash2_capture || std::getenv("STRATA_STATE_HASH")) {
+        uint64_t populated = 0;
+        const uint64_t expected = uint64_t(g.n_layers) * uint64_t(g.n_expert);
         for (int64_t l = 0; l < g.n_layers; ++l) for (int64_t e = 0; e < g.n_expert; ++e) {
             const int st = multi_gpu ? stage_of(l) : 0;
             const auto& cache = st ? stages[size_t(st - 1)]->cache : xcache;
-            if (cache.slot_of(l, e) < 0) {
-                std::fprintf(stderr, "strata dflash2 capture: BLOCKED incomplete concrete expert residency\n"); return 1;
-            }
+            const int slot = cache.slot_of(l, e);
+            populated += slot >= 0 && cache.device_slot(slot) != nullptr;
+        }
+        if (!o.dflash2.empty() || std::getenv("STRATA_STATE_HASH"))
+            std::fprintf(stderr, "DFLASH2_RESIDENCY populated_pairs=%llu expected_pairs=%llu all_resident=%d\n",
+                (unsigned long long)populated, (unsigned long long)expected, int(populated == expected));
+        if (o.dflash2_capture && populated != expected) {
+            std::fprintf(stderr, "strata dflash2 capture: BLOCKED incomplete concrete expert residency\n"); return 1;
         }
     }
     if (multi_gpu)
@@ -11907,7 +12162,13 @@ int main(int argc, char** argv) {
         }
         auto stage_third = [&](int st) -> strata::core::Verifier& { return *third_verifiers[(size_t)st]; };
         auto stage_peer = [&](int st) -> strata::core::Verifier& { return st == 0 ? ver_b : stages[(size_t) st - 1]->ver_b; };
-        const int batch_compute_rows = batch_mtp && !batch_mtp_pipeline ? strata::kernels::kVerifyMaxT
+        if (use_dflash)
+            for (int stage = 0; stage < n_stages; ++stage)
+                if ((batch_mtp_pipeline && !stage_peer(stage).enable_dflash2_capture(err)) ||
+                    (o.batch_mtp_third && !stage_third(stage).enable_dflash2_capture(err))) {
+                    std::fprintf(stderr, "strata dflash2: %s\n", err.c_str()); return 1;
+                }
+        const int batch_compute_rows = use_dflash || (batch_mtp && !batch_mtp_pipeline) ? strata::kernels::kVerifyMaxT
                                      : batch_mtp_pipeline ? std::max(o.spec, std::min(o.batch, 4))
                                      : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT));
         SplitDrive split_drive_b;
@@ -11934,8 +12195,9 @@ int main(int argc, char** argv) {
         if (n_stages > 1) {
             // pipelined slot groups write their rows at hbase = group * rows-per-group, so with more than
             // kVerifyMaxT slots in groups the hand-off holds one row per slot (otherwise kVerifyMaxT, as before)
-            const int hrows = !batch_mtp && o.batch_groups > 1 ? std::max<int>(strata::kernels::kVerifyMaxT, o.batch)
-                                                               : strata::kernels::kVerifyMaxT;
+            const int hrows = use_dflash && batch_mtp_pipeline ? 16 :
+                !batch_mtp && o.batch_groups > 1 ? std::max<int>(strata::kernels::kVerifyMaxT, o.batch)
+                                               : strata::kernels::kVerifyMaxT;
             const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand((size_t) n_stages - 1, nullptr);
             for (float*& h : hand) {
@@ -11982,7 +12244,11 @@ int main(int argc, char** argv) {
                     stage_third(st).set_stage(st == 0 ? 0 : split_at[(size_t)st - 1],
                         st + 1 < n_stages ? split_at[(size_t)st] : -1,
                         st == 0 ? nullptr : hand[(size_t)st - 1], st + 1 < n_stages ? hand[(size_t)st] : nullptr);
-                if (hrows > strata::kernels::kVerifyMaxT) stage_ver(st).set_handoff_rows(hrows);
+                if (hrows > strata::kernels::kVerifyMaxT) {
+                    stage_ver(st).set_handoff_rows(hrows);
+                    if (batch_mtp_pipeline) stage_peer(st).set_handoff_rows(hrows);
+                    if (o.batch_mtp_third) stage_third(st).set_handoff_rows(hrows);
+                }
                 if (overlap)
                     stage_ver(st).set_handoff_flags(st == 0 ? nullptr : hflag_h[(size_t) st - 1],
                                                     st == 0 ? nullptr : hflag_d[(size_t) st - 1],
@@ -12008,12 +12274,14 @@ int main(int argc, char** argv) {
                     vs.slot_off = gs.cache.slot_offsets();
                     vs.n_slots = gs.cache.slots();
                     gs.ver.set_remote_expert_opt(remote_opt.get());
-                    if (batch_mtp) gs.ver.set_batch_graph_limit(strata::core::kVerifyBatchGraphKeys);
+                    if (batch_mtp) gs.ver.set_batch_graph_limit(use_dflash ?
+                        strata::core::kDflash2BatchGraphKeys : strata::core::kVerifyBatchGraphKeys);
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
                                        batch_compute_rows, err);
                     if (ok_s && batch_mtp_pipeline) {
                         gs.ver_b.set_remote_expert_opt(remote_opt.get());
-                        gs.ver_b.set_batch_graph_limit(strata::core::kVerifyBatchGraphKeys);
+                        gs.ver_b.set_batch_graph_limit(use_dflash ?
+                            strata::core::kDflash2BatchGraphKeys : strata::core::kVerifyBatchGraphKeys);
                         ok_s = gs.ver_b.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
                                             batch_compute_rows, err);
                     }
@@ -12104,7 +12372,8 @@ int main(int argc, char** argv) {
         }
         if (batch_mtp_pipeline) {
             ver_b.set_remote_expert_opt(remote_opt.get());
-            ver_b.set_batch_graph_limit(strata::core::kVerifyBatchGraphKeys);
+            ver_b.set_batch_graph_limit(use_dflash ?
+                strata::core::kDflash2BatchGraphKeys : strata::core::kVerifyBatchGraphKeys);
             if (!ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, batch_compute_rows, err)) {
                 std::fprintf(stderr, "strata serve: --batch-mtp-pipeline: second primary verifier: %s\n", err.c_str());
                 return 1;
@@ -12119,7 +12388,8 @@ int main(int argc, char** argv) {
         }
         ver.set_remote_expert_opt(remote_opt.get());
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
-        if (batch_mtp) ver.set_batch_graph_limit(strata::core::kVerifyBatchGraphKeys);
+        if (batch_mtp) ver.set_batch_graph_limit(use_dflash ?
+            strata::core::kDflash2BatchGraphKeys : strata::core::kVerifyBatchGraphKeys);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
                       batch_compute_rows, err) ||
             (use_mtp && !prefill_head_alias_bound &&
@@ -12134,8 +12404,34 @@ int main(int argc, char** argv) {
         auto capture_prompt_stage = [&](int st) -> strata::prefill::Prefill& {
             return st ? stages[size_t(st - 1)]->sp : sp;
         };
+        std::array<strata::core::Verifier*, 4> capture_verifiers{};
+        std::array<strata::prefill::Prefill*, 4> capture_prompts{};
+        std::array<int, 5> capture_tap_stages{};
+        const int capture_stages = dflash ? (multi_gpu ? n_stages : 1) : 0;
+        if (capture_stages > int(capture_verifiers.size())) {
+            std::fprintf(stderr, "strata dflash2: at most four physical target stages are supported\n"); return 1;
+        }
+        for (int st = 0; st < capture_stages; ++st) {
+            capture_verifiers[size_t(st)] = &stage_ver(st);
+            capture_prompts[size_t(st)] = &capture_prompt_stage(st);
+            if (use_dflash && (!stage_ver(st).reserve_spec_q(err) ||
+                (batch_mtp_pipeline && !stage_peer(st).reserve_spec_q(err)) ||
+                (o.batch_mtp_third && !stage_third(st).reserve_spec_q(err)))) {
+                std::fprintf(stderr, "strata dflash2: %s\n", err.c_str()); return 1;
+            }
+        }
+        for (size_t tap = 0; tap < capture_tap_stages.size(); ++tap)
+            capture_tap_stages[tap] = multi_gpu ? stage_of(strata::core::dflash2::tap_layers[tap]) : 0;
+        strata::program::dflash2_serving::CaptureFrame serial_capture_frame;
+        auto bind_capture_frame = [&](strata::program::dflash2_serving::CaptureFrame& frame,
+                                      const std::array<strata::core::Verifier*, 4>& owners) {
+            frame.bind(dflash.get(), {owners.data(), size_t(capture_stages)},
+                {capture_prompts.data(), size_t(capture_stages)}, capture_tap_stages);
+        };
+        bind_capture_frame(serial_capture_frame, capture_verifiers);
         auto capture_begin = [&](strata::core::dflash2::CapturePhase kind, int64_t start, int64_t count,
                                  std::string& e) -> bool {
+            if (dflash) return serial_capture_frame.begin(kind, 8, start, count, e);
             if (!feature_capture) return true;
             if (!feature_capture->begin(kind, start, count, e)) return false;
             const auto owner = feature_capture->owner();
@@ -12149,6 +12445,7 @@ int main(int argc, char** argv) {
             return true;
         };
         auto capture_finish = [&](strata::core::dflash2::CapturePhase kind, std::string& e) -> bool {
+            if (dflash) return serial_capture_frame.finish(e);
             if (!feature_capture) return true;
             // commit() propagates its actual keep to every stage. This recursive
             // wait must drain ALL of them before a single borrowed payload is read.
@@ -12200,6 +12497,76 @@ int main(int argc, char** argv) {
             return true;
         };
 #endif
+        const int neural_snapshot_stage = mtp_first ? 0 : n_stages - 1;
+        auto clear_draft_view = [](strata::core::ConversationView& view) {
+            view.draft_tokens = view.draft_begin = view.draft_origin = -1;
+            view.draft_next_token = -1; view.draft_owner = 0; view.draft_identity = {};
+            view.draft_boundary_residual = nullptr; view.draft_boundary_position = -1; view.draft_boundary_owner = 0;
+        };
+        auto snapshot_validate = [&](const strata::core::SavedConversation& image,
+                const strata::core::SessionState& state, int stage, std::string& why,
+                strata::core::ConversationSnapshotExpectation expectation =
+                    strata::core::ConversationSnapshotExpectation::ordinary, int slot = 8) {
+            return use_neural && stage == neural_snapshot_stage
+                ? strata::core::conversation_neural_validate(image, state, g, *neural, slot, expectation, why)
+                : strata::core::conversation_snapshot_validate(image, state, g, nullptr, expectation, why);
+        };
+        auto snapshot_save = [&](strata::core::SavedConversation& image, strata::core::ConversationView view,
+                const strata::core::SessionState& state, int stage, int slot, std::string& why,
+                strata::core::ConversationKvReuse reuse, size_t* reused,
+                std::vector<strata::core::ConversationRetainedPrefix>* retained,
+                const strata::core::DraftOwner* source_owner = nullptr) {
+            if (use_neural && stage == neural_snapshot_stage) {
+                const auto expected = source_owner ? *source_owner : neural->owner(slot);
+                return strata::core::conversation_neural_save(image, view, state, g, *neural, slot, why,
+                    std::move(reuse), reused, retained, &expected);
+            }
+            clear_draft_view(view);
+            return strata::core::conversation_snapshot_save(image, view, state, g, nullptr, why,
+                std::move(reuse), reused, retained);
+        };
+        auto snapshot_bytes = [&](strata::core::ConversationView view,
+                const strata::core::SessionState& state, int stage, int slot, size_t& bytes, std::string& why,
+                const strata::core::ConversationKvReuse* reuse = nullptr) {
+            const bool owns = use_neural && stage == neural_snapshot_stage;
+            if (owns) neural->certify_view(view, slot);
+            if (!owns || use_dflash) clear_draft_view(view);
+            const auto* legacy = owns && !use_dflash ? neural->legacy_state(slot) : nullptr;
+            const bool okay = reuse && !(owns && use_dflash)
+                ? strata::core::conversation_snapshot_capture_bytes(*reuse, view, state, g, legacy, bytes, why)
+                : strata::core::conversation_snapshot_bytes(view, state, g, legacy, bytes, why);
+            if (!okay) return false;
+            if (owns && use_dflash) {
+                const uint64_t extra = neural->allocation_plan().snapshot_host;
+                if (extra > SIZE_MAX - bytes) { why = "native snapshot byte extent overflow"; return false; }
+                bytes += size_t(extra);
+            }
+            return true;
+        };
+        auto snapshot_restore = [&](const strata::core::SavedConversation& image,
+                strata::core::SessionState& state, int stage, int64_t prompt_length, int32_t next,
+                strata::core::ConversationSnapshotExpectation expectation, std::string& why,
+                const strata::core::ConversationCheckpoint* selected = nullptr,
+                const strata::core::DraftOwner* expected_owner = nullptr) {
+            if (use_neural && expected_owner && !neural->owns(*expected_owner)) {
+                why = "stale neural restore owner before target writes"; return strata::core::ConversationRestore::invalid;
+            }
+            if (use_neural && stage == neural_snapshot_stage) {
+                const auto expected = expected_owner ? *expected_owner : neural->owner(8);
+                return strata::core::conversation_neural_restore(image, state, g, *neural, 8,
+                    prompt_length, next, expectation, why, selected, &expected);
+            }
+            return strata::core::conversation_snapshot_restore(image, state, g, nullptr, expectation, why, selected);
+        };
+        auto fingerprint_neural = [&](const strata::core::SessionState& state, int slot, int64_t cells,
+                strata::program::SessionFingerprint& hash, std::string& why, const float* residual = nullptr) {
+            const strata::core::QsaState empty{};
+            const auto* legacy = use_neural ? neural->legacy_state(slot) : nullptr;
+            if (!strata::program::session_fingerprint(state, legacy ? *legacy : empty, g, cells, hash, why, residual))
+                return false;
+            return !use_dflash || !neural->slot_coverage(slot).present ||
+                neural->state_fingerprint(slot, cells, hash.draft, why);
+        };
         // The existing primary-only fingerprint cannot certify a split observer.
         // Keep this bounded diagnostic off the ordinary serving path, and hash
         // authoritative target cells on every owning device after full drain.
@@ -12208,7 +12575,9 @@ int main(int argc, char** argv) {
             if (!std::getenv("STRATA_STATE_HASH")) return true;
             if (!ver.wait_commit(e)) return false;
             const strata::core::QsaState no_draft{};
-            for (int st = 0; st < n_stages; ++st) {
+            // A same-device verifier split still has one full-model prefill owner.
+            const int owners = residual_row < 0 && split_same ? 1 : n_stages;
+            for (int st = 0; st < owners; ++st) {
                 const auto& state = st == 0 || split_same ? ss : stages[size_t(st - 1)]->ss;
                 strata::program::SessionFingerprint h;
                 if (!strata::program::session_fingerprint(state, no_draft, g, cells, h, e)) return false;
@@ -12374,7 +12743,7 @@ int main(int argc, char** argv) {
                                  "reason=fixed resident checkpoint lease unavailable\n");
             return 1;
         }
-        strata::program::ResidentSlots resident(g, std::move(resident_stages), mtp, sp, drive.d,
+        strata::program::ResidentSlots resident(g, std::move(resident_stages), *neural, sp, drive.d,
                                                o.max_context, o.prompt_cache > 0, std::max(o.prompt_cache, 1),
                                                admitted_checkpoint_bytes);
         std::array<strata::program::ResidentExecutor, 4> resident_executors{
@@ -12439,6 +12808,10 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "host resident fixture requires three stages, four slots and two owners\n");
                 return 1;
             }
+#if defined(STRATA_DFLASH2_CAPTURE)
+            if (dflash)
+                return resident_native_model_checks(resident, drive.d, g, test_resident_stages, *dflash);
+#endif
             return resident_host_model_checks(resident, drive.d, g, test_resident_stages, mtp);
         }
         if (stages.size() || bslot_ss.size() != 1 || bslot_ss[0].size() != 2 ||
@@ -12608,8 +12981,8 @@ int main(int argc, char** argv) {
                     mtp.invalidate_coverage(); err = "pipeline: verifier drain failed"; return false;
                 }
             }
-            const strata::core::OnDevice on(mtp.device());
-            if (!mtp.idle(e2)) { err = e2; return false; }
+            const strata::core::OnDevice on(use_neural ? neural->device() : -1);
+            if (!neural->idle(e2)) { err = e2; return false; }
             return true;
         };
         std::vector<int64_t> cur;
@@ -12641,6 +13014,7 @@ int main(int argc, char** argv) {
         // Only certification fields cross the next request's bind-to-park seam.
         // The drafter still owns any immutable boundary row until parking finishes.
         std::optional<strata::core::ConversationView> displaced_draft;
+        std::optional<strata::core::DraftOwner> displaced_owner;
         // ---- the persistent conversation store (private, CPU-only) -------------
         // One coordinator owns the cache root, its catalog, its quota and its storage threads; it is the sole disk
         // authority and never touches GPU state.  It extends the sources above instead of competing with them: the
@@ -12805,11 +13179,15 @@ int main(int argc, char** argv) {
                 };
                 add_state(ss, 0);
                 for (size_t k = 0; k < stages.size(); ++k) add_state(stages[k]->ss, (uint64_t) k + 1);
-                fields.u64(use_mtp ? 1 : 0);
+                fields.u64(uint64_t(neural->kind()));
                 if (use_mtp) {
                     fields.i64(mtp.device());
                     add_qsa(mtp.kv_state(), false);
                     fields.i64(mtp.max_t());
+                }
+                if (use_dflash) {
+                    fields.i64(neural->device()); fields.i64(neural->window());
+                    for (int64_t dimension : neural->identity().geometry) fields.i64(dimension);
                 }
                 fields.i64(o.max_context);
                 fields.i64(o.kv_resident);
@@ -12971,6 +13349,13 @@ int main(int argc, char** argv) {
                                 reinterpret_cast<const uint8_t*>(mtp.draft_vocab_ids()),
                                 (size_t) draft_vocab * sizeof(int32_t))));
                 }
+                if (use_neural) {
+                    bind_number("draft.kind", int64_t(neural->kind()));
+                    bind_number("draft.format", neural->identity().format);
+                    arithmetic.push_back(strata::core::arithmetic_digest("draft.weights", neural->identity().weights));
+                    arithmetic.push_back(strata::core::arithmetic_digest("draft.configuration", neural->identity().configuration));
+                    arithmetic.push_back(strata::core::arithmetic_digest("draft.borrowed_target", neural->identity().borrowed_target));
+                }
                 if (std::getenv("STRATA_STORE_TIMING")) {
                     // One line per resolved component so a cross-process domain difference names itself.
                     for (const auto& value : arithmetic) {
@@ -13011,7 +13396,7 @@ int main(int argc, char** argv) {
             limits.max_state_bytes = options.read_budget_bytes;
             limits.max_stages = (uint32_t) stages.size() + 1;
             limits.max_checkpoints = (uint32_t) std::max(o.prompt_cache, 1);
-            limits.max_kv_layers = (uint32_t) g.n_qsa_layers() + 1;
+            limits.max_kv_layers = uint32_t(g.n_qsa_layers()) + (use_dflash ? 5 : use_neural ? 1 : 0);
             if (!store_declined_reason.empty()) {
                 persistence_disabled_reason = store_declined_reason;
                 // The binding above is deliberately incomplete without a card identity, so nothing is opened and no
@@ -13665,9 +14050,9 @@ int main(int argc, char** argv) {
                 out.status = strata::core::ConversationStoreReadStatus::stale;
                 return out;
             }
-            if (!strata::program::conversation_store_restore_compatible(image, use_mtp)) {
+            if (!strata::program::conversation_store_restore_compatible(image, use_neural)) {
                 if (!legacy_store_mtp_decline_reported) {
-                    std::fprintf(stderr, "strata serve: conversation store: legacy MAN1 image declined for MTP "
+                    std::fprintf(stderr, "strata serve: conversation store: legacy MAN1 image declined for neural "
                                          "engine: draft coverage not certified\n");
                     legacy_store_mtp_decline_reported = true;
                 }
@@ -13756,6 +14141,11 @@ int main(int argc, char** argv) {
                 if (!kv_parts(mtp.kv_state(), false, mtp.device())) {
                     work.bytes = UINT64_MAX; return work;
                 }
+            }
+            if (use_dflash) {
+                const uint64_t bytes = neural->copy_bytes(8, tokens, false, why);
+                if (bytes == UINT64_MAX) { work.bytes = UINT64_MAX; return work; }
+                work.path(neural->device(), int(neural->kind())); work.add(bytes);
             }
             if (capture) for (const ConvCheckpoint& c : checks) {
                 if (!stages.empty() && c.stage_parts.size() != stages.size()) continue;
@@ -13883,13 +14273,15 @@ int main(int argc, char** argv) {
                 !live_ok || !live_scope.valid() || live.empty()) return true;
             if (source.shared_prefix && source.resident) {
                 const auto& owner = source.resident->owner;
-                if (!source.boundary_residual || !source.boundary_residual->frozen() ||
+                const bool foreign = owner.stop || owner.tainted || !owner.preparing ||
+                    owner.p != int64_t(live.size()) || owner.ids != live ||
+                    !owner.input.shared_scope.matches(live_scope) || !live_imgs.empty() || !checks.empty();
+                const bool absent_mtp_boundary = !use_dflash && (!source.boundary_residual ||
+                    !source.boundary_residual->frozen() ||
                     source.boundary_residual->size() != size_t(g.hc * g.n_embd) * sizeof(float) ||
                     source.boundary_position != int64_t(live.size()) - 1 ||
-                    source.boundary_request != owner.request || source.boundary_incarnation != owner.incarnation ||
-                    owner.stop || owner.tainted || !owner.preparing || owner.p != int64_t(live.size()) ||
-                    owner.ids != live || !owner.input.shared_scope.matches(live_scope) ||
-                    !live_imgs.empty() || !checks.empty()) {
+                    source.boundary_request != owner.request || source.boundary_incarnation != owner.incarnation);
+                if (foreign || absent_mtp_boundary) {
                     err = "packed shared snapshot: stale or foreign boundary source"; return false;
                 }
             }
@@ -13940,13 +14332,14 @@ int main(int argc, char** argv) {
             const size_t n_st = stages.size();
             // the draft layer's K/V lives on the last stage's GPU (the drafter is loaded there): with a split it is
             // saved with that stage's image, under its device; stage 0's image holds none
-            const auto* draft_state = source.resident ? source.resident->draft : use_mtp ? &mtp.kv_state() : nullptr;
-            const strata::core::QsaState* draft0 = n_st > 0 && !mtp_first ? nullptr : draft_state;
-            auto draft_of = [&](size_t k) -> const strata::core::QsaState* {
-                return !mtp_first && k + 1 == n_st ? draft_state : nullptr;
-            };
+            const int draft_slot = source.resident ? source.resident->draft_slot : 8;
+            const bool draft0 = use_neural && neural_snapshot_stage == 0;
+            auto draft_of = [&](size_t k) { return use_neural && int(k + 1) == neural_snapshot_stage; };
             auto certify_capture = [&](strata::core::ConversationView& v, bool owns_draft) {
                 if (!owns_draft) return;
+                if (use_dflash && (source.resident || !displaced_draft)) {
+                    neural->certify_view(v, draft_slot); return;
+                }
                 // Private restores need the producer's real completed interval even
                 // on the legacy reader; suffix writes alone cannot certify its prefix.
                 if (source.resident) {
@@ -13992,8 +14385,9 @@ int main(int argc, char** argv) {
                         v.draft_boundary_residual = displaced_draft->draft_boundary_residual;
                         v.draft_boundary_position = displaced_draft->draft_boundary_position;
                         v.draft_boundary_owner = displaced_draft->draft_boundary_owner;
+                        v.draft_identity = displaced_draft->draft_identity; v.draft_origin = displaced_draft->draft_origin;
                     }
-                } else mtp.certify_view(v);
+                } else neural->certify_view(v, draft_slot);
                 if (!store_man2 && source.shared_prefix) {
                     // Legacy shared cuts retain their observed sanitizing extent;
                     // certified export also retains the owned boundary row.
@@ -14028,7 +14422,7 @@ int main(int argc, char** argv) {
             } merge_back{cs, checks, n_st > 0};
             strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached,
                                                 source.shared_prefix};
-            certify_capture(view, draft0 != nullptr);
+            certify_capture(view, draft0);
             auto reuse = source.resident || source.shared_prefix
                 ? strata::core::ConversationKvReuse{} : conversations.take_reuse();
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
@@ -14040,9 +14434,9 @@ int main(int argc, char** argv) {
                 auto& st = stages[k];
                 const strata::core::OnDevice on(st->dev);
                 strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached, source.shared_prefix};
-                certify_capture(view_k, draft_of(k) != nullptr);
+                certify_capture(view_k, draft_of(k));
                 size_t b = 0;
-                if (!strata::core::conversation_snapshot_bytes(view_k, session_at(k + 1), g, draft_of(k), b, err)) {
+                if (!snapshot_bytes(view_k, session_at(k + 1), int(k + 1), draft_slot, b, err)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (stage CUDA%d: %s)\n",
                                  st->dev, err.c_str());
                     err.clear();
@@ -14050,8 +14444,7 @@ int main(int argc, char** argv) {
                 }
                 if (!stage_reuse[k].kv.empty()) {
                     size_t r = 0;
-                    if (strata::core::conversation_snapshot_capture_bytes(stage_reuse[k], view_k, session_at(k + 1), g, draft_of(k),
-                                                                          r, err)) {
+                    if (snapshot_bytes(view_k, session_at(k + 1), int(k + 1), draft_slot, r, err, &stage_reuse[k])) {
                         b = r;
                         stage_retained += stage_reuse[k].bytes();
                     } else {
@@ -14066,14 +14459,13 @@ int main(int argc, char** argv) {
                 stage_estimate += stage_bytes;
             }
             size_t estimate = 0;
-            if (!strata::core::conversation_snapshot_bytes(view, session_at(0), g, draft0, estimate, err)) {
+            if (!snapshot_bytes(view, session_at(0), 0, draft_slot, estimate, err)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", err.c_str());
                 err.clear(); // A recoverable miss must not poison the batched draft prefill's error channel.
                 return true;
             }
             const size_t fresh_estimate = estimate;
-            if (!reuse.kv.empty() && !strata::core::conversation_snapshot_capture_bytes(
-                    reuse, view, session_at(0), g, draft0, estimate, err)) {
+            if (!reuse.kv.empty() && !snapshot_bytes(view, session_at(0), 0, draft_slot, estimate, err, &reuse)) {
                 reuse = {};
                 estimate = fresh_estimate;
                 err.clear();
@@ -14144,8 +14536,9 @@ int main(int argc, char** argv) {
                 const uint64_t reuse_donor_head = store_on ? reuse.donor_head : 0;
                 const uint64_t reuse_donor_epoch = reuse.donor_epoch;
                 std::vector<strata::core::ConversationRetainedPrefix> retained_prefixes;
-                if (!strata::core::conversation_snapshot_save(image, view, session_at(0), g, draft0, err,
-                        std::move(reuse), &reused_bytes, store_on ? &retained_prefixes : nullptr)) {
+                if (!snapshot_save(image, view, session_at(0), 0, draft_slot, err,
+                        std::move(reuse), &reused_bytes, store_on ? &retained_prefixes : nullptr,
+                        !source.resident && displaced_owner ? &*displaced_owner : nullptr)) {
                     note_capture_error();
                     return false;
                 }
@@ -14159,11 +14552,12 @@ int main(int argc, char** argv) {
                         return false;
                     }
                     strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached, source.shared_prefix};
-                    certify_capture(view_k, draft_of(k) != nullptr);
+                    certify_capture(view_k, draft_of(k));
                     strata::core::SavedConversation part;
                     std::vector<strata::core::ConversationRetainedPrefix> stage_prefixes;
-                    if (!strata::core::conversation_snapshot_save(part, view_k, session_at(k + 1), g, draft_of(k), err,
-                            std::move(stage_reuse[k]), &reused_bytes, store_on ? &stage_prefixes : nullptr)) {
+                    if (!snapshot_save(part, view_k, session_at(k + 1), int(k + 1), draft_slot, err,
+                            std::move(stage_reuse[k]), &reused_bytes, store_on ? &stage_prefixes : nullptr,
+                            !source.resident && displaced_owner ? &*displaced_owner : nullptr)) {
                         note_capture_error();
                         return false;
                     }
@@ -14186,11 +14580,10 @@ int main(int argc, char** argv) {
                                            strata::core::ConversationSnapshotExpectation::ordinary) {
                     std::string why;
                     if (candidate.stage_images.size() != stages.size() ||
-                        !strata::core::conversation_snapshot_validate(
-                            candidate, session_at(0), g, draft0, expectation, why)) return false;
+                        !snapshot_validate(candidate, session_at(0), 0, why, expectation, draft_slot)) return false;
                     for (size_t k = 0; k < stages.size(); ++k)
-                        if (!strata::core::conversation_snapshot_validate(candidate.stage_images[k],
-                                session_at(k + 1), g, draft_of(k), expectation, why)) return false;
+                        if (!snapshot_validate(candidate.stage_images[k],
+                                session_at(k + 1), int(k + 1), why, expectation, draft_slot)) return false;
                     return true;
                 };
                 // Capture is complete: only retained allocations can be saved.
@@ -15843,23 +16236,7 @@ int main(int argc, char** argv) {
                             if (size_t(frames) >= kPackedQueuedFrames)
                                 l = "BQINPUTREFUSED " + std::string(tag);
                         } else {
-                            // At most one unconsumed intention per identical fence.
-                            // A stale seat/incarnation/cursor must not erase a valid control.
-                            const bool reprioritize = text.starts_with("BQPRIORITY ");
-                            size_t fence_end = tag_end;
-                            for (int field = 0; reprioritize && field < 3; ++field) {
-                                const size_t begin = text.find_first_not_of(" \t", fence_end);
-                                fence_end = begin == text.npos ? text.npos : text.find_first_of(" \t", begin);
-                                if (fence_end == text.npos) break;
-                            }
-                            const auto prefix = text.substr(0, fence_end);
-                            for (auto it = in_lines.begin(); it != in_lines.end(); ++it) {
-                                const bool same = reprioritize ?
-                                    it->compare(0, prefix.size(), prefix) == 0 && it->size() > prefix.size() &&
-                                        ((*it)[prefix.size()] == ' ' || (*it)[prefix.size()] == '\t') :
-                                    *it == text;
-                                if (same) { in_lines.erase(it); break; }
-                            }
+                            strata::program::coalesce_native_control(in_lines, text);
                         }
                     }
                     if (in_lines.size() >= strata::program::native_submission_limit * 5 + kPackedQueuedFrames) {
@@ -15917,7 +16294,7 @@ int main(int argc, char** argv) {
             if (private_preparation) in_cv.notify_all();
             return true;
         };
-        sp.should_stop = [&] { return stop_req.load(); };
+        sp.should_stop = [&] { return stop_req.load() && (!use_dflash || !neural->inputs_pending(8)); };
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
@@ -16061,7 +16438,7 @@ int main(int argc, char** argv) {
                     std::snprintf(role, sizeof(role), "slot_%d", b);
                     strata::program::write_kv_residency_info(stdout, role,
                         slot.qsa_states ? &slot.qsa_states[slot.qsa_primary()] : nullptr,
-                        mtp.slot_state(b), page_size);
+                        use_neural ? neural->legacy_state(b) : nullptr, page_size);
                 }
             }
         }
@@ -16140,7 +16517,8 @@ int main(int argc, char** argv) {
         std::string line;
         int64_t rounds = 0;
         const int S = o.spec;
-        const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
+        const int S_mtp = use_dflash ? std::min(4, o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S) :
+            o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;
         if (use_mtp && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         // --pipeline-windows 2 loads the drafter with 8 rows: the serial loop's chain keeps its own length
         else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
@@ -16337,6 +16715,8 @@ int main(int argc, char** argv) {
                 return resident_executors[size_t(slot)].finish(packed_owners[size_t(slot)].work, why, diagnostic);
             return resident.finish(slot, why, diagnostic);
         };
+        // Native projection commits the whole kept prefix before software history
+        // advances. Observe only its final history update, at that same frontier.
         auto resident_commit = [&](int slot, int32_t token, const float* residual, std::string& why,
                                    bool diagnostic = true) {
             if (private_preparation && slot >= 0 && size_t(slot) < packed_owners.size() &&
@@ -16345,7 +16725,26 @@ int main(int argc, char** argv) {
                                                                  token, residual, why, diagnostic);
             return resident.committed(slot, token, residual, why, diagnostic);
         };
+        auto prepare_native_uniforms = [&](int slot, int64_t frontier,
+                const strata::kernels::SamplerParams& sampling, std::string& why) {
+#if defined(STRATA_DFLASH2_CAPTURE)
+            if (dflash) {
+                std::array<float, 3> uniforms{};
+                for (size_t row = 0; row < uniforms.size(); ++row)
+                    uniforms[row] = strata::kernels::philox_uniform(sampling.seed,
+                        uint64_t(frontier + int64_t(row)) | strata::core::kSpecCtrDraft);
+                return dflash->set_proposal_uniforms(slot, neural->owner(slot), int(frontier), uniforms, why);
+            }
+#endif
+            return true;
+        };
         auto resident_propose = [&](int slot, const float* residual, std::string& why) {
+            if (use_dflash) {
+                const auto& state = bs[size_t(slot)];
+                if (S_mtp <= 1 || state.max_new - state.produced <= 1 || o.max_context - state.p <= 1 ||
+                    state.p > strata::core::dflash2::max_position - 4) return true;
+                if (!prepare_native_uniforms(slot, state.p, state.sampling, why)) return false;
+            }
             if (private_preparation && slot >= 0 && size_t(slot) < packed_owners.size() &&
                 packed_owners[size_t(slot)].work)
                 return resident_executors[size_t(slot)].propose(packed_owners[size_t(slot)].work, residual, why);
@@ -16580,15 +16979,15 @@ int main(int argc, char** argv) {
                             (unsigned long long) identity.request, (unsigned long long) identity.incarnation);
             std::putchar('\n');
         };
-        auto record_batch_proposal = [&](int b, int32_t proposal, int32_t target, int keep) {
+        auto record_batch_proposal = [&](int b, int32_t proposal, int32_t target, int keep, int offered = 1) {
             const BSlot& sl = bs[(size_t) b];
             auto& counts = batch_drafts[b];
             if (counts.request != sl.request) counts = {sl.request, 0, 0};
-            ++counts.offered;
+            counts.offered += offered;
             counts.accepted += keep - 1;
             if (private_preparation && size_t(b) < packed_owners.size() &&
                 packed_owners[size_t(b)].lease.request == sl.request) {
-                ++packed_owners[size_t(b)].draft_offered;
+                packed_owners[size_t(b)].draft_offered += offered;
                 packed_owners[size_t(b)].draft_accepted += keep - 1;
             }
             if (batch_mtp_trace)
@@ -16612,7 +17011,7 @@ int main(int argc, char** argv) {
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0;
         int64_t bt_miss0 = 0, bt_hits0 = 0, bt_pcie0 = 0;
-        int64_t bt_windows = 0, bt_rows = 0, bt_tokens = 0, bt_accepted = 0;   // bt_accepted: --batch-mtp proposals taken
+        int64_t bt_windows = 0, bt_rows = 0, bt_tokens = 0, bt_accepted = 0, bt_offered = 0;
         uint64_t batch_commit_epoch = 0; // monotonic across the resettable batch timing windows
         auto emit_batch_token = [&](int slot, int32_t token) {
             if (private_preparation && slot >= 0 && size_t(slot) < packed_owners.size() &&
@@ -16656,6 +17055,97 @@ int main(int argc, char** argv) {
 
         // the stage-to-verifier mapping: one definition, before every use below (`batch_step` and the pipelined pump)
         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
+        auto neural_row_width = [&](const BSlot& slot) {
+            const int proposals = use_dflash ? strata::spec::neural_window_width(slot.proposal.confidence.data(),
+                slot.proposal.count, S_mtp, float(slot.input.spec_min_probability),
+                !slot.sampling.greedy && slot.sampling.temperature > 0) - 1 : 1;
+            return int(std::max<int64_t>(1, std::min<int64_t>(
+                proposals + 1, std::min(slot.max_new - slot.produced, o.max_context - slot.p))));
+        };
+        auto append_neural_rows = [&](int b, int* rows, int32_t* tokens, int64_t* positions,
+                                      int& count, int capacity, std::string& why) {
+            const auto& slot = bs[size_t(b)];
+            const int width = neural_row_width(slot);
+            if (count + width > capacity) { why = "neural frame exceeds physical verifier capacity"; return false; }
+            if (width > 1 && (slot.proposal.count < width - 1 || slot.proposal.frontier != slot.p ||
+                slot.proposal.owner != neural->owner(b) || !slot.proposal.validate(n_vocab, why, neural->kind()))) {
+                if (why.empty()) why = "neural frame has no current owner proposal"; return false;
+            }
+            for (int row = 0; row < width; ++row) {
+                rows[count] = b; tokens[count] = row ? slot.proposal.tokens[size_t(row - 1)] : slot.x;
+                positions[count++] = slot.p + row;
+            }
+            return true;
+        };
+        auto stage_batch_q = [&](strata::core::Verifier& owner, const int* rows, int count,
+                std::array<int32_t, strata::kernels::kVerifyMaxT * strata::core::kSpecQStride>& q,
+                std::array<int32_t, strata::kernels::kVerifyMaxT>& proposed, std::string& why) {
+            if (!owner.set_batch_spec_q(nullptr, nullptr, 0, false, why)) return false;
+            if (!use_dflash) return true;
+            bool required = false;
+            for (int first = 0; first < count;) {
+                const int b = rows[first]; int end = first + 1;
+                while (end < count && rows[end] == b) ++end;
+                const auto& slot = bs[size_t(b)];
+                if (!slot.sampling.greedy && slot.sampling.temperature > 0 && end - first > 1) {
+                    if (slot.proposal.distribution != strata::core::DraftProposal::Distribution::conditional_q ||
+                        !slot.proposal.probability_rows()) {
+                        why = "sampled DFlash frame lacks its real conditional q"; return false;
+                    }
+                    if (!required) { q.fill(-1); proposed.fill(-1); required = true; }
+                    for (int row = first; row < end - 1; ++row) {
+                        const int proposal = row - first;
+                        proposed[size_t(row)] = slot.proposal.tokens[size_t(proposal)];
+                        std::copy_n(slot.proposal.probability_rows() + proposal * strata::core::kSpecQStride,
+                            strata::core::kSpecQStride, q.data() + row * strata::core::kSpecQStride);
+                    }
+                }
+                first = end;
+            }
+            return !required || owner.set_batch_spec_q(q.data(), proposed.data(), count, true, why);
+        };
+        auto accepted_batch_prefix = [&](int b, const int32_t* tokens, const int32_t* output, int width) {
+            const auto& slot = bs[size_t(b)];
+            int accepted = 0;
+            while (accepted < width - 1 && tokens[accepted + 1] == output[accepted]) ++accepted;
+            int keep = int(std::min<int64_t>(accepted + 1, slot.max_new - slot.produced));
+            if (slot.stop) keep = 1;
+            for (int row = 0; row < keep; ++row)
+                if (std::find(o.eos_ids.begin(), o.eos_ids.end(), int64_t(output[row])) != o.eos_ids.end()) {
+                    keep = row + 1; break;
+                }
+#if defined(STRATA_DFLASH2_CAPTURE)
+            if (dflash) strata::program::dflash2_serving::log_window(neural->owner(b), slot.p,
+                {tokens, size_t(width)}, accepted, keep, slot.max_new - slot.produced, slot.sampling,
+                uint64_t(slot.ids.size()), strata::program::SessionFingerprint::basis, o.eos_ids);
+#endif
+            return keep;
+        };
+#if defined(STRATA_DFLASH2_CAPTURE)
+        auto begin_packed_capture = [&](strata::program::dflash2_serving::CaptureFrame& frame,
+                const int* rows, const int64_t* positions, int count, std::string& why) {
+            int owners = 0, depth = 0;
+            if (count < 1 || count > strata::kernels::kVerifyMaxT) {
+                why = "native decode frame exceeds its physical verifier row capacity"; return false;
+            }
+            for (int row = 0; row < count; ++row) {
+                if (row == 0 || rows[row] != rows[row - 1]) { ++owners; depth = 0; }
+                if (++depth > 4) { why = "native decode owner exceeds its four-row proposal block"; return false; }
+            }
+            if (owners > 2) { why = "native decode frame exceeds its two-owner graph/key family"; return false; }
+            std::array<strata::core::BatchRow, strata::kernels::kVerifyMaxT> metadata;
+            for (int row = 0; row < count; ++row) {
+                auto& m = metadata[size_t(row)];
+                m.slot = rows[row]; m.request_id = bs[size_t(m.slot)].request;
+                m.position = positions[row]; m.mask = strata::core::BatchRowMask::active;
+            }
+            return frame.begin_batch({metadata.data(), size_t(count)}, why);
+        };
+        strata::program::dflash2_serving::CaptureFrame sync_capture_frame;
+        bind_capture_frame(sync_capture_frame, capture_verifiers);
+#endif
+        std::array<int32_t, strata::kernels::kVerifyMaxT * strata::core::kSpecQStride> sync_q{};
+        std::array<int32_t, strata::kernels::kVerifyMaxT> sync_proposed{};
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
         auto batch_step = [&]() -> bool {
@@ -16698,29 +17188,32 @@ int main(int argc, char** argv) {
                     if (bs[(size_t) b].active && !bs[(size_t) b].failed && bs[(size_t) b].request)
                         ready.push_back({bs[(size_t) b].request, bs[(size_t) b].foreground});
                 decode_service.set_capacity(strata::program::decode_window_capacity(
-                    ready, batch_mtp ? 4 : strata::kernels::kVerifyMaxT));
+                    ready, use_dflash ? 2 : batch_mtp ? 4 : strata::kernels::kVerifyMaxT));
                 for (const uint64_t request : decode_service.select(ready)) {
                     for (int b = 0; b < (int) bs.size(); ++b)
                         if (bs[(size_t) b].request == request && bs[(size_t) b].active) { rows[S++] = b; break; }
                 }
             } else {
-                for (size_t scanned = 0; scanned < bs.size() && S < (batch_mtp ? 4 : strata::kernels::kVerifyMaxT); ++scanned) {
+                const int seats = use_dflash ? 2 : batch_mtp ? 4 : strata::kernels::kVerifyMaxT;
+                for (size_t scanned = 0; scanned < bs.size() && S < seats; ++scanned) {
                     const int b = batch_mtp ? (int) ((resident_cursor + scanned) % bs.size()) : (int) scanned;
                     if (bs[(size_t) b].active) rows[S++] = b;
                 }
-                if (batch_mtp && S) resident_cursor = ((size_t) rows[S - 1] + 1) % bs.size();
+                if (!use_dflash && batch_mtp && S) resident_cursor = ((size_t) rows[S - 1] + 1) % bs.size();
+            }
+            if (use_dflash && S) {
+                if (!o.resident_multiplex) resident_cursor = (size_t(rows[S - 1]) + 1) % bs.size();
+                std::sort(rows, rows + S);
             }
             if (batch_mtp) {
                 int expanded[8] = {}, n = 0;
                 for (int t = 0; t < S && n < 8; ++t) {
                     const int b = rows[t];
                     const auto& sl = bs[(size_t) b];
-                    if (sl.draft < 0) { err = "batch MTP: live slot has no proposal"; return false; }
+                    const int width = neural_row_width(sl);
+                    if (n + width > strata::kernels::kVerifyMaxT) break;
                     first[A] = n; active[A++] = b;
-                    expanded[n] = b; tok[n] = sl.x; pos[n++] = sl.p;
-                    if (n < 8 && sl.p + 1 < o.max_context && sl.produced + 2 <= sl.max_new) {
-                        expanded[n] = b; tok[n] = sl.draft; pos[n++] = sl.p + 1;
-                    }
+                    if (!append_neural_rows(b, expanded, tok, pos, n, strata::kernels::kVerifyMaxT, err)) return false;
                 }
                 S = n;
                 std::copy(expanded, expanded + S, rows);
@@ -16779,6 +17272,10 @@ int main(int argc, char** argv) {
                          : strata::core::BatchRowMask::padding;
             }
             if (!batch_mtp) for (int t = 0; t < S; ++t) metadata[rows[t]].mask = strata::core::BatchRowMask::active;
+            if (batch_mtp && !stage_batch_q(ver, rows, S, sync_q, sync_proposed, err)) return false;
+#if defined(STRATA_DFLASH2_CAPTURE)
+            if (dflash && !begin_packed_capture(sync_capture_frame, rows, pos, S, err)) return false;
+#endif
             if (!ver.run_slot_rows(metadata, count, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
                 phase_error("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                 return false;
@@ -16801,18 +17298,29 @@ int main(int argc, char** argv) {
             int keep[8] = {};
             for (int a = 0; a < A; ++a) {
                 const int b = active[a], i = first[a];
-                const BSlot& sl = bs[(size_t) b];
-                const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i]) != o.eos_ids.end();
-                keep[b] = batch_mtp && i + 1 < S && rows[i + 1] == b && outb[i] == tok[i + 1] && !eos && !sl.stop &&
-                          sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
-                if ((split_batch_mtp || private_preparation) && i + 1 < S && rows[i + 1] == b &&
-                    (!private_preparation || !ver.nonfinite_in(i, 2)))
-                    record_batch_proposal(b, tok[i + 1], outb[i], keep[b]);
+                const int end = a + 1 < A ? first[a + 1] : S;
+                keep[b] = accepted_batch_prefix(b, tok + i, outb + i, end - i);
+                bt_offered += end - i - 1;
+                bt_accepted += bs[size_t(b)].stop ? 0 : keep[b] - 1;
+                if (end - i > 1 &&
+                    (!private_preparation || !ver.nonfinite_in(i, end - i)))
+                    record_batch_proposal(b, tok[i + 1], outb[i], keep[b], end - i - 1);
             }
             if (!(batch_mtp ? ver.commit_slot_prefixes(keep, err) : ver.commit_slots(err))) {
                 phase_error("ERR %s\n", err.c_str());
                 return false;
             }
+#if defined(STRATA_DFLASH2_CAPTURE)
+            if (dflash) {
+                uint32_t discard = 0;
+                for (int index = 0; index < A; ++index) {
+                    const int end = index + 1 < A ? first[index + 1] : S;
+                    if (bs[size_t(active[index])].stop || ver.nonfinite_in(first[index], end - first[index]))
+                        discard |= uint32_t(1) << active[index];
+                }
+                if (!sync_capture_frame.finish(err, discard)) return false;
+            }
+#endif
             const Clock::time_point w2 = Clock::now();
             auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
             bt_run += msd(w0, w1);
@@ -16824,9 +17332,14 @@ int main(int argc, char** argv) {
                 const auto& sl = bs[(size_t) b];
                 const int start = batch_mtp ? first[t] : t;
                 const int accepted = batch_mtp ? keep[b] : 1;
+                if (use_dflash && sl.stop) {
+                    resident.taint(b); neural->invalidate_slot_coverage(b);
+                    if (!resident_finish(b, err, false)) return false;
+                    print_mtp_done(b, "cancel"); native_service_end(b); continue;
+                }
                 // #879: a row of this slot held non-finite logits: the slot ends (BDONE nonfinite), nothing is
                 // emitted, and the next request reads its prompt from token 0 (nan_flush)
-                const int verified = batch_mtp && start + 1 < S && rows[start + 1] == b ? 2 : 1;
+                const int verified = batch_mtp ? (t + 1 < A ? first[t + 1] : S) - start : 1;
                 const bool nf = ver.nonfinite_in(start, verified);
                 if (nf) {
                     std::fprintf(stderr, "strata batch: non-finite logits (#879) in slot %d at position %lld: it ends "
@@ -16851,10 +17364,12 @@ int main(int argc, char** argv) {
                 for (int j = 0; j < accepted; ++j) {
                     const int32_t y = outb[batch_mtp ? start + j : b];
                     last_residual = ver.final_R(start + j);
-                    if (!resident_commit(b, y, last_residual, err)) {
+                    if (!resident_commit(b, y, last_residual, err,
+                                         !use_dflash || j + 1 == accepted)) {
                         phase_error("ERR %s\n", err.c_str()); return false;
                     }
                     if (!emit_batch_token(b, y)) return false;
+                    ++bt_tokens;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
                                     : sl.p + 1 > o.max_context ? "length" : nullptr;
@@ -16928,12 +17443,14 @@ int main(int argc, char** argv) {
                     const std::string pr = (k == 0 ? ver : stages[k - 1]->ver).profile_report();
                     if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %zu (ms/window):%s\n", k + 1, pr.c_str());
                 }
-                if (batch_mtp)   // each slot-window offers one proposal and yields 1 + (accepted) tokens
-                    std::fprintf(stderr, "strata batch: MTP proposals accepted %lld of %lld (%.1f%%)\n",
-                                 (long long) bt_accepted, (long long) (bt_rows - bt_accepted),
-                                 100.0 * (double) bt_accepted / (double) std::max<int64_t>(bt_rows - bt_accepted, 1));
+                if (batch_mtp)
+                    std::fprintf(stderr, use_dflash
+                        ? "strata batch: DFlash2 proposals committed %lld of %lld offered (%.1f%%)\n"
+                        : "strata batch: MTP proposals accepted %lld of %lld (%.1f%%)\n",
+                        (long long)bt_accepted, (long long)bt_offered,
+                        100.0 * double(bt_accepted) / double(std::max<int64_t>(bt_offered, 1)));
                 bt_run = bt_commit = bt_emit = bt_adapt_wait = 0;
-                bt_windows = bt_rows = bt_tokens = bt_accepted = bt_adapt_rounds = bt_adapt_swaps = 0;
+                bt_windows = bt_rows = bt_tokens = bt_accepted = bt_offered = bt_adapt_rounds = bt_adapt_swaps = 0;
             }
             return true;
         };
@@ -16958,7 +17475,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --batch-mtp-pipeline: two group-owned replay chains, "
                                  "%d compute rows per owner, physical handoff bases 0/%d; "
                                  "accepted-prefix commit before either group reuses its owner.\n",
-                                 batch_compute_rows, std::min(o.batch, 4));
+                                 batch_compute_rows, use_dflash ? 8 : std::min(o.batch, 4));
         const bool retained_prefill = [] {
             const char* value = std::getenv("STRATA_PREFILL_RETAINED_LAYERS");
             return value && std::strcmp(value, "0") != 0;
@@ -16999,6 +17516,11 @@ int main(int argc, char** argv) {
             int32_t tok[strata::kernels::kVerifyMaxT] = {};
             int64_t pos[strata::kernels::kVerifyMaxT] = {};
             int64_t since = 0;              ///< tick it started waiting (fairness)
+            std::array<int32_t, strata::kernels::kVerifyMaxT * strata::core::kSpecQStride> q{};
+            std::array<int32_t, strata::kernels::kVerifyMaxT> proposed{};
+#if defined(STRATA_DFLASH2_CAPTURE)
+            strata::program::dflash2_serving::CaptureFrame capture;
+#endif
             bool round_started = false;
         };
         std::vector<PGroup> pg((size_t) (piped ? (o.batch_mtp_third ? 3 : o.batch_groups)
@@ -17206,20 +17728,36 @@ int main(int argc, char** argv) {
                 for (int t = 0; t < G.count;) {
                     const int first = t, b = G.rows[t];
                     while (t < G.count && G.rows[t] == b) ++t;
-                    const BSlot& sl = bs[(size_t) b];
-                    const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) out[first]) != o.eos_ids.end();
-                    keep[b] = t - first == 2 && out[first] == G.tok[first + 1] && !eos && !sl.stop &&
-                              sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
-                    if (t - first == 2 && (!private_preparation || !head.nonfinite_in(first, 2)))
-                        record_batch_proposal(b, G.tok[first + 1], out[first], keep[b]);
+                    keep[b] = accepted_batch_prefix(b, G.tok + first, out + first, t - first);
+                    bt_offered += t - first - 1;
+                    bt_accepted += bs[size_t(b)].stop ? 0 : keep[b] - 1;
+                    if (t - first > 1 && (!private_preparation || !head.nonfinite_in(first, t - first)))
+                        record_batch_proposal(b, G.tok[first + 1], out[first], keep[b], t - first - 1);
                 }
                 if (!group_verifier(0, gi).commit_slot_prefixes(keep, err)) {
                     phase_error("ERR %s\n", err.c_str()); return false;
                 }
+#if defined(STRATA_DFLASH2_CAPTURE)
+                if (dflash) {
+                    uint32_t discard = 0;
+                    for (int first = 0; first < G.count;) {
+                        const int b = G.rows[first]; int end = first + 1;
+                        while (end < G.count && G.rows[end] == b) ++end;
+                        if (bs[size_t(b)].stop || head.nonfinite_in(first, end - first)) discard |= uint32_t(1) << b;
+                        first = end;
+                    }
+                    if (!G.capture.finish(err, discard)) return false;
+                }
+#endif
                 for (int t = 0; t < G.count;) {
                     const int first = t, b = G.rows[t];
                     while (t < G.count && G.rows[t] == b) ++t;
                     const BSlot& sl = bs[(size_t) b];
+                    if (use_dflash && sl.stop) {
+                        resident.taint(b); neural->invalidate_slot_coverage(b);
+                        if (!resident_finish(b, err, false)) return false;
+                        print_mtp_done(b, "cancel"); native_service_end(b); continue;
+                    }
                     // Successful polling only certifies completion. Retire a poisoned slot after
                     // every deferred stage has committed/drained, before emitting or advancing its draft.
                     if (head.nonfinite_in(first, t - first)) {
@@ -17239,7 +17777,8 @@ int main(int argc, char** argv) {
                     for (int j = 0; j < keep[b]; ++j) {
                         const int32_t y = out[first + j];
                         residual = head.final_R(first + j);
-                        if (!resident_commit(b, y, residual, err, batch_mtp_trace)) {
+                        if (!resident_commit(b, y, residual, err,
+                                             batch_mtp_trace && (!use_dflash || j + 1 == keep[b]))) {
                             phase_error("ERR %s\n", err.c_str()); return false;
                         }
                         if (!emit_batch_token(b, y)) return false;
@@ -17289,7 +17828,22 @@ int main(int argc, char** argv) {
                     PGroup& G = pg[(size_t) pick];
                     G.round_started = bounded_round;
                     G.count = 0;
-                    if (o.batch_mtp_floating) {
+                    if (use_dflash && !o.batch_mtp_floating) {
+                        const int capacity = group_verifier(0, pick).max_t();
+                        int scanned = 0;
+                        for (; scanned < GS; ++scanned) {
+                            const int b = pick * GS + (G.cursor + scanned) % GS;
+                            const auto& slot = bs[size_t(b)];
+                            if (!slot.active) continue;
+                            if (slot.stop) {
+                                if (!resident_finish(b, err, batch_mtp_trace)) return false;
+                                print_mtp_done(b, "cancel"); continue;
+                            }
+                            if (G.count + neural_row_width(slot) > capacity) break;
+                            if (!append_neural_rows(b, G.rows, G.tok, G.pos, G.count, capacity, err)) return false;
+                        }
+                        G.cursor = (G.cursor + scanned) % GS;
+                    } else if (o.batch_mtp_floating) {
                         int ready[4] = {}, n = 0;
                         for (int b = 0; b < 4; ++b) {
                             const BSlot& sl = bs[(size_t)b];
@@ -17335,15 +17889,11 @@ int main(int argc, char** argv) {
                         for (int t = 0; t < take; ++t) {
                             const int b = ready[t];
                             const BSlot& sl = bs[(size_t)b];
-                            if (sl.draft < 0) { phase_error("ERR batch MTP: live slot has no proposal\n"); return false; }
                             if (batch_mtp_trace)
                                 std::fprintf(stderr, "STATE_FLOAT_LEASE tick=%lld owner=%d slot=%d position=%lld\n",
                                              (long long)pipe_tick, pick, b, (long long)sl.p);
                             seat_served[b] = pipe_tick;
-                            G.rows[G.count] = b; G.tok[G.count] = sl.x; G.pos[G.count++] = sl.p;
-                            if (sl.p + 1 < o.max_context && sl.produced + 2 <= sl.max_new) {
-                                G.rows[G.count] = b; G.tok[G.count] = sl.draft; G.pos[G.count++] = sl.p + 1;
-                            }
+                            if (!append_neural_rows(b, G.rows, G.tok, G.pos, G.count, batch_compute_rows, err)) return false;
                         }
                     } else if (GS > 2) {
                         int selected[2] = {}, n = 0, scanned = 0;
@@ -17363,12 +17913,7 @@ int main(int argc, char** argv) {
                         if (n == 2 && selected[0] > selected[1]) std::swap(selected[0], selected[1]);
                         for (int t = 0; t < n; ++t) {
                             const int b = selected[t];
-                            const BSlot& sl = bs[(size_t) b];
-                            if (sl.draft < 0) { phase_error("ERR batch MTP: live slot has no proposal\n"); return false; }
-                            G.rows[G.count] = b; G.tok[G.count] = sl.x; G.pos[G.count++] = sl.p;
-                            if (sl.p + 1 < o.max_context && sl.produced + 2 <= sl.max_new) {
-                                G.rows[G.count] = b; G.tok[G.count] = sl.draft; G.pos[G.count++] = sl.p + 1;
-                            }
+                            if (!append_neural_rows(b, G.rows, G.tok, G.pos, G.count, batch_compute_rows, err)) return false;
                         }
                     } else
                     for (int t = 0; t < GS; ++t) {
@@ -17380,14 +17925,19 @@ int main(int argc, char** argv) {
                             print_mtp_done(b, "cancel");
                             continue;
                         }
-                        if (sl.draft < 0) { phase_error("ERR batch MTP: live slot has no proposal\n"); return false; }
-                        G.rows[G.count] = b; G.tok[G.count] = sl.x; G.pos[G.count++] = sl.p;
-                        if (sl.p + 1 < o.max_context && sl.produced + 2 <= sl.max_new) {
-                            G.rows[G.count] = b; G.tok[G.count] = sl.draft; G.pos[G.count++] = sl.p + 1;
-                        }
+                        if (!append_neural_rows(b, G.rows, G.tok, G.pos, G.count, batch_compute_rows, err)) return false;
                     }
                     if (!G.count) continue;
                     for (int t = 0; t < G.count; ++t) native_service_begin(G.rows[t]);
+                    if (!stage_batch_q(group_verifier(0, pick), G.rows, G.count, G.q, G.proposed, err)) return false;
+#if defined(STRATA_DFLASH2_CAPTURE)
+                    if (dflash) {
+                        std::array<strata::core::Verifier*, 4> owners{};
+                        for (int stage = 0; stage < n_pipe; ++stage) owners[size_t(stage)] = &group_verifier(stage, pick);
+                        bind_capture_frame(G.capture, owners);
+                        if (!begin_packed_capture(G.capture, G.rows, G.pos, G.count, err)) return false;
+                    }
+#endif
                     G.inflight = true;
                     G.stage = 0;
                     drive.d.failed = false;
@@ -17396,8 +17946,8 @@ int main(int argc, char** argv) {
                 PGroup& G = pg[(size_t) pick];
                 strata::core::Verifier& owner = group_verifier(k, pick);
                 strata::core::progress().busy.store(true);
-                const int handoff_base = o.batch_mtp_third ? (pick == 0 ? 0 : pick == 1 ? 4 : 6)
-                                                          : pick * std::min(2 * GS, 4);
+                const int handoff_base = use_dflash ? pick * 8 :
+                    o.batch_mtp_third ? (pick == 0 ? 0 : pick == 1 ? 4 : 6) : pick * std::min(2 * GS, 4);
                 if (!owner.batch_launch(handoff_base, G.rows, G.count, G.tok, G.pos, err,
                                         strata::core::Verifier::BatchCommit::deferred)) {
                     phase_error("ERR %s\n", err.c_str()); return false;
@@ -17435,7 +17985,7 @@ int main(int argc, char** argv) {
                                          k, gi, k == 0 ? 0 : stages[(size_t) k - 1]->dev,
                                          (long long) v.windows, v.ms_commit, v.ms_commit / (double) v.windows);
                         }
-                bt_windows = bt_rows = bt_tokens = 0;
+                bt_windows = bt_rows = bt_tokens = bt_accepted = bt_offered = 0;
                 if (!in_prompt_read) strata::core::progress().busy.store(false);
             }
             return true;
@@ -18325,7 +18875,10 @@ int main(int argc, char** argv) {
             owner.seams = {first_turn >= o.prompt_cache_root && o.prompt_cache_root > 0 ? first_turn : 0,
                            last_turn, owner.input.pin > 0 && owner.input.pin < endpoint ? owner.input.pin : 0};
             owner.periodic = o.prompt_cache_every > 0 ? owner.resume + o.prompt_cache_every : INT64_MAX;
-            if (owner.input.shared_scope.valid() && owner.resume < owner.input.pin &&
+            if (use_dflash && owner.input.shared_scope.valid() && owner.input.pin > 0 &&
+                owner.resume <= owner.input.pin)
+                owner.shared_capture = true; // compact-KV publication intent, no MTP residual allocation
+            if (use_mtp && owner.input.shared_scope.valid() && owner.resume < owner.input.pin &&
                 mtp.first_needed(slot) <= owner.input.pin - 1) {
                 auto selector = store_selector_base;
                 selector.scope = owner.input.shared_scope;
@@ -18353,19 +18906,25 @@ int main(int argc, char** argv) {
             } release{owner};
             const int slot = owner.lease.slot;
             if (packed_cancelled(slot)) return true; // controls were pumped after the complete-chain drain
+            if (use_dflash && !pipe_drain()) return false;
+            if (packed_cancelled(slot)) return true;
             if (!owner.pending || !owner.prepared || owner.frontier != owner.input.pin ||
-                owner.shared_boundary_position != owner.input.pin - 1 ||
-                owner.shared_boundary_request != owner.lease.request ||
-                owner.shared_boundary_incarnation != owner.lease.incarnation) {
+                (!use_dflash && (owner.shared_boundary_position != owner.input.pin - 1 ||
+                 owner.shared_boundary_request != owner.lease.request ||
+                 owner.shared_boundary_incarnation != owner.lease.incarnation))) {
                 err = "packed shared snapshot: boundary no longer belongs to its prepared owner"; return false;
             }
             auto source = resident.prepared_snapshot_source(owner.lease, err);
             if (!source) return err.empty();
-            if (owner.resume >= owner.input.pin || owner.resume > source->draft_begin ||
-                source->draft_begin < 0 || source->draft_begin > owner.input.pin - 1 ||
-                source->draft_cells < owner.input.pin - 1) {
+            const bool covered = use_dflash ?
+                source->draft_cells == owner.input.pin &&
+                    source->draft_begin == std::max<int64_t>(neural->origin(slot), owner.input.pin - 2047) :
+                owner.resume < owner.input.pin && owner.resume <= source->draft_begin &&
+                    source->draft_begin >= 0 && source->draft_begin <= owner.input.pin - 1 &&
+                    source->draft_cells >= owner.input.pin - 1;
+            if (!covered) {
                 std::fprintf(stderr, "strata serve: conversation store: skip shared prefix publication "
-                                     "(pin=%lld; no fresh contiguous draft interval)\n", (long long)owner.input.pin);
+                                     "(pin=%lld; no usable contiguous draft interval)\n", (long long)owner.input.pin);
                 return true;
             }
             auto selector = store_selector_base;
@@ -18388,9 +18947,14 @@ int main(int argc, char** argv) {
                 &owner.shared_boundary, owner.shared_boundary_position, owner.shared_boundary_request,
                 owner.shared_boundary_incarnation}, 0, nullptr);
         };
+        auto shared_publication_due = [&](const PackedOwner& owner) {
+            return owner.shared_boundary_request || (use_dflash && owner.shared_capture &&
+                owner.pending && owner.prepared && owner.frontier == owner.input.pin);
+        };
         auto capture_shared_boundary = [&](PackedOwner& owner, const strata::prefill::OwnerSpan& span,
                                             const float* residual, int device, void* opaque_stream,
                                             std::string& why) -> bool {
+            if (use_dflash) return true;
             const int64_t position = owner.input.pin - 1;
             if (!owner.shared_capture || position < span.position || position - span.position >= span.rows) return true;
             const size_t bytes = size_t(g.hc * g.n_embd) * sizeof(float);
@@ -18414,6 +18978,10 @@ int main(int argc, char** argv) {
             owner.shared_boundary_incarnation = span.incarnation;
             return true;
         };
+#if defined(STRATA_DFLASH2_CAPTURE)
+        strata::program::dflash2_serving::CaptureFrame private_capture_frame;
+        bind_capture_frame(private_capture_frame, capture_verifiers);
+#endif
         if (private_preparation) {
             sp.on_segment_stage = [&](const strata::prefill::OwnerSpan& span, size_t stage,
                                       uint64_t execution, int64_t frontier, std::string& why) {
@@ -18453,13 +19021,14 @@ int main(int argc, char** argv) {
                 }
                 if (!capture_shared_boundary(owner, span, residual, arithmetic.device(), arithmetic.stream(), why))
                     return false;
+                if (use_dflash) return true;
                 const char* decline = nullptr;
                 const bool batched = arithmetic.draft_kv(mtp, residual, span.next_tokens, span.rows,
                     span.position, why, &decline, span.slot,
                     int64_t(owner.tokens.size()));
                 if (!batched && !why.empty()) return false;
                 const bool drained = batched ||
-                    mtp.prefill_slot(span.slot, residual, span.next_tokens, span.rows, span.position, why);
+                    neural->prefill_slot(span.slot, residual, span.next_tokens, span.rows, span.position, why);
                 if (drained && span.position + span.rows == owner.lease.endpoint)
                     packed_first_ready.store(true, std::memory_order_release);
                 return drained;
@@ -18496,6 +19065,10 @@ int main(int argc, char** argv) {
                 resident_cancel(slot);
                 if (!resident_finish(slot, err)) return false;
                 packed_done(slot, "cancel");
+            }
+            for (auto& owner : packed_owners) if (shared_publication_due(owner) && !packed_publish_shared(owner)) {
+                if (strata::program::preservation_ends_serving(capture_failure())) return false;
+                drop_capture("the prepared shared prefix");
             }
             // #249: one composition decision for this boundary.  Solo owners take the next pack alone; an
             // ordinary pack runs after a bounded solo streak so ordinary work keeps progressing.
@@ -18607,13 +19180,26 @@ int main(int argc, char** argv) {
                                 row.position = position + index; row.sequence_end = row.position + 1;
                                 row.output_offset = index; row.mask = strata::core::BatchRowMask::active;
                             }
+                            if (!ver.set_batch_spec_q(nullptr, nullptr, 0, false, err)) return false;
+#if defined(STRATA_DFLASH2_CAPTURE)
+                            if (dflash && !sync_capture_frame.begin_batch(
+                                    {metadata.data(), size_t(rows)}, err)) return false;
+#endif
                             if (!ver.run_slot_rows(metadata.data(), rows, win_pool_fn, win_pool_user, unused.data(), err) ||
-                                !ver.commit_slots(err) || !ver.wait_commit(err) || head.nonfinite_in(0, rows))
-                                return false;
+                                !ver.commit_slots(err) || !ver.wait_commit(err)) return false;
+                            const bool nonfinite = head.nonfinite_in(0, rows);
+#if defined(STRATA_DFLASH2_CAPTURE)
+                            if (dflash && !sync_capture_frame.finish(err,
+                                    nonfinite ? uint32_t(1) << slot : 0)) return false;
+#endif
+                            if (nonfinite) {
+                                resident.taint(slot); nan_flush = true; poison_store();
+                                err = "retained known-input verification produced non-finite logits"; return false;
+                            }
                             auto window = span;
                             window.position = position; window.rows = rows;
                             if (!capture_shared_boundary(owner, window, head.final_R(0), head.device(), head.stream(), err) ||
-                                !mtp.prefill_slot(slot, head.final_R(0),
+                                !neural->prefill_slot(slot, head.final_R(0),
                                     bs[size_t(slot)].prompt.data() + position + 1, rows, position, err))
                                 return false;
                             position += rows;
@@ -18643,7 +19229,7 @@ int main(int argc, char** argv) {
                         for (size_t stage = 0; stage <= stages.size(); ++stage)
                             if (!sp.on_segment_stage(span, stage, 0, owner.frontier, err)) return false;
                         if (!packed_checkpoint(owner)) return false;
-                        if (owner.shared_boundary_request && !packed_publish_shared(owner)) {
+                        if (shared_publication_due(owner) && !packed_publish_shared(owner)) {
                             if (strata::program::preservation_ends_serving(capture_failure())) return false;
                             drop_capture("the retained short shared prefix");
                         }
@@ -18695,7 +19281,22 @@ int main(int argc, char** argv) {
                     }
                     return false;
                 };
-                const auto result = sp.run_segments(spans.data(), count, err, pending);
+                strata::prefill::SegmentedResult result;
+#if defined(STRATA_DFLASH2_CAPTURE)
+                if (dflash) {
+                    if (count != 1 || spans[0].rows < 1 || spans[0].rows > sp.chunk()) {
+                        err = "DFlash private preparation requires one bounded actual owner chunk"; return false;
+                    }
+                    if (!private_capture_frame.begin(strata::core::dflash2::CapturePhase::prefill,
+                            spans[0].slot, spans[0].position, spans[0].rows, err)) return false;
+                    result = sp.run_owner(spans[0], err);
+                    if (result.completion != strata::prefill::PrefillCompletion::failed &&
+                        (!private_capture_frame.finish(err) ||
+                         !neural->prefill_slot(spans[0].slot, nullptr, spans[0].next_tokens,
+                            spans[0].rows, spans[0].position, err))) return false;
+                } else
+#endif
+                    result = sp.run_segments(spans.data(), count, err, pending);
                 const double wall = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
                 int64_t issued_rows = 0;
                 for (int index = 0; index < count; ++index)
@@ -18753,11 +19354,11 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 if (!packed_collect()) return false; // certified frontiers are public before reselection
                 for (auto& owner : packed_owners) {
-                    if (!owner.shared_boundary_request) continue;
+                    if (!shared_publication_due(owner)) continue;
                     // A preceding owner's synchronous capture may have queued
                     // this owner's cancellation. Consume it before borrowing.
                     if (!packed_collect()) return false;
-                    if (owner.shared_boundary_request && !packed_publish_shared(owner)) {
+                    if (shared_publication_due(owner) && !packed_publish_shared(owner)) {
                         if (strata::program::preservation_ends_serving(capture_failure())) return false;
                         drop_capture("the packed shared prefix");
                     }
@@ -18826,11 +19427,31 @@ int main(int argc, char** argv) {
                 packed_owners[size_t(slot)].final_issued = true;
                 native_service_begin(slot);
             }
+            if (!ver.set_batch_spec_q(nullptr, nullptr, 0, false, err)) return false;
+#if defined(STRATA_DFLASH2_CAPTURE)
+            if (dflash && !sync_capture_frame.begin_batch(
+                    {final_rows.data(), size_t(final_count)}, err)) return false;
+#endif
             if (!ver.run_slot_rows(final_rows.data(), final_count, win_pool_fn, win_pool_user, output, err) ||
                 !ver.commit_slots(err) || !ver.wait_commit(err)) {
                 for (int index = 0; index < final_count; ++index) resident.taint(final_slots[size_t(index)]);
                 return false;
             }
+#if defined(STRATA_DFLASH2_CAPTURE)
+            if (dflash) {
+                uint32_t discard = 0;
+                for (int row = 0; row < final_count; ++row) {
+                    const int slot = final_slots[size_t(row)];
+                    if (stage_verifier(n_pipe - 1).nonfinite_in(row)) discard |= uint32_t(1) << slot;
+                    strata::program::dflash2_serving::log_window(neural->owner(slot), final_rows[size_t(row)].position,
+                        {&final_rows[size_t(row)].token, 1}, 0, 1,
+                        bs[size_t(slot)].max_new - bs[size_t(slot)].produced, bs[size_t(slot)].sampling,
+                        uint64_t(bs[size_t(slot)].ids.size()), strata::program::SessionFingerprint::basis, o.eos_ids,
+                        "target", 0, "bootstrap");
+                }
+                if (!sync_capture_frame.finish(err, discard)) return false;
+            }
+#endif
             if (!packed_collect()) return false;
             auto& head = stage_verifier(n_pipe - 1);
             for (int index = 0; index < final_count; ++index) {
@@ -18860,7 +19481,7 @@ int main(int argc, char** argv) {
                                      "final_position=%lld frontier=%lld mtp_cells=%lld\n",
                              owner.tag.c_str(), slot, (unsigned long long)owner.lease.request,
                              (unsigned long long)owner.lease.incarnation, (long long)owner.lease.endpoint,
-                             (long long)bs[size_t(slot)].p, (long long)mtp.slot_cells(slot));
+                             (long long)bs[size_t(slot)].p, (long long)neural->slot_cells(slot));
                 owner.first = true;
                 owner.pending = false;
                 owner.frontier = int64_t(owner.tokens.size());
@@ -18927,6 +19548,7 @@ int main(int argc, char** argv) {
                          std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count(), next_phase);
             return true;
         };
+        bool parity_request_seen = false;
         for (;;) {
             line_drain_ms = 0.0;
             if (retained_prompt) {
@@ -19114,11 +19736,8 @@ int main(int argc, char** argv) {
                     for (size_t b = 0; b < bs.size(); ++b) {
                         const auto& sl = bs[b];
                         const auto& state = bslot_ss[0][b]->state();
-                        const strata::core::QsaState empty_draft{};
-                        const auto* draft = use_mtp ? mtp.slot_state((int) b) : &empty_draft;
                         strata::program::SessionFingerprint h;
-                        if (!draft || !strata::program::session_fingerprint(state, *draft, g,
-                                (int64_t) sl.ids.size(), h, err)) return false;
+                        if (!fingerprint_neural(state, int(b), int64_t(sl.ids.size()), h, err)) return false;
                         for (uint64_t v : {h.gdn, h.ple, h.tail, h.pooled, h.kv, h.draft,
                                            h.stale, h.dead, h.pooled_full}) words.push_back(v);
                         words.push_back((uint32_t) state.ple_prev[0]);
@@ -19305,7 +19924,7 @@ int main(int argc, char** argv) {
                     phase_error("ERR %s\n", err.c_str());
                     return 1;
                 }
-                const auto* session_draft = use_mtp ? &mtp.kv_state() : nullptr;
+                const auto* session_draft = use_neural ? neural->legacy_state() : nullptr;
                 strata::core::SessionFileIdentity id;
                 try {
                     if (!session_identity(id, err, [&] { blocking("fingerprint", 2u << 20); })) {
@@ -19381,8 +20000,15 @@ int main(int argc, char** argv) {
                         std::vector<strata::core::SessionKvSource> sources;
                         // the live running state comes off the device in one synchronous copy
                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, session_draft,
-                                                                         err)) {
+                        size_t capture_bytes = 0;
+                        if (use_neural && (!snapshot_bytes(view, ss, 0, 8, capture_bytes, err) ||
+                            !admit(uint64_t(capture_bytes) + (16ull << 20), err))) {
+                            refuse(err, strata::core::SessionError::memory); continue;
+                        }
+                        const bool captured = use_neural
+                            ? snapshot_save(meta, view, ss, 0, 8, err, {}, nullptr, nullptr)
+                            : strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, session_draft, err);
+                        if (!captured) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
@@ -19392,7 +20018,10 @@ int main(int argc, char** argv) {
                         wo.progress = moving;
                         wo.phase = blocking;
                         strata::core::SessionStatus st;
-                        if (!strata::core::session_file_write(path, meta, sources, id, bytes, err, wo, &st)) {
+                        const bool written = use_neural
+                            ? strata::core::session_file_write(path, meta, id, bytes, err, wo, &st)
+                            : strata::core::session_file_write(path, meta, sources, id, bytes, err, wo, &st);
+                        if (!written) {
                             refuse(err, st.error, st.published);
                             continue;
                         }
@@ -19426,8 +20055,8 @@ int main(int argc, char** argv) {
                                   ram_note(mem) + ")";
                             return false;
                         };
-                        if (!strata::core::conversation_session_read_limits(
-                                limits, ss, g, session_draft, (uint64_t) o.max_context,
+                        if (!strata::core::conversation_neural_read_limits(
+                                limits, ss, g, *neural, 8, (uint64_t) o.max_context,
                                 (uint64_t) std::max(o.prompt_cache, 1), err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -19444,9 +20073,17 @@ int main(int argc, char** argv) {
                     const double read_ms = ms();
                     // the whole image against this engine, still without any device write
                     blocking("validate", bytes);
-                    if (!strata::core::conversation_snapshot_validate(image, ss, g, session_draft, err)) {
+                    if (!snapshot_validate(image, ss, 0, err)) {
                         refuse(err);
                         continue;
+                    }
+                    if (use_neural && !neural->owner(8).request) {
+                        cur.assign(image.live.ids.begin(), image.live.ids.end());
+                        if (cur.size() >= size_t(o.max_context)) cur.resize(size_t(o.max_context - 1));
+                        strata::program::ResidentRequest restored_request;
+                        restored_request.max_new = 1;
+                        restored_request.sampling = resident.working().sampling;
+                        if (!resident.begin(-1, cur, restored_request, err)) { refuse(err); continue; }
                     }
                     // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
                     if (!kvg_ensure((int64_t) image.live.ids.size() + 256, adapt_quiesce)) {
@@ -19457,7 +20094,8 @@ int main(int argc, char** argv) {
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
-                    if (strata::core::conversation_snapshot_restore(image, ss, g, session_draft, err) !=
+                    if (snapshot_restore(image, ss, 0, int64_t(image.live.ids.size()), image.draft_next_token,
+                            strata::core::ConversationSnapshotExpectation::ordinary, err) !=
                         strata::core::ConversationRestore::restored) {
                         // validated above: a failure here is a transfer failure, after device writes began - never
                         // decode from a partial state; the server starts the engine again
@@ -19468,7 +20106,6 @@ int main(int argc, char** argv) {
                         std::fflush(stdout);
                         return 1;
                     }
-                    if (use_mtp) mtp.restored_snapshot(image, int64_t(image.live.ids.size()));
                     live = std::move(image.live.ids);
                     live_imgs = std::move(image.live.imgs);
                     checks = std::move(image.checkpoints);
@@ -19818,10 +20455,22 @@ int main(int argc, char** argv) {
             // begin() rebinds the working drafter before the outgoing live image is parked.
             // Preserve its producer's drained interval and owned boundary row together.
             strata::core::ConversationView outgoing_draft{live, live_imgs, checks, cvec_cached};
-            mtp.certify_view(outgoing_draft);
+            neural->certify_view(outgoing_draft);
             displaced_draft.emplace(outgoing_draft);
+            displaced_owner = neural->owner(8);
             if (!resident.begin(admit_slot, ids, input, err)) {
                 phase_error("ERR %s\n", err.c_str()); return 1;
+            }
+            if (dflash_capture_dir) {
+                if (parity_request_seen || max_new != 8 || admit_slot >= 0) {
+                    phase_error("ERR DFLASH2_CAPTURE_DIR requires exactly one serial eight-output request\n"); return 1;
+                }
+                parity_request_seen = true;
+            }
+            uint64_t request_bias_hash = strata::program::SessionFingerprint::basis;
+            if (use_dflash) for (float value : req_bias) {
+                uint32_t bits = 0; std::memcpy(&bits, &value, sizeof(bits));
+                request_bias_hash = strata::program::fingerprint_word(request_bias_hash, bits);
             }
             const auto& req_sp = resident.working().sampling;
             strata::program::StreamingWorkHandle streaming_work;
@@ -20013,8 +20662,7 @@ int main(int argc, char** argv) {
                 [&](auto match, const strata::core::SavedConversation& image, const ConvCheckpoint& c) {
                     std::string why;
                     if (image.stage_images.size() != stages.size() ||
-                        !strata::core::conversation_snapshot_validate(image, ss, g,
-                            use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, why)) return;
+                        !snapshot_validate(image, ss, 0, why)) return;
                     PrefixWork rewind;
                     auto rewind_part = [&](const ConvCheckpoint& part, const strata::core::SessionState& state) {
                         rewind.path(state.allocation_device, -1);
@@ -20025,8 +20673,7 @@ int main(int argc, char** argv) {
                     for (size_t i = 0; i < stages.size(); ++i) {
                         const auto& part = image.stage_images[i];
                         if (part.live.ids != image.live.ids || part.live.imgs != image.live.imgs ||
-                            !strata::core::conversation_snapshot_validate(part, stages[i]->ss, g,
-                                use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, why)) return;
+                            !snapshot_validate(part, stages[i]->ss, int(i + 1), why)) return;
                         if (!match.live) {
                             const auto cp = std::find_if(part.checkpoints.begin(), part.checkpoints.end(),
                                 [&](const ConvCheckpoint& k) { return k.ids == c.ids && k.imgs == c.imgs; });
@@ -20178,8 +20825,7 @@ int main(int argc, char** argv) {
                 constexpr auto exact = strata::core::ConversationSnapshotExpectation::exact_cut;
                 std::string why;
                 if (!incoming || incoming->stage_images.size() != stages.size()) return false;
-                if (!strata::core::conversation_snapshot_validate(*incoming, ss, g,
-                        use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, exact, why)) {
+                if (!snapshot_validate(*incoming, ss, 0, why, exact)) {
                     std::fprintf(stderr, "strata serve: conversation store: discard invalid shared snapshot (%s)\n",
                                  why.c_str());
                     return false;
@@ -20187,8 +20833,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < stages.size(); ++i) {
                     const auto& part = incoming->stage_images[i];
                     if (part.live.ids != incoming->live.ids ||
-                        !strata::core::conversation_snapshot_validate(part, stages[i]->ss, g,
-                            use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, exact, why)) {
+                        !snapshot_validate(part, stages[i]->ss, int(i + 1), why, exact)) {
                         std::fprintf(stderr, "strata serve: conversation store: discard invalid shared stage (%s)\n",
                                      why.c_str());
                         return false;
@@ -20334,8 +20979,7 @@ int main(int argc, char** argv) {
             }
             if (incoming && !selected.shared) for (size_t i = 0; i < stages.size(); ++i) {
                 const strata::core::OnDevice on(stages[i]->dev);
-                if (!strata::core::conversation_snapshot_validate(incoming->stage_images[i], stages[i]->ss, g,
-                        use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err)) {   // the draft: the last stage's
+                if (!snapshot_validate(incoming->stage_images[i], stages[i]->ss, int(i + 1), err)) {
                     std::fprintf(stderr, "strata serve: conversation cache: discard invalid stage snapshot (%s)\n",
                                  err.c_str());
                     incoming.reset();
@@ -20343,8 +20987,7 @@ int main(int argc, char** argv) {
                     break;
                 }
             }
-            if (incoming && !selected.shared && !strata::core::conversation_snapshot_validate(*incoming, ss, g,
-                    use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err)) {
+            if (incoming && !selected.shared && !snapshot_validate(*incoming, ss, 0, err)) {
                 std::fprintf(stderr, "strata serve: conversation cache: discard invalid snapshot (%s)\n", err.c_str());
                 incoming.reset();
                 err.clear();
@@ -20396,6 +21039,7 @@ int main(int argc, char** argv) {
                               // own, and it never supersedes the head that donor came from.
                               req_ckpt != 0)) {
                 displaced_draft.reset();
+                displaced_owner.reset();
                 if (strata::program::preservation_ends_serving(capture_failure())) {
                     phase_error("ERR %s\n", err.c_str());
                     return 1;
@@ -20403,6 +21047,7 @@ int main(int argc, char** argv) {
                 drop_capture("the outgoing conversation snapshot");
             }
             displaced_draft.reset();
+            displaced_owner.reset();
             // QUIT has no later request to park the last completed conversation, so the clean-shutdown seam parks it
             // itself.  Only the decision the next request would have taken is recorded: this request's own keys say
             // whether its history is continued at all (ckpt=0 is a one-shot that must neither be parked nor supersede
@@ -20475,30 +21120,31 @@ int main(int argc, char** argv) {
                 phase::Span phase_span(phase_current, phase::Stage::gpu_mount);
                 const PrefixWork restore_work = session_work(direct_cut ? parked.tokens : (int64_t) incoming->live.ids.size(), false);
                 const auto t0 = Clock::now();
-                if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
-                        use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, incoming_expectation, err,
-                        direct_cut ? incoming_cuts[0] : nullptr) !=
+                auto restore_owner = neural->owner(8);
+                if (use_neural && !neural->context_idle(err)) { phase_error("ERR %s\n", err.c_str()); return 1; }
+                const int64_t restored_cells = direct_cut ? parked.tokens : int64_t(incoming->live.ids.size());
+                const int32_t restored_next = restored_cells < int64_t(ids.size())
+                    ? int32_t(ids[size_t(restored_cells)]) : incoming->draft_next_token;
+                if (snapshot_restore(*incoming, ss, 0, int64_t(ids.size()), restored_next, incoming_expectation, err,
+                        direct_cut ? incoming_cuts[0] : nullptr, use_neural ? &restore_owner : nullptr) !=
                     strata::core::ConversationRestore::restored) {
                     // Already prevalidated above: a failure here is fatal, never
                     // permission to decode from a partially restored session.
                     phase_error("ERR restoring parked conversation: %s\n", err.c_str());
                     return 1;
                 }
+                if (use_neural && neural_snapshot_stage == 0) restore_owner = neural->owner(8);
                 for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
                     const strata::core::OnDevice on(stages[i]->dev);
-                    if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
-                            use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, incoming_expectation, err,
-                            direct_cut ? incoming_cuts[i + 1] : nullptr) !=
+                    if (snapshot_restore(incoming->stage_images[i], stages[i]->ss, int(i + 1), int64_t(ids.size()),
+                            restored_next, incoming_expectation, err, direct_cut ? incoming_cuts[i + 1] : nullptr,
+                            use_neural ? &restore_owner : nullptr) !=
                         strata::core::ConversationRestore::restored) {
                         phase_error("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
                                     err.c_str());
                         return 1;
                     }
                     if (cudaDeviceSynchronize() != cudaSuccess) { phase_error("ERR stage sync\n"); return 1; }
-                }
-                if (use_mtp) {
-                    const auto& owner = stages.empty() || mtp_first ? *incoming : incoming->stage_images.back();
-                    mtp.restored_snapshot(owner, direct_cut ? parked.tokens : int64_t(incoming->live.ids.size()));
                 }
                 if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
                     uint64_t draft_hash = 0;
@@ -20744,16 +21390,27 @@ int main(int argc, char** argv) {
             // A shared cut's draft state must be reusable with any suffix. Do not
             // skip prefix rows based on this request's longer private suffix.
             req_times = ReqTimes{};
-            const int64_t read_from = reread_to > 0 ? 0 : resume;
+            const auto draft_horizon = strata::program::draft_kv::prompt_horizon(
+                use_neural ? neural->kind() : strata::core::DraftKind::none,
+                n, resume, reread_to, req_shared_scope.valid(), req_pin, store_man2);
+            const int64_t read_from = draft_horizon.read_from;
+            if (dflash_capture_dir && read_from != 0) {
+                phase_error("ERR proposal bundle capture requires this request's fresh chronological feature ring\n"); return 1;
+            }
 #if defined(STRATA_DFLASH2_CAPTURE)
-            if (feature_capture && (read_from != 0 ||
+            if (dflash) {
+                if (!dflash->prepare_slot(8, resident.working().request, n, read_from, read_from == 0, err)) {
+                    phase_error("ERR native draft context preparation: %s\n", err.c_str()); return 1;
+                }
+            } else if (feature_capture && (read_from != 0 ||
                 !feature_capture->reset(resident.working().request, resident.working().request, 0, err))) {
                 phase_error("ERR dflash2 capture requires a fresh request: %s\n", err.c_str()); return 1;
             }
 #endif
-            if (use_mtp) mtp.set_prompt_len(req_shared_scope.valid() && read_from < req_pin ? req_pin + 1 : n);
-            if (use_mtp) mtp.set_boundary_capture(store_man2 && req_shared_scope.valid() && read_from < req_pin
-                                                   ? req_pin - 1 : -1);
+            if (use_neural) {
+                neural->set_prompt_len(draft_horizon.prompt_len);
+                neural->set_boundary_capture(draft_horizon.boundary_capture);
+            }
             conversations.limit_reuse(read_from);
             pp_total = n;
             pp_from = read_from;
@@ -20907,6 +21564,7 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 return true;
             };
+            bool batch_fatal = false;
             // tokens [a, b) through the windows: commit all of them, then give the draft layer their residuals
             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
                 phase::Span phase_span(phase_current, phase::Stage::prefill_run);
@@ -20917,7 +21575,9 @@ int main(int argc, char** argv) {
                 // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)
                 struct NoHeadSampling {
                     strata::core::Verifier& v;
-                    explicit NoHeadSampling(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
+                    explicit NoHeadSampling(strata::core::Verifier& x) : v(x) {
+                        v.set_spec_q(nullptr, 0, 0); v.set_head_sampling(false);
+                    }
                     ~NoHeadSampling() { v.set_head_sampling(true); }
                 } no_head_sampling(ver);
                 std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
@@ -20941,6 +21601,11 @@ int main(int argc, char** argv) {
                         return false;
                     }
                     if (nonfinite_hit(ver, "prompt")) {   // (its commit is not needed: the next request reads from 0)
+#if defined(STRATA_DFLASH2_CAPTURE)
+                        if (dflash && (!ver.commit(T, e) || !serial_capture_frame.finish(e, uint32_t(1) << 8))) {
+                            batch_fatal = true; return false;
+                        }
+#endif
                         e = "non-finite logits (#879)";
                         return false;
                     }
@@ -21187,7 +21852,6 @@ int main(int argc, char** argv) {
                 const char* v = std::getenv("STRATA_BATCH_DECODE_SHARE");
                 return v != nullptr ? std::max(0.0, std::atof(v)) : 0.5;
             }();
-            bool batch_fatal = false;
             int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
             double il_ms = 0;
             int64_t yielded_at = -1;   // BYIELD: the read stopped here and its slot holds it
@@ -21281,16 +21945,25 @@ int main(int argc, char** argv) {
                     ~SegPlanScope() { p = {}; }
                 } seg_plan_scope{seg_plan};
                 auto run = [&](int64_t q, int64_t r) -> bool {
-                    phase::Span phase_span(phase_current, phase::Stage::prefill_run);
-                    if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
+                    for (int64_t at = q; at < r;) {
+                        if (use_dflash && stop_req.load()) { e = "cancelled"; return false; }
+                        const int64_t end = use_dflash
+                            ? std::min(r, at + (planned ? plan.chunk : sp.chunk())) : r;
+                        phase::Span phase_span(phase_current, phase::Stage::prefill_run);
+                        if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
 #if defined(STRATA_DFLASH2_CAPTURE)
-                    if (!capture_begin(strata::core::dflash2::CapturePhase::prefill, q, r - q, e)) return false;
+                        if (!capture_begin(strata::core::dflash2::CapturePhase::prefill, at, end - at, e)) return false;
 #endif
-                    if (!sp.run(ids.data() + q, r - q, q, e)) return false;
+                        if (!sp.run(ids.data() + at, end - at, at, e)) {
+                            if (use_dflash) batch_fatal = true;
+                            return false;
+                        }
 #if defined(STRATA_DFLASH2_CAPTURE)
-                    if (!capture_finish(strata::core::dflash2::CapturePhase::prefill, e)) return false;
+                        if (!capture_finish(strata::core::dflash2::CapturePhase::prefill, e)) return false;
 #endif
-                    if (!report_stage_state("prefill", drive.d.request_generation, r, -1, e)) return false;
+                        if (!report_stage_state("prefill", drive.d.request_generation, end, -1, e)) return false;
+                        at = end;
+                    }
                     return true;
                 };
                 // (a layer split reads its stages as a pipeline over one run's chunks: beside slots a chunk at a time, with
@@ -21481,8 +22154,19 @@ int main(int argc, char** argv) {
                     for (int64_t q = a0; okay && q < b0; q += 2048) {
                         {
                             phase::Span phase_span(phase_current, phase::Stage::prefill_run);
+                            if (use_dflash && stop_req.load()) { e = "cancelled"; return false; }
+#if defined(STRATA_DFLASH2_CAPTURE)
+                            if (dflash && !capture_begin(strata::core::dflash2::CapturePhase::prefill,
+                                    q, std::min<int64_t>(2048, b0 - q), e)) return false;
+#endif
                             okay = sp.run_retained(ids.data() + q, std::min<int64_t>(2048, b0 - q), q, e, retained_step, retained_layer_yields);
                         }
+#if defined(STRATA_DFLASH2_CAPTURE)
+                            if (dflash) {
+                                if (!okay) { batch_fatal = true; return false; }
+                                if (!capture_finish(strata::core::dflash2::CapturePhase::prefill, e)) return false;
+                            }
+#endif
                         // This legacy mode retains its existing chunk handover;
                         // all retained successor calls and callbacks are serial.
                         store_seam();
@@ -21585,6 +22269,9 @@ int main(int argc, char** argv) {
                         std::atomic<bool> abort_read{false};
                         bool read_ok = true;
                         std::string read_err;
+                        // Published only by the reader; the owner loop reads these after join.
+                        bool read_fatal = false;
+                        int64_t read_reached = q0;
                         in_prompt_read = true;
                         sp.stop_at_chunk = [&] {
                             return abort_read.load(std::memory_order_acquire) ||
@@ -21593,13 +22280,48 @@ int main(int argc, char** argv) {
                         std::thread reader([&] {
                             strata::aux_cpus::place_off_host();
                             try {
-                                if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
-                                read_ok = sp.run(ids.data() + q0, b0 - q0, q0, read_err);
+#if defined(STRATA_DFLASH2_CAPTURE)
+                                if (dflash) {
+                                    strata::program::dflash2_serving::CaptureFrame frame;
+                                    bind_capture_frame(frame, capture_verifiers);
+                                    const int64_t chunk = planned ? plan.chunk : sp.chunk();
+                                    while (read_reached < b0) {
+                                        if (stop_req.load()) {
+                                            read_ok = false; read_err = "cancelled"; break;
+                                        }
+                                        if (abort_read.load(std::memory_order_acquire) ||
+                                            (read_reached > q0 && want_yield.load(std::memory_order_acquire) >= 0))
+                                            break;
+                                        const int64_t end = std::min(b0, read_reached + chunk);
+                                        sp.force_chunk(chunk, planned ? plan_single : b0 - q0 <= chunk,
+                                                       planned && plan.chunked);
+                                        // reserve_inputs takes/releases the existing neural scratch lease.
+                                        // The pending owner defers STOP until this exact chunk drains;
+                                        // no common lease is held while its target stages run.
+                                        if (!frame.begin(strata::core::dflash2::CapturePhase::prefill, 8,
+                                                read_reached, end - read_reached, read_err) ||
+                                            !sp.run(ids.data() + read_reached, end - read_reached,
+                                                    read_reached, read_err) ||
+                                            !frame.finish(read_err)) {
+                                            read_ok = false; read_fatal = true; break;
+                                        }
+                                        // run() drained every stage; finish() transferred all five taps,
+                                        // published/projected under NeuralDrafter::Operation, then released them.
+                                        read_reached = end;
+                                    }
+                                } else
+#endif
+                                {
+                                    if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
+                                    read_ok = sp.run(ids.data() + q0, b0 - q0, q0, read_err);
+                                }
                             } catch (const std::exception& x) {
                                 read_ok = false;
+                                read_fatal = use_dflash;
                                 read_err = std::string("the prompt read failed: ") + x.what();
                             } catch (...) {
                                 read_ok = false;
+                                read_fatal = use_dflash;
                                 read_err = "the prompt read failed";
                             }
                             done.store(true, std::memory_order_release);
@@ -21680,7 +22402,16 @@ int main(int argc, char** argv) {
                             e = err.empty() ? "a pipelined batch window failed" : err;
                             return false;
                         }
-                        const int64_t q = read_ok && sp.stopped_at() >= 0 ? q0 + sp.stopped_at() : b0;
+                        const int64_t q = use_dflash ? read_reached :
+                            read_ok && sp.stopped_at() >= 0 ? q0 + sp.stopped_at() : b0;
+                        if (use_dflash) {
+                            if (read_fatal) batch_fatal = true;
+                            else {
+                                // Even a zero-work STOP has an exact drained native frontier.
+                                pp_reached = q;
+                                pp_exact = true;
+                            }
+                        }
                         const double read_ms = std::chrono::duration<double, std::milli>(Clock::now() - tc).count();
                         std::string per;
                         for (int k = 0; k < n_pipe; ++k) {
@@ -21792,8 +22523,19 @@ int main(int argc, char** argv) {
                             // Receipts remain inclusive host spans. Only the
                             // scheduler below subtracts synchronous decode work.
                             phase::Span phase_span(phase_current, phase::Stage::prefill_run);
+                            if (use_dflash && stop_req.load()) { e = "cancelled"; return false; }
+#if defined(STRATA_DFLASH2_CAPTURE)
+                            if (dflash && !capture_begin(strata::core::dflash2::CapturePhase::prefill, q, r - q, e))
+                                return false;
+#endif
                             prefill_okay = sp.run_retained(ids.data() + q, r - q, q, e, retained_step, false);
                         }
+#if defined(STRATA_DFLASH2_CAPTURE)
+                            if (dflash) {
+                                if (!prefill_okay) { batch_fatal = true; return false; }
+                                if (!capture_finish(strata::core::dflash2::CapturePhase::prefill, e)) return false;
+                            }
+#endif
                         if (!prefill_okay) { prefill_error = e; e.clear(); }
                         // A local stage release is not a publication/snapshot
                         // fence. Close every remaining consumer, even on STOP
@@ -21895,7 +22637,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             strata::program::apply_request_sampling(resident.working(), ver,
-                pipe || batch_mtp_pipeline ? &ver_b : nullptr, use_mtp ? &mtp : nullptr);
+                pipe || batch_mtp_pipeline ? &ver_b : nullptr, use_neural ? neural : nullptr);
             {   // aux_cpus=0|1: where the non-pool, non-host threads run for this request (-1 = the start-up --aux-cpus); moves
                 // threads only.  An enabled placement is swept at every request: it catches threads created since.
                 static const bool aux_start = strata::aux_cpus::enabled();
@@ -22081,8 +22823,8 @@ int main(int argc, char** argv) {
                     strata::core::ConversationStoreSelector selector = store_selector_base;
                     selector.scope = req_shared_scope;
                     selector.cvec = want_cvec;
-                    const auto certified = mtp.completed_coverage();
-                    if (use_mtp && (!certified.known() || certified.cells < pin_at - 1)) {
+                    const auto certified = neural->completed_coverage();
+                    if (use_neural && (!certified.known() || certified.cells < pin_at - (use_dflash ? 0 : 1))) {
                         std::fprintf(stderr, "strata serve: conversation store: skip shared prefix publication "
                                              "(pin=%lld; no completed contiguous draft interval)\n", (long long) pin_at);
                     } else if (!strata::program::ConversationPublicationQueue::shared_prefix_exists(
@@ -22107,7 +22849,7 @@ int main(int argc, char** argv) {
                             drop_capture("the exact shared prefix");
                         }
                     }
-                    if (use_mtp) mtp.set_prompt_len(n);
+                    if (use_neural) neural->set_prompt_len(n);
                 }
                 if (trace && to == message_at)
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
@@ -22163,6 +22905,8 @@ int main(int argc, char** argv) {
             const size_t WS = (size_t) std::max(S, merge_T);
             std::vector<int32_t> drafts(DS, 0), window(WS), outv(WS);
             std::vector<float> dprob(DS, 0.0f);
+            strata::core::DraftProposal serial_proposal;
+            int64_t discarded_target_frontier = -1;
             std::vector<int32_t> sbuf((size_t) S, 0);
             policy = strata::spec::DraftPolicy(S);
             if (o.suffix_draft > 0 || o.lookup_chain > 0) {
@@ -22875,11 +23619,10 @@ int main(int argc, char** argv) {
                 }
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {
-                int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
-                if (use_mtp && req_spec_min_p > 0.0) {
-                    T = 1;
-                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
-                }
+                const bool sampled_request = !req_sp.greedy && req_sp.temperature > 0;
+                int T = !use_neural ? 1 : strata::spec::neural_window_width(dprob.data(),
+                    use_dflash ? serial_proposal.count : S_mtp - 1, S_mtp,
+                    float(req_spec_min_p), sampled_request);
                 if (first_window) T = merge_T > 0 ? merge_T : 1;
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
@@ -22891,8 +23634,8 @@ int main(int argc, char** argv) {
                     const int k = sfx.propose(S - 1, sbuf.data());
                     lookup_proposed = k;
                     sfx_match = sfx.last_match();
-                    if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
-                        const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
+                    if (k > 0 && strata::spec::lookup_competes(sampled_request, use_neural, sbuf[0], drafts[0])) {
+                        const strata::spec::DraftPolicy::Pick pk = policy.choose(sampled_request ? S_mtp : T, k, sfx_match);
                         if (pk.lookup) { T = pk.t; from_sfx = true; }
                     }
                 }
@@ -22914,8 +23657,14 @@ int main(int argc, char** argv) {
                         chain_n = policy.chain(T, p_mtp, chain_n, cm);
                     }
                 }
-                const int T_mtp = T;
+                int T_mtp = T;
                 T += chain_n;
+                if (use_dflash && !merged) {
+                    T = int(std::min<int64_t>(T, std::min<int64_t>(max_new - produced_n, o.max_context - p)));
+                    if (T < 1) break;
+                    T_mtp = std::min(T_mtp, T);
+                    chain_n = T - T_mtp;
+                }
                 const bool timed_round = !first_window;
                 const Clock::time_point round0 = Clock::now();
                 if (p + T > o.max_context) break;
@@ -23014,8 +23763,21 @@ int main(int argc, char** argv) {
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
                 // Lookup and corrupted windows use point-mass/exact-match verification, as in CLI generate.
                 // Unchanged MTP q must never judge a modified draft token.
+                ver.set_spec_q(nullptr, 0, 0);
+#if defined(STRATA_DFLASH2_CAPTURE)
+                if (dflash && !from_sfx && !first_window && T_mtp > 1) {
+                    const bool sampled = !req_sp.greedy && req_sp.temperature > 0;
+                    if (serial_proposal.frontier != p || serial_proposal.owner != neural->owner(8) ||
+                        serial_proposal.count < T_mtp - 1 ||
+                        (sampled && serial_proposal.distribution !=
+                            strata::core::DraftProposal::Distribution::conditional_q)) {
+                        phase_error("ERR native proposal owner/frontier/conditional-q mismatch\n"); return 1;
+                    }
+                    if (sampled) ver.set_spec_q(serial_proposal.probability_rows(), T_mtp - 1, T_mtp - 1);
+                }
+#endif
                 if (use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1 && o.spec_corrupt <= 0)
-                    ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                    ver.set_spec_q(mtp.spec_q(), T_mtp - 1, 0);
 #if defined(STRATA_DFLASH2_CAPTURE)
                 // Prefill stops at n-1 EXCLUSIVE. Bootstrap at n-1 is a new
                 // committed INPUT row, not a duplicate of the prompt capture.
@@ -23052,6 +23814,13 @@ int main(int argc, char** argv) {
                     }
                 const int emit_begin = merged ? keep - 1 : 0;
                 const int emit_rows = keep - emit_begin;
+#if defined(STRATA_DFLASH2_CAPTURE)
+                if (dflash) strata::program::dflash2_serving::log_window(neural->owner(8), p,
+                    {window.data(), size_t(T)}, a, keep, max_new - produced_n, req_sp,
+                    uint64_t(consumed.size()), request_bias_hash, o.eos_ids,
+                    from_sfx ? "lookup" : chain_n ? "neural+lookup" : "neural",
+                    from_sfx || first_window ? 0 : T_mtp - 1);
+#endif
                 lookup_positions += T;
                 if (lookup_trace)
                     std::fprintf(stderr, "LOOKUP_ROUND request=%llu position=%lld history=%zu match=%d proposed=%d "
@@ -23063,7 +23832,7 @@ int main(int argc, char** argv) {
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (!from_sfx && !first_window)
                     for (int d = 0; d < T_mtp - 1 && d < 8 && d <= a; ++d) { ++dp_tested[d]; dp_ok[d] += d < a; }
-                if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
+                if (use_mtp && strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
                     ++t2_rej[a];
                     if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
                 }
@@ -23079,6 +23848,12 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 if (nonfinite_hit(ver, first_window ? "first decode" : "decode")) {   // #879: none of its tokens goes out
+#if defined(STRATA_DFLASH2_CAPTURE)
+                    if (dflash && !serial_capture_frame.finish(err, uint32_t(1) << 8)) {
+                        if (adapt_thr.joinable()) adapt_thr.join();
+                        phase_error("ERR %s\n", err.c_str()); return 1;
+                    }
+#endif
                     if (adapt_thr.joinable()) adapt_thr.join();
                     if (!adapt_ok) {
                         phase_error("ERR an adaptive refill failed\n");
@@ -23087,6 +23862,17 @@ int main(int argc, char** argv) {
                     finish = "nonfinite";
                     break;
                 }
+#if defined(STRATA_DFLASH2_CAPTURE)
+                if (dflash && stop_req.load()) {
+                    if (!serial_capture_frame.finish(err, uint32_t(1) << 8)) {
+                        if (adapt_thr.joinable()) adapt_thr.join();
+                        phase_error("ERR %s\n", err.c_str()); return 1;
+                    }
+                    neural->invalidate_slot_coverage(8);
+                    if (adapt_thr.joinable()) adapt_thr.join();
+                    discarded_target_frontier = p + keep; live_ok = false; finish = "cancel"; break;
+                }
+#endif
 #if defined(STRATA_DFLASH2_CAPTURE)
                 if (!capture_finish(strata::core::dflash2::CapturePhase::verify, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
@@ -23183,10 +23969,11 @@ int main(int argc, char** argv) {
                 // Terminal windows still populate their committed draft KV before
                 // admission/snapshot. Previously this left another request's cells.
                 const bool terminal = eos || produced_n >= max_new || stop_req.load();
-                const bool drafted = !use_mtp ? true : terminal
+                bool drafted = !use_mtp ? true : terminal
                     ? mtp.prefill(merged ? ver.final_R(keep - 1) : ver.final_R_all(),
                                   outv.data() + emit_begin, emit_rows, p + emit_begin, err)
-                    : mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                    : mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(),
+                        sampled_request ? 0.0f : float(req_spec_min_p));
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -23213,7 +24000,7 @@ int main(int argc, char** argv) {
                 }
                 if (T > keep && std::getenv("STRATA_STATE_HASH")) {
                     strata::program::SessionFingerprint h;
-                    if (!ver.wait_commit(err) || !strata::program::session_fingerprint(ss, mtp.kv_state(), g, p + keep, h, err)) {
+                    if (!ver.wait_commit(err) || !fingerprint_neural(ss, 8, p + keep, h, err)) {
                         phase_error("ERR %s\n", err.c_str()); return 1;
                     }
                     std::fprintf(stderr, "strata serve: STATE_ROLLBACK request=%llu cells=%lld window=%d keep=%d accepted=%d "
@@ -23222,6 +24009,23 @@ int main(int argc, char** argv) {
                                  (unsigned long long) h.gdn, (unsigned long long) strata::program::fingerprint_ple(h, ss),
                                  (unsigned long long) strata::program::fingerprint_kv(h), (unsigned long long) h.draft);
                 }
+#if defined(STRATA_DFLASH2_CAPTURE)
+                if (dflash) {
+                    const auto draft_started = Clock::now();
+                    serial_proposal.clear();
+                    if (!terminal && S_mtp > 1 && max_new - produced_n > 1 &&
+                        o.max_context - (p + keep) > 1 && p + keep <= strata::core::dflash2::max_position - 4) {
+                        drafted = prepare_native_uniforms(8, p + keep, req_sp, err) &&
+                            neural->propose_slot(8, nullptr, outv[size_t(keep - 1)], p + keep - 1, serial_proposal, err);
+                        if (drafted) {
+                            std::copy_n(serial_proposal.tokens.data(), serial_proposal.count, drafts.data());
+                            std::copy_n(serial_proposal.confidence.data(), serial_proposal.count, dprob.data());
+                        }
+                    }
+                    dt_draft += std::chrono::duration<double, std::milli>(Clock::now() - draft_started).count();
+                }
+#endif
+                if (!drafted) { phase_error("ERR %s\n", err.c_str()); return 1; }
                 if (timed_round && !eos && chain_n == 0)
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
@@ -23263,14 +24067,14 @@ int main(int argc, char** argv) {
                 }
             }
             if (drive.d.fs) std::fprintf(stderr, "strata serve: %s\n", drive.d.fs->report().c_str());
-            if (!cancelled) {
+            if (!cancelled && discarded_target_frontier < 0) {
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
                 // (the checkpoints taken while reading it are still good)
                 live.swap(consumed);
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
                 live_ok = o.prompt_cache > 0 && req_ckpt;   // ckpt=0: nothing to continue or park (#830)
                 if (nf_hit) live_ok = false;   // #879 (the next request's start drops the rest)
-            } else if (!nf_hit && pp_exact && pp_reached > 0 && o.prompt_cache > 0 && req_ckpt &&
+            } else if (discarded_target_frontier < 0 && !nf_hit && pp_exact && pp_reached > 0 && o.prompt_cache > 0 && req_ckpt &&
                        pp_reached <= (int64_t) cur.size()) {
                 // #1620: stopped between two windows (or before the first token was read): the session is exactly at
                 // pp_reached, so it stays the live conversation - the next request continues from it or parks it.
@@ -23294,7 +24098,7 @@ int main(int argc, char** argv) {
             if (state_hash && live_ok) {
                 strata::program::SessionFingerprint h;
                 const int64_t L = (int64_t) live.size();
-                if (!strata::program::session_fingerprint(ss, mtp.kv_state(), g, L, h, err, last_committed_residual)) {
+                if (!fingerprint_neural(ss, 8, L, h, err, last_committed_residual)) {
                     phase_error("ERR %s\n", err.c_str()); return 1;
                 }
                 std::fprintf(stderr, "strata serve: STATE_HASH L=%lld gdn=%016llx ple=%016llx tail=%016llx pooled=%016llx "
@@ -23341,11 +24145,12 @@ int main(int argc, char** argv) {
                 }
                 for (int stage = 0; stage < n_stages; ++stage)
                     if (!stage_ver(stage).context_idle(err)) { phase_error("ERR %s\n", err.c_str()); return 1; }
-                if (!sp.context_idle(err) || !mtp.context_idle(err)) {
+                if (!sp.context_idle(err) || !neural->context_idle(err)) {
                     phase_error("ERR %s\n", err.c_str()); return 1;
                 }
                 strata::program::StreamingDrainReceipt drained{
-                    streaming_work, cancelled ? std::max(at, pp_reached) : p, produced_n};
+                    streaming_work, discarded_target_frontier >= 0 ? discarded_target_frontier :
+                        cancelled ? std::max(at, pp_reached) : p, produced_n};
                 drained.verifier = drained.prefill_chain = drained.draft = drained.experts = true;
                 // This selected profile has no adaptive/peer/helper/pipeline transfer owner;
                 // verifier and recursive prefill idle checks cover its source/stager/GPU readers.
@@ -23402,6 +24207,9 @@ int main(int argc, char** argv) {
                     if (!resident.admit(admit_slot, live, request, err)) {
                         std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                         phase_error("ERR %s\n", err.c_str()); return 1;
+                    }
+                    if (use_dflash && !resident_propose(admit_slot, last_committed_residual, err)) {
+                        phase_error("ERR native resident proposal: %s\n", err.c_str()); return 1;
                     }
                     if (phase_receipts) {
                         store_owner(kResidentOwnerFirst + uint64_t(admit_slot)).phase_producer =
@@ -24466,7 +25274,8 @@ int main(int argc, char** argv) {
         // generated token and the MTP's first cell); otherwise the token loop already did that.
         bool first_window = native_pack;
         if (use_mtp && !first_window &&
-            !mtp.draft_first(o.spec, ss.R, x, p - 1, drafts.data(), err, dprob.data(), (float) o.spec_min_p)) {
+            !mtp.draft_first(o.spec, ss.R, x, p - 1, drafts.data(), err, dprob.data(),
+                !sp.greedy && sp.temperature > 0 ? 0.0f : float(o.spec_min_p))) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -24508,11 +25317,9 @@ int main(int argc, char** argv) {
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
         while ((int64_t) produced.size() < max_new) {
             const Clock::time_point t0 = Clock::now();
-            int T = S_mtp;
-            if (use_mtp && o.spec_min_p > 0.0) {
-                T = 1;
-                while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
-            }
+            const bool sampled_request = !sp.greedy && sp.temperature > 0;
+            int T = use_mtp ? strata::spec::neural_window_width(dprob.data(), S_mtp - 1, S_mtp,
+                float(o.spec_min_p), sampled_request) : S_mtp;
             if (first_window) T = 1;
             bool from_sfx = false;
             int sfx_match = 0, lookup_proposed = 0;
@@ -24521,8 +25328,8 @@ int main(int argc, char** argv) {
                 const int k = sfx.propose(o.spec - 1, sbuf.data());
                 lookup_proposed = k;
                 sfx_match = sfx.last_match();
-                if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
-                    const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
+                if (k > 0 && strata::spec::lookup_competes(sampled_request, use_mtp, sbuf[0], drafts[0])) {
+                    const strata::spec::DraftPolicy::Pick pk = policy.choose(sampled_request ? S_mtp : T, k, sfx_match);
                     if (pk.lookup) { T = pk.t; from_sfx = true; }
                 }
             }
@@ -24573,7 +25380,8 @@ int main(int argc, char** argv) {
             // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
             if (adapt_nowait()) apply_pending(false);
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
-            if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+            ver.set_spec_q(nullptr, 0, 0);
+            if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1, 0);
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
@@ -24691,7 +25499,8 @@ int main(int argc, char** argv) {
                 break;
             }
             const bool drafted = !use_mtp || (int64_t) produced.size() >= max_new ||
-                                 mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+                                 mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(),
+                                     sampled_request ? 0.0f : float(o.spec_min_p));
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
             if (!drafted) {

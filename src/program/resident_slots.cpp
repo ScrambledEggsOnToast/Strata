@@ -1,7 +1,7 @@
 #include "strata/program/resident_slots.hpp"
 #include "strata/program/session_fingerprint.hpp"
 #include "strata/core/expert_source.hpp"
-#include "strata/core/mtp.hpp"
+#include "strata/core/neural_drafter.hpp"
 #include "strata/core/admission_copy_observer.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/resident_memory.hpp"
@@ -19,7 +19,7 @@ static_assert(sizeof(ResidentSlot) + sizeof(core::SessionOwner) <= plan::kReside
               "resident metadata must fit the existing admission envelope");
 
 ResidentSlots::ResidentSlots(const core::ModelGeometry& geometry, std::vector<ResidentStage> stages,
-                             core::MtpDrafter& draft, prefill::Prefill& prompt, core::ExpertDispatch& dispatch,
+                             core::NeuralDrafter& draft, prefill::Prefill& prompt, core::ExpertDispatch& dispatch,
                              int64_t context, bool cache, int64_t checkpoint_chain_limit, uint64_t checkpoint_byte_limit)
     : geometry_(geometry), stages_(std::move(stages)), draft_(draft), prompt_(prompt), dispatch_(dispatch),
       slots_(stages_.empty() ? 0 : stages_[0].slots.size()), context_(context), preparations_(slots_.size()),
@@ -206,23 +206,21 @@ ContinuationCertificate ResidentSlots::certify_continuation(int slot, const core
     in.has_stages = std::all_of(stages_.begin(), stages_.end(), [slot](const ResidentStage& stage) {
         return (size_t) slot < stage.slots.size() && stage.slots[(size_t) slot] != nullptr;
     });
-    const auto* draft = draft_.kv_state().max_cells > 0 ? draft_.slot_state(slot) : nullptr;
-    if (draft && draft_.slots_[(size_t) slot].certified) {
-        const auto& chain = draft_.slots_[(size_t) slot];
+    const auto chain = draft_.slot_coverage(slot);
+    if (draft_.enabled() && chain.present) {
         const int64_t cells = cut ? int64_t(cut->ids.size()) : in.committed_tokens;
         const int64_t frontier = draft_.slot_resume_frontier(slot, cells);
-        // A malformed present certificate is not an absent optional draft.
         in.draft_present = true;
-        in.draft_request = chain.request;
-        in.draft_shape_valid = chain.completed_cells <= chain.cells && chain.cells <= draft->max_cells &&
-            chain.completed_cells <= in.committed_tokens;
-        in.draft_begin = chain.begin;
-        in.draft_end = chain.completed_cells;
+        in.draft_request = chain.owner.request;
+        in.draft_incarnation = chain.owner.incarnation;
+        in.draft_shape_valid = chain.coherent && chain.certified_end <= in.committed_tokens;
+        in.draft_begin = chain.certified_begin; in.draft_end = chain.certified_end;
         in.draft_frontier = frontier;
-        in.draft_boundary = frontier >= 0 && frontier < chain.completed_cells &&
-            frontier < in.committed_tokens ? state.ids[(size_t) frontier] : chain.tail_token;
+        in.draft_kind = draft_.kind(); in.draft_origin = draft_.origin(slot);
+        in.draft_boundary = frontier >= 0 && frontier < chain.certified_end &&
+            frontier < in.committed_tokens ? state.ids[size_t(frontier)] : chain.next_token;
         in.token_at_frontier = frontier >= 0 && frontier < in.committed_tokens
-            ? state.ids[(size_t) frontier] : in.draft_boundary;
+            ? state.ids[size_t(frontier)] : in.draft_boundary;
     }
     ContinuationCertificate certificate = ::strata::program::certify_continuation(in);
     if (std::getenv("STRATA_CONTINUATION_TRACE"))
@@ -236,25 +234,22 @@ ContinuationCertificate ResidentSlots::certify_continuation(int slot, const core
 }
 
 void ResidentSlots::inject_absent_draft(int slot) {
-    if (!draft_.slot_state(slot)) return;
-    auto& chain = draft_.slots_[(size_t) slot];
-    chain.certified = false;
-    chain.begin = chain.completed_cells = -1;
-    chain.tail_token = -1;
+    draft_.invalidate_slot_coverage(slot);
 }
 
 template<class Token>
 bool ResidentSlots::draft_ready(int slot, const core::ConversationCheckpoint* cut,
         const std::vector<Token>& tokens, uint64_t expected_request, uint64_t expected_incarnation,
         std::string& error) const {
-    if (draft_.kv_state().max_cells <= 0) return true; // unchanged no-MTP configuration
+    if (!draft_.enabled()) return true; // unchanged no-MTP configuration
     const auto certificate = certify_continuation(slot, cut, expected_request, expected_incarnation);
     uint64_t row_bytes = 0;
     if (geometry_.hc > 0 && geometry_.n_embd > 0 &&
         uint64_t(geometry_.hc) <= UINT64_MAX / sizeof(float) / uint64_t(geometry_.n_embd))
         row_bytes = uint64_t(geometry_.hc) * uint64_t(geometry_.n_embd) * sizeof(float);
-    auto decision = decide_draft_readiness(certificate, int64_t(tokens.size()), draft_.window_, row_bytes);
-    if (decision.ready && certificate.draft_frontier > certificate.draft_begin) {
+    auto decision = decide_draft_readiness(certificate, int64_t(tokens.size()), draft_.window(), row_bytes);
+    if (decision.ready && draft_.kind() == core::DraftKind::mtp &&
+        certificate.draft_frontier > certificate.draft_begin) {
         const auto& source = slots_[(size_t) slot];
         const int64_t frontier = certificate.draft_frontier;
         const int32_t boundary = frontier < int64_t(source.ids.size())
@@ -357,7 +352,7 @@ bool ResidentSlots::slot_idle(int slot, std::string& error) {
     }
     // A pipelined operation for other rows may continue. Its snapshots don't
     // borrow this slot's history and its stage reports no consumer for this row.
-    return draft_.scratch_idle(error, true);
+    return draft_.slot_idle(slot, error, true);
 }
 
 bool ResidentSlots::init_resources(std::string& error) {
@@ -384,12 +379,9 @@ bool ResidentSlots::init_resources(std::string& error) {
     for (size_t b = 0; b < slots_.size(); ++b) {
         const auto& slot = slots_[b];
         if (!slot.request || slot.failed) continue;
-        if (!stages_[0].verifier->set_slot_context((int) b, slot.request, slot.sampling,
-                                                  &slot.ids, slot.cvec, error) ||
-            (stages_[0].batch_peer && !stages_[0].batch_peer->set_slot_context((int) b, slot.request,
-                                                  slot.sampling, &slot.ids, slot.cvec, error)) ||
-            (stages_[0].batch_third && !stages_[0].batch_third->set_slot_context((int)b, slot.request,
-                                                  slot.sampling, &slot.ids, slot.cvec, error))) {
+        if (!stages_[0].verifier->set_slot_context((int) b, slot.request, slot.sampling, &slot.ids, slot.cvec, error, slots_[size_t((int) b)].incarnation) ||
+            (stages_[0].batch_peer && !stages_[0].batch_peer->set_slot_context((int) b, slot.request, slot.sampling, &slot.ids, slot.cvec, error, slots_[size_t((int) b)].incarnation)) ||
+            (stages_[0].batch_third && !stages_[0].batch_third->set_slot_context((int)b, slot.request, slot.sampling, &slot.ids, slot.cvec, error, slots_[size_t((int)b)].incarnation))) {
             resources_ = Resources::failed; return false;
         }
     }
@@ -422,6 +414,8 @@ void ResidentSlots::residency(const char* phase, int slot) const {
 
 void ResidentSlots::retire(int slot) {
     auto& state = slots_[(size_t) slot];
+    std::string error;
+    if (!draft_.release_identity(slot, state.request, state.incarnation, error)) std::terminate();
     if (state.active || state.failed) residency("failure", slot);
     residency("release", slot);
     state.request = 0;
@@ -527,16 +521,19 @@ bool ResidentSlots::validate_source(const core::SavedConversation& image, const 
         (!image.scope.matches(request.scope) && !(request.pin > 0 && image.scope.matches(request.shared_scope)))) {
         error = "resident preparation: snapshot stage, steering or authorization mismatch"; return false;
     }
-    const bool mtp = draft_.kv_state().max_cells > 0;
+    const bool mtp = draft_.enabled();
     for (size_t stage = 0; stage < stages_.size(); ++stage) {
         const auto& part = preparation_stage(image, stage);
-        const auto* draft = mtp && stage + 1 == stages_.size() ? draft_.slot_state(slot) : nullptr;
+        const auto* draft = mtp && stage + 1 == stages_.size() ? draft_.legacy_state(slot) : nullptr;
         if (stage && (!part.stage_images.empty() || part.live.ids != image.live.ids ||
                       part.live.imgs != image.live.imgs || part.cvec != image.cvec)) {
             error = "resident preparation: snapshot stages describe different owners"; return false;
         }
-        if (!core::conversation_snapshot_validate(part, *stages_[stage].slots[(size_t) slot],
-                                                 geometry_, draft, expectation, error)) return false;
+        if (mtp && stage + 1 == stages_.size()) {
+            if (!core::conversation_neural_validate(part, *stages_[stage].slots[size_t(slot)],
+                    geometry_, draft_, slot, expectation, error)) return false;
+        } else if (!core::conversation_snapshot_validate(part, *stages_[stage].slots[size_t(slot)],
+                    geometry_, draft, expectation, error)) return false;
     }
     // Neither page-rounded payloads nor the live token count certify skipped
     // draft rows. Source certification is supplied by the capture/store owner;
@@ -552,13 +549,17 @@ bool ResidentSlots::validate_source(const core::SavedConversation& image, const 
     }
     const auto eligible = [&](const core::ConversationCheckpoint& candidate) {
         const int64_t cells = (int64_t) candidate.ids.size();
-        const int64_t needed = mtp && draft_.window_ > 0 ?
-            std::max<int64_t>(0, (int64_t) tokens.size() - draft_.window_) : 0;
-        const bool catchup = mtp && cells == live && draft_limit == live - 1 &&
-                             !last.draft_boundary_residual.empty();
+        const int64_t needed = draft_.kind() == core::DraftKind::dflash2
+            ? std::max(last.draft_origin, cells - int64_t(2047))
+            : mtp && draft_.window() > 0 ?
+                std::max<int64_t>(0, int64_t(tokens.size()) - draft_.window()) : 0;
+        const bool catchup = mtp && draft_.kind() == core::DraftKind::mtp && cells == live &&
+                             draft_limit == live - 1 && !last.draft_boundary_residual.empty();
         if (!preparation_prefix(candidate, tokens, selected_limit) || (cells > draft_limit && !catchup) ||
             (mtp && std::min(draft_begin, cells) > needed)) return false;
         if (catchup) return true; // destination tokenN is consumed only after its one-row catchup
+        if (draft_.kind() == core::DraftKind::dflash2)
+            return last.draft_begin == needed && cells >= last.draft_begin;
         if (!mtp || draft_begin >= cells) return true; // an empty interval owes no boundary token
         const int32_t boundary = cells < live ? image.live.ids[(size_t) cells] : last.draft_next_token;
         return boundary >= 0 && boundary == tokens[(size_t) cells];
@@ -671,9 +672,10 @@ bool ResidentSlots::reserve(const ResidentPrepareInput* inputs, int count, Resid
             } else if (input.cut) {
                 error = "resident preparation: snapshot cut without source"; return false;
             } else if (state.reusable(input.request.scope, input.request.steering) && !state.tainted) {
-                const bool mtp = draft_.kv_state().max_cells > 0;
+                const bool mtp = draft_.enabled();
                 const auto boundary_matches = [&](int64_t cells) {
-                    if (!mtp || draft_.slot_begin(input.slot) >= cells) return true;
+                    if (!mtp || draft_.kind() != core::DraftKind::mtp ||
+                        draft_.slot_begin(input.slot) >= cells) return true;
                     const int32_t boundary = cells < (int64_t) state.ids.size() ? state.ids[(size_t) cells] :
                         draft_.slot_next_token(input.slot);
                     return boundary >= 0 && boundary == (*input.tokens)[(size_t) cells];
@@ -690,7 +692,8 @@ bool ResidentSlots::reserve(const ResidentPrepareInput* inputs, int count, Resid
                         boundary_matches((int64_t) cut.ids.size()))
                         position = (int64_t) cut.ids.size();
                 source.retained = position > 0;
-                if (mtp && position > draft_.slot_begin(input.slot)) source.tail_token = (int32_t) (*input.tokens)[(size_t) position];
+                if (mtp && draft_.kind() == core::DraftKind::mtp &&
+                    position > draft_.slot_begin(input.slot)) source.tail_token = int32_t((*input.tokens)[size_t(position)]);
                 if (!select_checkpoints(state.checks, *input.tokens, position, input.slot,
                                         selected[(size_t) index], error)) return false;
                 if (position && position != (int64_t) state.ids.size()) {
@@ -724,7 +727,7 @@ bool ResidentSlots::reserve(const ResidentPrepareInput* inputs, int count, Resid
         state.foreground = true;
         state.cvec = input.request.steering; state.img = false;
         state.p = position; state.produced = 0; state.max_new = input.request.max_new;
-        state.x = 0; state.draft = -1; state.original_slot = input.slot;
+        state.x = 0; state.proposal.clear(); state.original_slot = input.slot;
         state.partial_from0 = false; state.prefill_split_until = 0; state.prefill_plan = {};
         state.t0 = Clock::now();
         preparations_[(size_t) input.slot] = sources[(size_t) index];
@@ -780,51 +783,28 @@ bool ResidentSlots::prepare(const ResidentPreparation& lease, const core::SavedC
     source.mutated = touched_ = true;
     state.failed = true;
     dispatch_.slot_requests[lease.slot] = lease.request;
-    if (!stages_[0].verifier->set_slot_context(lease.slot, lease.request, state.sampling, &state.ids, state.cvec, error) ||
-        (stages_[0].batch_peer && !stages_[0].batch_peer->set_slot_context(lease.slot, lease.request,
-                                                  state.sampling, &state.ids, state.cvec, error)) ||
-        (stages_[0].batch_third && !stages_[0].batch_third->set_slot_context(lease.slot, lease.request,
-                                                  state.sampling, &state.ids, state.cvec, error)) ||
+    if (!stages_[0].verifier->set_slot_context(lease.slot, lease.request, state.sampling, &state.ids, state.cvec, error, slots_[size_t(lease.slot)].incarnation) ||
+        (stages_[0].batch_peer && !stages_[0].batch_peer->set_slot_context(lease.slot, lease.request, state.sampling, &state.ids, state.cvec, error, slots_[size_t(lease.slot)].incarnation)) ||
+        (stages_[0].batch_third && !stages_[0].batch_third->set_slot_context(lease.slot, lease.request, state.sampling, &state.ids, state.cvec, error, slots_[size_t(lease.slot)].incarnation)) ||
         !prompt_.bind_owner(lease.slot, lease.request, lease.incarnation, lease.stages, error) ||
-        !draft_.bind_request(lease.slot, lease.request, error)) return fail(lease.slot);
+        !draft_.bind_request(lease.slot, lease.request, error, lease.incarnation) ||
+        !draft_.set_slot_sampling(lease.slot, state.sampling, error)) return fail(lease.slot);
     try {
-        const bool mtp = draft_.kv_state().max_cells > 0;
+        const bool mtp = draft_.enabled();
         if (source.image && position > 0) {
-            std::optional<core::MtpDrafter::Operation> operation;
-            if (mtp) {
-                const core::OnDevice on(draft_.device());
-                operation.emplace(draft_, error, lease.slot);
-                if (!*operation) return fail(lease.slot);
-            }
             for (size_t stage = 0; stage < stages_.size(); ++stage) {
                 const auto& image = preparation_stage(*source.image, stage);
                 const auto* part = preparation_stage_cut(*source.image, *source.cut, stage, stages_.size());
-                const auto* draft = mtp && stage + 1 == stages_.size() ? draft_.slot_state(lease.slot) : nullptr;
+                const auto* draft = mtp && stage + 1 == stages_.size() ? draft_.legacy_state(lease.slot) : nullptr;
                 const core::OnDevice on(stages_[stage].device);
-                if (!part || core::conversation_snapshot_restore(image, *lease.stages[stage], geometry_,
-                        draft, source.expectation, error, part == &image.live ? nullptr : part) !=
-                            core::ConversationRestore::restored) return fail(lease.slot);
-            }
-            if (mtp) {
-                const core::OnDevice on(draft_.device());
-                if (!operation->finish(error)) return fail(lease.slot);
-                auto& target = draft_.slots_[(size_t) lease.slot];
-                const auto& last = preparation_stage(*source.image, stages_.size() - 1);
-                target.cells = std::min(position, last.draft_cells);
-                target.completed_cells = target.cells;
-                target.begin = std::min(target.cells, last.draft_begin);
-                target.certified = true;
-                target.tail_token = target.cells == position && position > target.begin
-                    ? state.prompt[size_t(position)] : -1; // token identity was proven by source preflight
-                target.prompt_len = (int64_t) state.prompt.size();
-                target.proposal = target.proposal_token = -1; target.proposal_cell = -1;
-                operation.reset(); // final restored-state reads are done; catchup takes its own scratch lease
-                // The immutable prefix never stores tokenN. Advance exactly its
-                // missing cell with this destination's tokenN, using the existing
-                // Rin_ arena and KV-only front, before advertising full coverage.
-                if (target.cells != position &&
-                    !draft_.catchup_slot(lease.slot, last.draft_boundary_residual,
-                        state.prompt[size_t(position)], position - 1, error)) return fail(lease.slot);
+                const auto* selected = part == &image.live ? nullptr : part;
+                if (!part || (mtp && stage + 1 == stages_.size()
+                    ? core::conversation_neural_restore(image, *lease.stages[stage], geometry_, draft_,
+                        lease.slot, int64_t(state.prompt.size()), state.prompt[size_t(position)],
+                        source.expectation, error, selected)
+                    : core::conversation_snapshot_restore(image, *lease.stages[stage], geometry_,
+                        draft, source.expectation, error, selected)) != core::ConversationRestore::restored)
+                    return fail(lease.slot);
             }
         } else {
             for (size_t stage = 0; stage < stages_.size(); ++stage) {
@@ -843,7 +823,7 @@ bool ResidentSlots::prepare(const ResidentPreparation& lease, const core::SavedC
             }
             if (mtp && !draft_.prepare_slot(lease.slot, lease.request, (int64_t) state.prompt.size(),
                                             position, !source.retained, error)) return fail(lease.slot);
-            if (mtp) draft_.slots_[(size_t) lease.slot].tail_token = source.tail_token;
+            if (mtp) draft_.restore_boundary_token(lease.slot, source.tail_token);
         }
     } catch (const std::bad_alloc&) {
         error = "resident preparation: direct destination allocation failed"; return fail(lease.slot);
@@ -861,10 +841,10 @@ bool ResidentSlots::prefilled(const ResidentPreparation& lease, int64_t frontier
         error = "resident preparation: invalid certified frontier"; return false;
     }
     if (!idle(error)) return false;
-    if (draft_.kv_state().max_cells > 0 &&
+    if (draft_.enabled() &&
         (draft_.slot_cells(lease.slot) != frontier ||
          !draft_.slot_covers(lease.slot, frontier, (int64_t) state.prompt.size()) ||
-         (frontier > draft_.slot_begin(lease.slot) &&
+         (draft_.kind() == core::DraftKind::mtp && frontier > draft_.slot_begin(lease.slot) &&
           draft_.slot_next_token(lease.slot) != state.prompt[(size_t) frontier]))) {
         error = "resident preparation: draft interval or boundary token is not coherent"; return fail(lease.slot);
     }
@@ -923,15 +903,13 @@ bool ResidentSlots::first_token(const ResidentPreparation& lease, int32_t next, 
             error = "resident first token: verifier owner has not committed its final row"; return fail(lease.slot);
         }
     if (next < 0) { error = "resident first token: invalid verifier pick"; return fail(lease.slot); }
-    if (draft_.kv_state().max_cells > 0 &&
+    if (draft_.enabled() &&
         !draft_.advance_slot(lease.slot, residual, next, lease.endpoint, error)) return fail(lease.slot);
     state.ids.push_back(state.prompt.back());
     state.p = (int64_t) state.ids.size(); state.produced = 1; state.x = next;
-    state.draft = -1;
-    if (draft_.kv_state().max_cells > 0 && draft_.batch_drafting_) {
-        const auto& target = draft_.slots_[(size_t) lease.slot];
-        if (target.proposal_cell == lease.endpoint && target.proposal_token == next) state.draft = target.proposal;
-    }
+    state.proposal.clear();
+    if (draft_.enabled() && draft_.batch_drafting() &&
+        !draft_.cached_proposal(lease.slot, next, lease.endpoint, state.proposal, error)) return fail(lease.slot);
     state.preparing = false; state.active = true;
     preparations_[(size_t) lease.slot] = {};
     if (!observe("admit", lease.slot, state.p, error, residual)) return fail(lease.slot);
@@ -975,10 +953,10 @@ bool ResidentSlots::suspend_prompt(const ResidentPreparation& lease, uint64_t op
         return false;
     }
     if (!idle(error)) return false;
-    if (draft_.kv_state().max_cells > 0 &&
+    if (draft_.enabled() &&
         (draft_.slot_cells(lease.slot) != state.p ||
          !draft_.slot_covers(lease.slot, state.p, int64_t(state.prompt.size())) ||
-         (state.p > draft_.slot_begin(lease.slot) &&
+         (draft_.kind() == core::DraftKind::mtp && state.p > draft_.slot_begin(lease.slot) &&
           draft_.slot_next_token(lease.slot) != state.prompt[size_t(state.p)]))) {
         error = "resident prompt: suspension draft frontier is not ready"; return false;
     }
@@ -1018,7 +996,7 @@ bool ResidentSlots::abort_preparation(const ResidentPreparation& lease, std::str
     retire(lease.slot);
     state.active = state.preparing = state.cached = state.partial = false;
     state.ids.clear(); state.prompt.clear(); state.checks.clear();
-    state.p = state.produced = 0; state.draft = -1; state.prefill_split_until = 0;
+    state.p = state.produced = 0; state.proposal.clear(); state.prefill_split_until = 0;
     state.prefill_plan = {};
     preparations_[(size_t) lease.slot] = {};
     return true;
@@ -1122,9 +1100,9 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     if (timing) report_admission_timing(slot, "retire_checkpoint_bind", -1, 1, phase);
     try {
         if (!copy_to(slot, prefix, error)) return fail(slot);
-        if (draft_.kv_state().max_cells > 0) {
+        if (draft_.enabled()) {
             if (timing) phase = Clock::now();
-            if (!draft_.bind_request(slot, working_.request, error)) return fail(slot);
+            if (!draft_.bind_request(slot, working_.request, error, state.incarnation)) return fail(slot);
             if (timing) report_admission_timing(slot, "draft_request_bind", draft_.device(), 1, phase);
             if (!draft_.save_slot(slot, (int64_t) prefix.size(), error)) return fail(slot);
         }
@@ -1141,7 +1119,7 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     state.sampling = working_.sampling;
     state.request = working_.request;
     state.x = request.next_token;
-    state.draft = -1;
+    state.proposal.clear();
     state.p = (int64_t) prefix.size();
     state.produced = parked ? 0 : 1;
     state.max_new = input_.max_new;
@@ -1155,16 +1133,14 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     dispatch_.slot_requests[slot] = working_.request;
     if (timing) report_admission_timing(slot, "slot_metadata", -1, (int64_t) prefix.size(), phase);
     if (timing) phase = Clock::now();
-    if (request.residual && !draft_.propose_slot(slot, request.residual, state.x, state.p - 1,
-                                                state.draft, error)) return fail(slot);
+    if (!draft_.set_slot_sampling(slot, state.sampling, error)) return fail(slot);
+    if (request.residual && draft_.kind() == core::DraftKind::mtp &&
+        !draft_.propose_slot(slot, request.residual, state.x, state.p - 1, state.proposal, error)) return fail(slot);
     if (timing) report_admission_timing(slot, "initial_proposal", draft_.device(), request.residual ? 1 : 0, phase);
     if (timing) phase = Clock::now();
-    if (!stages_[0].verifier->set_slot_context(slot, working_.request, state.sampling,
-                                              &state.ids, state.cvec, error) ||
-        (stages_[0].batch_peer && !stages_[0].batch_peer->set_slot_context(slot, working_.request,
-                                              state.sampling, &state.ids, state.cvec, error)) ||
-        (stages_[0].batch_third && !stages_[0].batch_third->set_slot_context(slot, working_.request,
-                                              state.sampling, &state.ids, state.cvec, error)) ||
+    if (!stages_[0].verifier->set_slot_context(slot, working_.request, state.sampling, &state.ids, state.cvec, error, slots_[size_t(slot)].incarnation) ||
+        (stages_[0].batch_peer && !stages_[0].batch_peer->set_slot_context(slot, working_.request, state.sampling, &state.ids, state.cvec, error, slots_[size_t(slot)].incarnation)) ||
+        (stages_[0].batch_third && !stages_[0].batch_third->set_slot_context(slot, working_.request, state.sampling, &state.ids, state.cvec, error, slots_[size_t(slot)].incarnation)) ||
         !observe(continuing ? "resume" : "admit", slot, (int64_t) prefix.size(), error)) {
         // Retain a continuing identity for balanced failure/release receipts.
         // A new request has not published its start yet.
@@ -1230,14 +1206,16 @@ std::optional<ResidentSnapshotSource> ResidentSlots::completed_snapshot_source(i
     if (source.partial || source.img || source.tainted || !source.input.scope.valid() || source.ids.empty())
         return std::nullopt;
     if (!idle(error)) return std::nullopt;
-    const auto* draft = draft_.kv_state().max_cells > 0 ? draft_.slot_state(slot) : nullptr;
-    if (draft_.kv_state().max_cells > 0 && !draft) {
+    const auto* draft = draft_.enabled() ? draft_.legacy_state(slot) : nullptr;
+    if (draft_.enabled() && !draft_.slot_coverage(slot).coherent) {
         error = "resident snapshot: missing draft state"; return std::nullopt;
     }
     const auto certificate = certify_continuation(slot, nullptr, 0, 0, &error);
     if (!certificate.certified) return std::nullopt;
-    ResidentSnapshotSource result{source, stages_, draft, slot, draft ? draft_.slot_begin(slot) : 0,
-        draft ? draft_.slots_[size_t(slot)].completed_cells : 0, draft ? draft_.slot_next_token(slot) : -1};
+    const auto coverage = draft_.slot_coverage(slot);
+    ResidentSnapshotSource result{source, stages_, draft_, draft, slot,
+        coverage.present ? coverage.certified_begin : 0, coverage.present ? coverage.certified_end : 0,
+        coverage.present ? coverage.next_token : -1};
     result.certificate = certificate;
     return result;
 }
@@ -1256,22 +1234,24 @@ std::optional<ResidentSnapshotSource> ResidentSlots::prepared_snapshot_source(
         error = "resident prepared snapshot: incoherent owner frontier"; return std::nullopt;
     }
     if (!idle(error)) return std::nullopt;
-    const auto* draft = draft_.kv_state().max_cells > 0 ? draft_.slot_state(lease.slot) : nullptr;
-    if (draft_.kv_state().max_cells > 0) {
-        if (!draft || draft_.slots_[(size_t) lease.slot].request != lease.request ||
-            draft_.slot_cells(lease.slot) != source.p ||
-            draft_.slots_[(size_t) lease.slot].completed_cells != source.p ||
-            !draft_.slot_covers(lease.slot, source.p, (int64_t) source.prompt.size()) ||
-            (source.p > draft_.slot_begin(lease.slot) &&
-             draft_.slot_next_token(lease.slot) != source.prompt[(size_t) source.p])) {
+    const auto* draft = draft_.enabled() ? draft_.legacy_state(lease.slot) : nullptr;
+    if (draft_.enabled()) {
+        const auto coverage = draft_.slot_coverage(lease.slot);
+        if (!coverage.present || !coverage.coherent || coverage.owner.request != lease.request ||
+            coverage.owner.incarnation != lease.incarnation ||
+            draft_.slot_cells(lease.slot) != source.p || coverage.certified_end != source.p ||
+            !draft_.slot_covers(lease.slot, source.p, int64_t(source.prompt.size())) ||
+            (draft_.kind() == core::DraftKind::mtp && source.p > draft_.slot_begin(lease.slot) &&
+             draft_.slot_next_token(lease.slot) != source.prompt[size_t(source.p)])) {
             error = "resident prepared snapshot: incoherent draft owner or interval"; return std::nullopt;
         }
     }
     const auto certificate = certify_continuation(lease.slot, nullptr, lease.request, lease.incarnation, &error);
     if (!certificate.certified) return std::nullopt;
-    ResidentSnapshotSource result{source, stages_, draft, lease.slot, draft ? draft_.slot_begin(lease.slot) : 0,
-        draft ? draft_.slots_[(size_t) lease.slot].completed_cells : 0,
-        draft ? draft_.slot_next_token(lease.slot) : -1};
+    const auto coverage = draft_.slot_coverage(lease.slot);
+    ResidentSnapshotSource result{source, stages_, draft_, draft, lease.slot,
+        coverage.present ? coverage.certified_begin : 0, coverage.present ? coverage.certified_end : 0,
+        coverage.present ? coverage.next_token : -1};
     result.certificate = certificate;
     return result;
 }
@@ -1293,7 +1273,7 @@ bool ResidentSlots::resume_work(int slot, const core::ConversationCheckpoint* ch
         error = "resident resume: checkpoint is not a retained prefix"; return false;
     }
     const int64_t cells = (int64_t) (checkpoint ? checkpoint->ids.size() : slots_[(size_t) slot].ids.size());
-    if (draft_.kv_state().max_cells > 0 &&
+    if (draft_.enabled() &&
         (!working_prompt_ || !draft_ready(slot, checkpoint, *working_prompt_,
             working_.resume_slot == slot ? working_.request : 0,
             working_.resume_slot == slot ? slots_[(size_t) slot].incarnation : 0, error))) {
@@ -1331,17 +1311,13 @@ bool ResidentSlots::resume_work(int slot, const core::ConversationCheckpoint* ch
             for (uint64_t n : parts) { work.add(n); if (!direct) work.add(n); }
         }
     }
-    if (draft_.kv_state().max_cells > 0) {
+    if (draft_.enabled()) {
         // Keep the historical independently completed frontier; draft_ready preflights its certificate,
         // prompt window and boundary before any target/draft copy or destination owner mutation.
-        const auto* from = draft_.slot_state(slot);
-        std::array<uint64_t, 5> parts{};
-        if (!from || !core::conversation_kv_part_sizes(*from, geometry_, cells, false, parts, error)) return false;
-        work.path(draft_.device(), from->kv_mode);
-        work.path(draft_.device(), int(from->n_slots));
-        work.path(draft_.device(), draft_.kv_state().kv_mode);
-        work.path(draft_.device(), int(draft_.kv_state().n_slots));
-        for (uint64_t n : parts) { work.add(n); if (!direct) work.add(n); }
+        const uint64_t bytes = draft_.copy_bytes(slot, cells, direct, error);
+        if (bytes == UINT64_MAX) return false;
+        work.path(draft_.device(), int(draft_.kind()));
+        work.add(bytes);
     }
     return work.bytes != UINT64_MAX;
 }
@@ -1354,7 +1330,7 @@ bool ResidentSlots::resume(int slot, const core::ConversationCheckpoint* checkpo
     working_.prefill_split_until = 0;
     try {
         if (!copy_from(slot, checkpoint, error) ||
-            (draft_.kv_state().max_cells > 0 && !draft_.restore_slot(slot, cells, error)) ||
+            (draft_.enabled() && !draft_.restore_slot(slot, cells, error)) ||
             !observe("resume", slot, cells, error)) {
             return fail(slot);
         }
@@ -1363,9 +1339,10 @@ bool ResidentSlots::resume(int slot, const core::ConversationCheckpoint* checkpo
         return fail(slot);
     }
     working_failed_ = false;
-    if (draft_.coverage_.known() && draft_.coverage_.cells == cells && cells > draft_.coverage_.begin &&
+    const auto coverage = draft_.completed_coverage();
+    if (coverage.known() && coverage.cells == cells && cells > coverage.begin &&
         working_prompt_ && cells < int64_t(working_prompt_->size()))
-        draft_.coverage_.next_token = (*working_prompt_)[size_t(cells)]; // resume_work proved this source boundary
+        draft_.restore_boundary_token(8, (*working_prompt_)[size_t(cells)]); // resume_work proved the boundary
     residency("resume", slot);
     slots_[(size_t) slot].restored(working_, slot, checkpoint == nullptr);
     return true;
@@ -1418,16 +1395,14 @@ bool ResidentSlots::committed(int slot, int32_t next, const float* residual, std
     }
     auto& state = slots_[(size_t) slot];
     if (!slot_idle(slot, error)) return false;
-    if (draft_.kv_state().max_cells > 0 && !draft_.advance_slot(slot, residual, next, state.p, error)) return fail(slot);
+    if (draft_.enabled() && !draft_.advance_slot(slot, residual, next, state.p, error)) return fail(slot);
     state.ids.push_back(state.x);
     if (diagnostic && !observe("commit", slot, (int64_t) state.ids.size(), error, residual)) return fail(slot);
     ++state.produced;
     state.x = next;
-    state.draft = -1;
-    if (draft_.kv_state().max_cells > 0 && draft_.batch_drafting_) {
-        const auto& target = draft_.slots_[(size_t) slot];
-        if (target.proposal_cell == state.p && target.proposal_token == next) state.draft = target.proposal;
-    }
+    state.proposal.clear();
+    if (draft_.enabled() && draft_.batch_drafting() &&
+        !draft_.cached_proposal(slot, next, state.p, state.proposal, error)) return fail(slot);
     ++state.p;
     return true;
 }
@@ -1436,7 +1411,10 @@ bool ResidentSlots::propose(int slot, const float* residual, std::string& error)
     if (slot < 0 || (size_t) slot >= slots_.size() || !slots_[(size_t) slot].active ||
         !slot_idle(slot, error)) return false;
     auto& state = slots_[(size_t) slot];
-    if (!draft_.propose_slot(slot, residual, state.x, state.p - 1, state.draft, error)) return fail(slot);
+    state.proposal.clear();
+    if (state.stop || state.produced >= state.max_new || state.p >= context_ ||
+        (draft_.kind() == core::DraftKind::dflash2 && state.p > 262144 - 4)) return true;
+    if (!draft_.propose_slot(slot, residual, state.x, state.p - 1, state.proposal, error)) return fail(slot);
     return true;
 }
 
@@ -1459,11 +1437,13 @@ bool ResidentSlots::finish(int slot, std::string& error, bool diagnostic) {
 bool ResidentSlots::observe(const char* phase, int slot, int64_t cells, std::string& error, const float* residual) {
     if (!std::getenv("STRATA_STATE_HASH")) return true;
     const core::QsaState empty_draft{};
-    const auto* draft = draft_.kv_state().max_cells > 0 ? draft_.slot_state(slot) : &empty_draft;
-    if (!draft) { error = "resident draft state missing"; return false; }
+    const auto* legacy = draft_.enabled() ? draft_.legacy_state(slot) : nullptr;
+    const auto* draft = legacy ? legacy : &empty_draft;
     auto& session = *stages_[0].slots[(size_t) slot];
     SessionFingerprint h;
     if (!session_fingerprint(session, *draft, geometry_, cells, h, error, residual)) return false;
+    if (draft_.enabled() && draft_.kind() == core::DraftKind::dflash2 &&
+        !draft_.state_fingerprint(slot, cells, h.draft, error)) return false;
     const uint64_t id = slots_[(size_t) slot].request;
     if (!id || dispatch_.slot_requests[slot] != id) { error = "resident request owner mismatch"; return false; }
     const bool released = resources_ == Resources::released;
@@ -1487,9 +1467,14 @@ bool ResidentSlots::observe(const char* phase, int slot, int64_t cells, std::str
             const auto& private_state = std::strcmp(phase, "resume") == 0
                 ? *stages_[stage].main : *stages_[stage].slots[(size_t) slot];
             SessionFingerprint part;
-            const auto& private_draft = stage + 1 != stages_.size() ? empty_draft
-                : std::strcmp(phase, "resume") == 0 ? draft_.kv_state() : *draft;
-            if (!session_fingerprint(private_state, private_draft, geometry_, cells, part, error)) return false;
+            const auto* state = stage + 1 == stages_.size()
+                ? draft_.legacy_state(std::strcmp(phase, "resume") == 0 ? 8 : slot) : nullptr;
+            if (!session_fingerprint(private_state, state ? *state : empty_draft,
+                                      geometry_, cells, part, error)) return false;
+            if (stage + 1 == stages_.size() && draft_.enabled() &&
+                draft_.kind() == core::DraftKind::dflash2 &&
+                !draft_.state_fingerprint(std::strcmp(phase, "resume") == 0 ? 8 : slot,
+                                          cells, part.draft, error)) return false;
             std::fprintf(stderr, "STATE_STAGE phase=%s stage=%zu slot=%d request=%llu cells=%lld "
                                  "gdn=%016llx ple=%016llx kv=%016llx draft=%016llx history=%016llx "
                                  "seed=%llu counter=%llu\n", phase, stage, slot, (unsigned long long) id,

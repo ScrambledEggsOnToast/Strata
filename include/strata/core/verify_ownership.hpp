@@ -1,8 +1,12 @@
 // Verifier ownership/canary contract. No CUDA dependency: also used by CPU seam tests.
 #pragma once
 
+#include "strata/core/batch_rows.hpp"
+
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <map>
 
 namespace strata::core {
 
@@ -27,6 +31,49 @@ private:
 inline constexpr int kVerifyCanaryRows = 8;
 inline constexpr int kVerifySoloOwner = 8;
 inline constexpr unsigned kVerifyBatchGraphKeys = 32;
+
+// Native DFlash2's complete row-schedule superset over four physical slots:
+// dflash2_batch_rows_supported enforces this union; other modes keep the general row validator.
+// decode: 4*4 singleton shapes + 4*3*4*4 ordered two-owner shapes = 208;
+// retained known-input target reads: singleton depths 5..8 add 4*4 = 16;
+// final prompt rows: every distinct-owner order of length 3 or 4 adds 4P3+4P4 = 48.
+// Length-one/two final prompts and cancellation/partial-ready subsets already occur above.
+// Thus 272 layouts * bases {0,8} * residency variants {0,1} = 1088 keys. A physical
+// verifier still holds at most eight rows; the optional third native replay owner is unsupported.
+// Failed capture reservations remain keys in BOTH maps until idle graph release.
+inline constexpr unsigned kDflash2BatchGraphKeys = 1088;
+
+// Prospective Linux64 release libstdc++/glibc host-node ACCOUNTING ALLOWANCE, not a
+// measured allocator footprint or CUDA graph executable/capture-storage bound.
+// Each key reserves a window node and a commit node, including failed reservations.
+// The 256-byte/node allowance includes allocator/header/alignment slack, with one
+// additional insertion temporary charged at peak. The embedded map objects are already
+// part of sizeof(Verifier). Charge this FULL allowance per physical native verifier/stage.
+// The process host ceiling and unchanged opaque CUDA allowances remain independently enforced;
+// neither the node-size assertion below nor this finite allowance proves runtime graph fit.
+inline constexpr uint64_t kDflash2BatchGraphNodeBytes = 256;
+inline constexpr uint64_t kDflash2BatchGraphHostBytes =
+    (2ull * kDflash2BatchGraphKeys + 1) * kDflash2BatchGraphNodeBytes;
+
+#if defined(__linux__) && defined(__LP64__) && defined(__GLIBC__) && defined(__GLIBCXX__) && !defined(_GLIBCXX_DEBUG)
+inline constexpr bool kDflash2BatchGraphHostPricingSupported = sizeof(int) == 4 && sizeof(void*) == 8;
+#else
+inline constexpr bool kDflash2BatchGraphHostPricingSupported = false;
+#endif
+
+// Native admission must refuse unsupported pricing ABIs, not break unrelated legacy builds.
+// Only the opt-in native build references libstdc++'s implementation-specific node type.
+#if defined(STRATA_DFLASH2_CAPTURE) && defined(__linux__) && defined(__LP64__) && \
+    defined(__GLIBC__) && defined(__GLIBCXX__) && !defined(_GLIBCXX_DEBUG)
+namespace detail {
+using VerifyBatchGraphMapValue = std::map<VerifyBatchKey, void*>::value_type;
+inline constexpr size_t kVerifyBatchGraphAllocatorSlack = 2 * sizeof(size_t) + alignof(std::max_align_t);
+// This checks the actual key/pointer-handle/tree-link node shape, not allocator RSS.
+static_assert(sizeof(std::_Rb_tree_node<VerifyBatchGraphMapValue>) + kVerifyBatchGraphAllocatorSlack <=
+                  kDflash2BatchGraphNodeBytes,
+              "Linux64 std::map node no longer fits the prospective batch graph host-node allowance");
+} // namespace detail
+#endif
 
 // Bound at admission, independently of the per-operation mapped row staging.
 struct VerifyCanaryOwner {

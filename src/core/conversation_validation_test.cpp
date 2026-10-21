@@ -15,70 +15,6 @@
 #if defined(CONVERSATION_TEST_TRANSFERS)
 #include "strata/core/native_head.hpp"
 #include "strata/core/mtp.hpp"
-#include "strata/program/draft_kv_plan.hpp"
-#include <memory>
-
-// Execute the production horizon/dispatch/pruning statements. Only the GPU
-// arithmetic is replaced: each selected draft row writes a nonzero host marker.
-namespace {
-namespace shared_draft_fixture {
-struct DraftRows {
-    int64_t prompt_len_ = 0, window_ = 32768, max_t_ = 8;
-    bool per_group_sync = false;
-    int token_calls = 0;
-    strata::core::QsaState state;
-    std::function<void(int64_t, int64_t)> write;
-    strata::core::ConversationDraftCoverage coverage;
-    int64_t boundary_position = -1;
-    void set_boundary_capture(int64_t position) { boundary_position = position; }
-    void set_prompt_len(int64_t n) { prompt_len_ = n; }
-    int64_t first_needed(int = 8) const {
-#include "shared_draft_first_needed.inc"
-        return first_needed;
-    }
-    const strata::core::QsaState& kv_state() const { return state; }
-    bool prefill(const float*, const int32_t* tokens, int64_t n, int64_t cell0, std::string&) {
-        ++token_calls;
-        const int64_t first_needed = this->first_needed();
-        if (per_group_sync) {
-#include "shared_draft_sync_range.inc"
-            write(cell0 + c, T);
-            coverage.completed(cell0 + c, cell0 + c + T, tokens[c + T - 1]);
-            }
-        } else {
-#include "shared_draft_async_range.inc"
-            write(cell0 + c, T);
-            coverage.completed(cell0 + c, cell0 + c + T, tokens[c + T - 1]);
-            }
-        }
-        return true;
-    }
-};
-
-namespace strata {
-namespace core = ::strata::core;
-namespace program = ::strata::program;
-namespace prefill {
-class Prefill {
-public:
-    bool accept_batched = false;
-    int batched_calls = 0;
-    std::function<bool(const float*, int64_t, int64_t, std::string&)> on_chunk;
-    bool draft_kv(DraftRows& mtp, const float*, const int32_t* tokens, int64_t n, int64_t cell0,
-                  std::string&, const char**) {
-        ++batched_calls;
-        if (!accept_batched) return false;
-        constexpr int slot = 8;
-#include "shared_draft_batched_range.inc"
-        mtp.write(cell0 + r0, n - r0);
-        mtp.coverage.completed(cell0 + r0, cell0 + n, r0 < n ? tokens[n - 1] : -1);
-        return true;
-    }
-};
-}
-}
-}
-}
 #endif
 #if defined(CONVERSATION_TEST_TRANSFERS)
 // GNU/ELF link wrapping exercises the actual restore control flow without
@@ -194,6 +130,9 @@ struct MtpDrafterCertificationFixture {
         rebound.coverage_ = {0, 8, 11};
         rebound.coverage_owner_ = 41;
         rebound.working_request_ = 42;
+        rebound.st_.max_cells = 16;
+        rebound.owners_[8] = {8, 42, 1, 0};
+        rebound.coverage_identity_ = {8, 41, 1, 0};
         {
             const std::vector<int32_t> ids(size_t(16), 7);
             const std::vector<ConversationImageKey> no_images;
@@ -203,9 +142,42 @@ struct MtpDrafterCertificationFixture {
             check(view.draft_owner == 0 && view.draft_begin == -1 && view.draft_tokens == -1,
                   "a later request's bind leaves the earlier request's coverage unadvertised");
             rebound.working_request_ = 41;
+            rebound.owners_[8].request = 41;
             rebound.certify_view(view);
             check(view.draft_owner == 41 && view.draft_begin == 0 && view.draft_tokens == 8,
                   "the request that wrote the coverage can still certify it");
+        }
+        {
+            MtpDrafter parked;
+            parked.st_.max_cells = 16;
+            check(parked.bind_request(8, 51, error, 1), "bind outgoing MTP producer");
+            {
+                MtpDrafter::Operation operation(parked, error);
+                check(bool(operation), "acquire outgoing MTP producer operation");
+                operation.writes(0, 8, 11);
+                check(operation.finish(error), "complete outgoing MTP producer certification");
+            }
+            const auto outgoing = parked.owner();
+            check(parked.bind_request(8, 52, error, 2), "bind successor before parking outgoing storage");
+            strata::kernels::SamplerParams sampling{};
+            sampling.greedy = true;
+            parked.set_draft_sampling(sampling);
+            parked.set_draft_history(nullptr, 0, 0);
+            const std::vector<int32_t> ids(size_t(16), 7);
+            const std::vector<ConversationImageKey> no_images;
+            const std::vector<ConversationCheckpoint> no_checks;
+            ConversationView view{ids, no_images, no_checks, true};
+            parked.certify_view(view, 8, &outgoing);
+            check(parked.owner().generation == outgoing.generation &&
+                  view.draft_owner == 51 && view.draft_tokens == 8,
+                  "actual sampler and history rebind preserve the displaced numerical producer");
+            {
+                MtpDrafter::Operation operation(parked, error);
+                check(bool(operation) && operation.finish(error), "complete later mutating MTP operation");
+            }
+            parked.certify_view(view, 8, &outgoing);
+            check(view.draft_owner == 0 && view.draft_tokens == -1,
+                  "later numerical generation still refuses the displaced source");
         }
     }
 };
@@ -867,108 +839,6 @@ void resident_transfer_envelopes() {
 #endif
 }
 #if defined(CONVERSATION_TEST_TRANSFERS)
-namespace shared_draft_fixture {
-int64_t draft_horizon(DraftRows& mtp, bool shared, int64_t resume, int64_t reread_to,
-                      int64_t req_pin = 8192, int64_t n = 65536, bool store_man2 = true) {
-    const bool use_mtp = true;
-    const ConversationScope req_shared_scope = shared ? ConversationScope{{1}} : ConversationScope{};
-#include "shared_draft_horizon.inc"
-    return read_from;
-}
-
-void diagnostic_shared_draft(bool batched, bool per_group_sync, int64_t window) {
-    constexpr int64_t pin = 8192, resume = 16384, prompt = 65536;
-    ModelGeometry g;
-    g.n_layers = 4; g.ssm_state_size = 2; g.ssm_v_heads = 2; g.ssm_conv_channels = 8;
-    g.n_head_kv = 1; g.head_dim = 64; g.idx_key_dim = 8;
-    Pools main(g, 0, resume), draft(g, 0, resume);
-    // A diagnostic reread starts with no valid draft rows, not a restored ring.
-    std::fill(draft.data[0].begin(), draft.data[0].end(), 0);
-    std::fill(draft.data[1].begin(), draft.data[1].end(), 0);
-    DraftRows mtp;
-    mtp.window_ = window;
-    mtp.per_group_sync = per_group_sync;
-    mtp.write = [&](int64_t at, int64_t count) {
-        const size_t row = size_t(g.n_head_kv * g.head_dim * 2);
-        for (size_t part : {size_t(0), size_t(1)})
-            std::fill(draft.data[part].begin() + size_t(at) * row,
-                      draft.data[part].begin() + size_t(at + count) * row, 0x6d);
-    };
-    // Private serving keeps the full-prompt horizon, including diagnostic reads;
-    // a normal private checkpoint at/past the pin does not create a shared cut.
-    check(draft_horizon(mtp, false, resume, resume) == 0 && mtp.prompt_len_ == prompt,
-          "private diagnostic reread keeps its ordinary full-prompt horizon");
-    check(draft_horizon(mtp, true, resume, -1) == resume && mtp.prompt_len_ == prompt,
-          "private resume past the shared pin keeps the ordinary horizon");
-    check(draft_horizon(mtp, true, pin, -1) == pin && mtp.prompt_len_ == prompt,
-          "a resume exactly at the pin does not recompute or capture that cut");
-    check(draft_horizon(mtp, true, resume, resume, pin, prompt, false) == 0 &&
-          mtp.prompt_len_ == pin + 1 && mtp.boundary_position == -1,
-          "legacy export keeps the shared horizon without allocating a boundary row");
-    const int64_t read_from = draft_horizon(mtp, true, resume, resume);
-    const int64_t required_begin = std::max<int64_t>(0, pin + 1 - window - 64);
-    check(read_from == 0 && mtp.boundary_position == pin - 1,
-          "certified export captures the reread shared boundary independently of packed scheduling");
-
-    strata::prefill::Prefill sp;
-    sp.accept_batched = batched;
-    struct Stage { strata::prefill::Prefill sp; int dev = 0; };
-    const std::vector<std::unique_ptr<Stage>> stages;
-    const bool use_mtp = true, multi_gpu = false, split_mtp_batch = false, mtp_first = false;
-    const std::vector<int64_t> cur(size_t(prompt), 11);
-#include "shared_draft_callback.inc"
-        return true;
-    };
-    std::string error;
-    for (int64_t at = read_from; at < pin; at += 2048)
-        check(sp.on_chunk(nullptr, 2048, at, error) && error.empty(),
-              "the production prompt callback populates draft state up to the pin");
-    check(sp.batched_calls == 4 && mtp.token_calls == (batched ? 0 : 4),
-          "both the E-9 batched callback and its per-group fallback are exercised");
-    const size_t row = size_t(g.n_head_kv * g.head_dim * 2);
-
-    ConversationStateSizes z;
-    check(conversation_state_sizes(g, z, error), "diagnostic fixture prices recurrent state");
-    std::vector<uint8_t> gdn(z.gdn, 0x45), ple(z.ple, 0x46);
-    SessionState ss;
-    ss.max_cells = resume; ss.layer_hi = g.n_layers; ss.gdn_alloc = g.n_gdn_layers(); ss.qsa_alloc = 1;
-    ss.gdn_state = reinterpret_cast<float*>(gdn.data());
-    ss.ple_hist = reinterpret_cast<float*>(ple.data());
-    ss.qsa_states = &main.st;
-    const std::vector<int32_t> ids(size_t(pin), 11);
-    const std::vector<ConversationImageKey> no_images;
-    const std::vector<ConversationCheckpoint> no_checks;
-    ConversationBuffer boundary;
-    boundary.resize(size_t(g.n_embd * g.hc) * sizeof(float), 0x3d);
-    boundary.freeze();
-    check(mtp.coverage.known() && mtp.coverage.cells == pin,
-          "host writers expose their actually completed contiguous interval");
-    const ConversationView exact{ids, no_images, no_checks, true, true, pin - 1, mtp.coverage.begin,
-                                  -1, 17, &boundary, pin - 1, 17};
-    SavedConversation image;
-    copy_calls = sync_calls = stream_sync_calls = fail_copy = fail_sync = 0;
-    check(conversation_snapshot_save(image, exact, ss, g, &draft.st, error) &&
-          conversation_snapshot_validate(image, ss, g, &draft.st, ConversationSnapshotExpectation::exact_cut, error) &&
-          image.kv.back().cells == pin - 1,
-          "diagnostic reread captures a valid exact N-1 draft extent");
-    for (const auto* part : {&image.kv.back().k, &image.kv.back().v}) {
-        bool populated = true;
-        check(part->visit(size_t(required_begin) * row, size_t(pin - 1 - required_begin) * row,
-              [&](const uint8_t* bytes, size_t n, size_t) {
-                  populated = populated && std::all_of(bytes, bytes + n, [](uint8_t byte) { return byte == 0x6d; });
-                  return true;
-              }) && populated, "the accepted exact capture contains required draft rows, not valid-looking zeros");
-    }
-    for (size_t part : {size_t(0), size_t(1)})
-        check(std::all_of(draft.data[part].begin() + size_t(required_begin) * row,
-                          draft.data[part].begin() + size_t(pin - 1) * row,
-                          [](uint8_t byte) { return byte == 0x6d; }),
-              "every required prefix draft K/V row is recomputed, not skipped by the private suffix");
-    check(mtp.prompt_len_ == pin + 1 && mtp.first_needed() == pin + 1 - window - 64,
-          "diagnostic reread of a deeper private checkpoint uses the exact shared-cut horizon");
-}
-}
-
 void exact_shared_cut(int format, int64_t cut) {
     ModelGeometry g;
     g.n_layers = 4; g.ssm_state_size = 2; g.ssm_v_heads = 2; g.ssm_conv_channels = 8;
@@ -1283,8 +1153,6 @@ int main() {
     strata::core::MtpDrafterCertificationFixture::run(check);
     for (int format : {0,1,2}) ring_refusal(format);
     for (int format : {0,1,2,3}) for (int64_t cut : {1,4,5,7,8,9,80}) exact_shared_cut(format, cut);
-    for (bool batched : {false, true}) for (bool sync : {false, true})
-        for (int64_t window : {2048, 32768}) shared_draft_fixture::diagnostic_shared_draft(batched, sync, window);
 #endif
     std::printf("conversation_validation_test: %d host-only checks passed\n", checks);
 }

@@ -699,6 +699,22 @@ void test_measured_prefill_quanta_and_bounded_decode_share() {
     require(!disabled.decode_allowed(0) && disabled.decode_ms() == 0 && disabled.chunk_ms() == 0,
             "disabled overlap mutated scheduling state");
 
+    // Carried debt remains blocked exactly at zero; uncharged decode cannot spend it.
+    TimeBudget retained(100, .25);
+    retained.prefilled(60, 1, 2048);
+    retained.decoded(250);
+    require(!retained.decode_allowed(0) && retained.decode_ms() == 250,
+            "retained decode discarded its indivisible-round debt");
+    retained.background_work(40);
+    require(!retained.decode_allowed(0), "partial background work cleared retained debt");
+    retained.background_work(10);
+    require(!retained.decode_allowed(0), "zero retained credit admitted decoding");
+    retained.background_work(1);
+    require(retained.decode_allowed(0) && !retained.decode_allowed(3),
+            "retained credit did not preserve its exact start boundary");
+    retained.decoded(1000, false);
+    require(retained.decode_allowed(0), "uncharged decode spent retained foreground credit");
+
     // Live read intervals replenish carried debt. Settling only at the part's
     // end would either starve every cold start or cap all decode at 1000 ms.
     TimeBudget live(100, .25);

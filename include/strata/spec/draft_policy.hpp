@@ -15,6 +15,8 @@
 // to the machine and the context length. It only chooses which drafts to verify: the output is unchanged.
 #pragma once
 
+#include <algorithm>
+#include <cstdint>
 #include <array>
 
 namespace strata::spec {
@@ -60,5 +62,24 @@ private:
     double rounds_ = 0;                                    // rounds observed so far
     std::array<double, kMaxT + 1> last_{};                 // the round at which each size was last measured
 };
+
+// Width includes the consumed anchor. Sampled proposals must not be selected
+// by their own drawn value/probability: confidence can stop only the NEXT draw.
+// Greedy retains its existing own-row confidence rule.
+inline int neural_window_width(const float* confidence, int proposals, int max_rows,
+                               float min_probability, bool sampled) {
+    const int available = std::clamp(proposals, 0, DraftPolicy::kMaxT - 1);
+    const int limit = std::clamp(max_rows, 1, available + 1);
+    int rows = sampled && limit > 1 ? 2 : 1;
+    while (rows < limit && confidence[rows - (sampled ? 2 : 1)] >= min_probability) ++rows;
+    return rows;
+}
+
+// Lookup/neural source competition for sampling must not condition on whether
+// the current neural draw agrees. The owner chooses using pre-draw width and
+// past observations; deterministic greedy keeps the prior agreement rule.
+inline bool lookup_competes(bool sampled, bool neural, int32_t first_lookup, int32_t first_neural) {
+    return sampled || !neural || first_lookup == first_neural;
+}
 
 }  // namespace strata::spec

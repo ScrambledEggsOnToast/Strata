@@ -40,6 +40,8 @@ namespace {
 
 constexpr char kManifestTag[8] = {'S', 'T', 'C', 'S', 'M', 'A', 'N', '1'};
 constexpr char kCertifiedManifestTag[8] = {'S', 'T', 'C', 'S', 'M', 'A', 'N', '2'};
+constexpr char kNeuralManifestTag[8] = {'S', 'T', 'C', 'S', 'M', 'A', 'N', '3'};
+constexpr uint64_t kDraftIdentityEncodedBytes = 181;
 constexpr char kCatalogTag[8] = {'S', 'T', 'C', 'S', 'C', 'A', 'T', '1'};
 constexpr char kBucketTag[10] = {'S', 'T', 'C', 'S', 'B', 'U', 'C', 'K', 'E', 'T'};
 constexpr char kObjectTag[8] = {'S', 'T', 'C', 'S', 'O', 'B', 'J', '1'};
@@ -313,11 +315,49 @@ KvMeta kv_meta(const ConversationKv& layer) {
     return meta;
 }
 
+uint64_t kv_part_bytes(const ConversationKv& layer, size_t part) {
+    const ConversationBuffer* buffers[] = {&layer.k, &layer.v, &layer.k_scale, &layer.v_scale, &layer.pooled};
+    return buffers[part]->size();
+}
+uint64_t kv_part_bytes(const KvMeta& layer, size_t part) { return layer.part[part]; }
+
 // Scalar-only: admission and decode share this before allocating any payload.
 template<class Kv>
 bool check_draft(const std::array<int64_t, 18>& g, int64_t lo, int64_t hi, uint64_t tokens,
                  int64_t begin, int64_t cells, int32_t next, uint64_t boundary,
-                 const Kv* kv, size_t count, std::string& why) {
+                 const Kv* kv, size_t count, std::string& why,
+                 const DraftIdentity& identity, int64_t origin) {
+    const bool native = identity.kind == DraftKind::dflash2;
+    if (identity.kind != DraftKind::none && identity.kind != DraftKind::mtp && !native) {
+        why = "unknown neural draft kind"; return false;
+    }
+    if (identity.kind != DraftKind::none && (!identity.bound() || identity.format != 1)) {
+        why = "neural draft has absent weight identity or unsupported numerical format"; return false;
+    }
+    if (native) {
+        if (identity.geometry != std::array<int64_t, 8>{5, 2560, 8, 128, 2047, 4, 262144, 16} ||
+            !digest_nonzero(identity.configuration) || !digest_nonzero(identity.borrowed_target) ||
+            origin < 0 || begin < origin || cells < begin || cells > 262144 || uint64_t(cells) != tokens ||
+            begin != std::max(origin, cells - int64_t(2047)) || next != -1 || boundary || g[1] <= 0 ||
+            g[2] <= 0 || lo < 0 || hi != g[1]) {
+            why = "invalid native draft identity/geometry/committed interval"; return false;
+        }
+        const int64_t main = std::max<int64_t>(hi / g[2] - lo / g[2], g[1] / g[2] ? 1 : 0);
+        if (uint64_t(main) > count || count - size_t(main) != 5) {
+            why = "native draft does not contain exactly five own K/V layers"; return false;
+        }
+        const uint64_t bytes = uint64_t(cells - begin) * 8 * 128 * sizeof(uint16_t);
+        for (size_t layer = size_t(main); layer < count; ++layer) {
+            const auto& state = kv[layer];
+            if (state.format != 0 || state.cells != cells || state.heads != 8 || state.head_dim != 128 ||
+                state.page_size != 1 || state.pooled_rows || state.idx_dim ||
+                kv_part_bytes(state, 0) != bytes || kv_part_bytes(state, 1) != bytes ||
+                kv_part_bytes(state, 2) || kv_part_bytes(state, 3) || kv_part_bytes(state, 4)) {
+                why = "native draft K/V payload geometry or byte extent differs"; return false;
+            }
+        }
+        return true;
+    }
     if (begin == -1 && cells == -1 && next == -1 && boundary == 0) return true;
     if (begin < 0 || cells < begin || uint64_t(cells) > tokens ||
         (uint64_t(cells) == tokens ? next < 0 : next != -1)) {
@@ -356,7 +396,7 @@ bool check_image_draft(const SavedConversation& image, uint32_t stage, uint32_t 
     }
     return check_draft(image.geometry, image.layer_lo, image.layer_hi, image.live.ids.size(),
                        image.draft_begin, image.draft_cells, image.draft_next_token, boundary,
-                       image.kv.data(), image.kv.size(), why);
+                       image.kv.data(), image.kv.size(), why, image.draft_identity, image.draft_origin);
 }
 
 bool image_container(const SavedConversation& image, uint32_t stage, const ConversationStoreLimits& limits,
@@ -380,6 +420,7 @@ bool image_container(const SavedConversation& image, uint32_t stage, const Conve
     meta.draft_cells = image.draft_cells;
     meta.draft_next_token = image.draft_next_token;
     meta.draft_boundary_bytes = image.draft_boundary_residual.size();
+    meta.draft_identity = image.draft_identity; meta.draft_origin = image.draft_origin;
     out.boundary = &image.draft_boundary_residual;
     meta.record = record_meta(image.live);
     if (meta.record.tokens > limits.max_tokens) {
@@ -575,7 +616,8 @@ bool check_containers(const ManifestMeta& meta, const ConversationStoreLimits& l
             return false;
         }
         if (!check_draft(c.geometry, c.layer_lo, c.layer_hi, c.record.tokens, c.draft_begin, c.draft_cells,
-                         c.draft_next_token, c.draft_boundary_bytes, c.kv.data(), c.kv.size(), why))
+                         c.draft_next_token, c.draft_boundary_bytes, c.kv.data(), c.kv.size(), why,
+                         c.draft_identity, c.draft_origin))
             return false;
         if (c.draft_begin >= 0 && c.stage + 1 != meta.stages) {
             why = "draft certification belongs only to the final stage";
@@ -986,6 +1028,7 @@ bool bind_streams(const ManifestMeta& meta, const ConversationStoreLimits& limit
         image.draft_begin = c.draft_begin;
         image.draft_cells = c.draft_cells;
         image.draft_next_token = c.draft_next_token;
+        image.draft_identity = c.draft_identity; image.draft_origin = c.draft_origin;
         image.live.stage_parts.resize(c.record.parts);
         for (uint32_t j = 0; j < c.checkpoints.size(); ++j)
             image.checkpoints[j].stage_parts.resize(c.checkpoints[j].parts);
@@ -1137,7 +1180,8 @@ bool container_meta_equal(const ContainerMeta& a, const ContainerMeta& b) {
         a.layer_lo != b.layer_lo || a.layer_hi != b.layer_hi || a.cvec != b.cvec)
         return false;
     if (a.draft_begin != b.draft_begin || a.draft_cells != b.draft_cells ||
-        a.draft_next_token != b.draft_next_token || a.draft_boundary_bytes != b.draft_boundary_bytes)
+        a.draft_next_token != b.draft_next_token || a.draft_boundary_bytes != b.draft_boundary_bytes ||
+        !a.draft_identity.content_matches(b.draft_identity) || a.draft_origin != b.draft_origin)
         return false;
     if (a.checkpoints.size() != b.checkpoints.size()) return false;
     for (size_t i = 0; i < a.checkpoints.size(); ++i)
@@ -1539,7 +1583,8 @@ bool image_shape(const SavedConversation& image, const ConversationStoreLimits& 
         if (!check_image_draft(container, stage_index++, uint32_t(image.stage_images.size()) + 1, limits, why))
             return false;
         const uint64_t boundary = container.draft_boundary_residual.size();
-        out.certified = out.certified || container.draft_begin != -1;
+        out.kind_tagged = out.kind_tagged || container.draft_identity.kind != DraftKind::none;
+        out.certified = out.certified || container.draft_begin != -1 || out.kind_tagged;
         if (boundary) {
             out.streams = sat_add(out.streams, 1);
             out.payload_bytes = sat_add(out.payload_bytes, boundary);
@@ -1648,6 +1693,7 @@ uint64_t manifest_encoded_size_of(const ManifestShape& shape) {
     bytes = sat_add(bytes, 4);                                        // the container count
     bytes = sat_add(bytes, sat_mul(shape.containers, 244));           // 236 fixed + the checkpoint and K/V counts
     if (shape.certified) bytes = sat_add(bytes, sat_mul(shape.containers, 28));
+    if (shape.kind_tagged) bytes = sat_add(bytes, sat_mul(shape.containers, kDraftIdentityEncodedBytes));
     bytes = sat_add(bytes, sat_mul(shape.container_records, 21));
     bytes = sat_add(bytes, sat_mul(shape.kv_layers, 96));
     bytes = sat_add(bytes, 4);                                        // the stream count
@@ -1669,9 +1715,11 @@ ManifestShape manifest_shape(const ManifestMeta& meta) {
     for (const auto& stream : meta.streams) shape.chunks = sat_add(shape.chunks, uint64_t(stream.chunks.size()));
     shape.objects = uint64_t(meta.objects.size());
     shape.cuts = uint64_t(meta.cuts.size());
-    for (const auto& c : meta.containers)
-        if (c.draft_begin != -1 || c.draft_cells != -1 || c.draft_next_token != -1 || c.draft_boundary_bytes)
-            shape.certified = true;
+    for (const auto& c : meta.containers) {
+        shape.kind_tagged = shape.kind_tagged || c.draft_identity.kind != DraftKind::none;
+        if (c.draft_begin != -1 || c.draft_cells != -1 || c.draft_next_token != -1 ||
+            c.draft_boundary_bytes || shape.kind_tagged) shape.certified = true;
+    }
     return shape;
 }
 
@@ -1708,7 +1756,8 @@ std::vector<uint8_t> manifest_encode(const ManifestMeta& meta) {
     const auto shape = manifest_shape(meta);
     w.reserve(size_t(manifest_encoded_size_of(shape)));
     const bool certified = shape.certified;
-    w.raw(certified ? kCertifiedManifestTag : kManifestTag, sizeof kManifestTag);
+    w.raw(shape.kind_tagged ? kNeuralManifestTag : certified ? kCertifiedManifestTag : kManifestTag,
+          sizeof kManifestTag);
     w.u64(meta.payload_bytes);
     w.u64(meta.epoch);
     w.u64(meta.generation);
@@ -1739,6 +1788,14 @@ std::vector<uint8_t> manifest_encode(const ManifestMeta& meta) {
             w.i64(c.draft_cells);
             w.u32(uint32_t(c.draft_next_token));
             w.u64(c.draft_boundary_bytes);
+        }
+        if (shape.kind_tagged) {
+            w.u8(uint8_t(c.draft_identity.kind)); w.u32(c.draft_identity.format);
+            w.digest(c.draft_identity.weights); w.digest(c.draft_identity.configuration);
+            w.digest(c.draft_identity.borrowed_target);
+            w.u64(0); // load generations are process-local, never persistent authority
+            for (auto dimension : c.draft_identity.geometry) w.i64(dimension);
+            w.i64(c.draft_origin);
         }
         w.u32(uint32_t(c.checkpoints.size()));
         for (const auto& checkpoint : c.checkpoints) {
@@ -1803,7 +1860,8 @@ bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreL
         why = "the manifest is larger than ConversationStoreLimits::max_manifest_bytes";
         return false;
     }
-    const bool certified = std::memcmp(bytes, kCertifiedManifestTag, sizeof kCertifiedManifestTag) == 0;
+    const bool tagged = std::memcmp(bytes, kNeuralManifestTag, sizeof kNeuralManifestTag) == 0;
+    const bool certified = tagged || std::memcmp(bytes, kCertifiedManifestTag, sizeof kCertifiedManifestTag) == 0;
     if (!certified && std::memcmp(bytes, kManifestTag, sizeof kManifestTag) != 0) {
         why = "the manifest does not start with the store's schema tag";
         return false;
@@ -1821,7 +1879,8 @@ bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreL
         why = "the manifest's header is truncated";
         return false;
     }
-    if (!r.count(count, limits.max_images, kContainerEncodedMin + (certified ? 28 : 0))) {
+    if (!r.count(count, limits.max_images, kContainerEncodedMin + (certified ? 28 : 0) +
+                 (tagged ? kDraftIdentityEncodedBytes : 0))) {
         why = "the manifest's container count is invalid";
         return false;
     }
@@ -1864,6 +1923,19 @@ bool manifest_decode(const uint8_t* bytes, size_t size, const ConversationStoreL
                 return false;
             }
             c.draft_next_token = int32_t(token);
+        }
+        if (tagged) {
+            uint8_t kind = 0;
+            if (!r.u8(kind) || kind > uint8_t(DraftKind::dflash2) || !r.u32(c.draft_identity.format) ||
+                !r.digest(c.draft_identity.weights) || !r.digest(c.draft_identity.configuration) ||
+                !r.digest(c.draft_identity.borrowed_target) || !r.u64(c.draft_identity.load_generation) ||
+                c.draft_identity.load_generation != 0) {
+                why = "a manifest's neural draft identity is truncated/noncanonical"; return false;
+            }
+            c.draft_identity.kind = DraftKind(kind);
+            for (auto& dimension : c.draft_identity.geometry)
+                if (!r.i64(dimension)) { why = "a manifest's draft geometry is truncated"; return false; }
+            if (!r.i64(c.draft_origin)) { why = "a manifest's draft origin is truncated"; return false; }
         }
         uint32_t checkpoints = 0;
         if (!r.count(checkpoints, limits.max_checkpoints, kCheckpointEncodedMin)) {

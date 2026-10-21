@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -116,11 +117,57 @@ PList chain_list(const std::vector<float>& l, const std::vector<int>& hist, cons
     }
     return L;
 }
+// A resident predictor is a one-row target call, not an automatic bonus row.
+// p=(3/4,1/4), q=(1/4,3/4), proposed=1: acceptance is 1/3;
+// rejection has all residual mass on token 0. Philox seed 1 accepts and seed 3
+// rejects at position 0. Ordinary sampling at seed 1 would pick 0, so this
+// catches silently treating the row as a bonus or dropping its conditional q.
+int single_row_contract() {
+    float* logits = nullptr;
+    int32_t *draft = nullptr, *q = nullptr, *out = nullptr;
+    check(cudaMalloc((void**) &logits, 2 * sizeof(float)), "single logits");
+    check(cudaMalloc((void**) &draft, sizeof(int32_t)), "single draft");
+    check(cudaMalloc((void**) &q, strata::core::kSpecQStride * sizeof(int32_t)), "single q");
+    check(cudaMalloc((void**) &out, sizeof(int32_t)), "single output");
+    const std::array<float, 2> values{std::log(3.0f), 0.0f};
+    const int32_t proposed = 1;
+    std::array<int32_t, strata::core::kSpecQStride> row{};
+    std::fill_n(row.begin(), strata::core::kSpecQEntries, -1);
+    row[0] = 0; row[1] = 1;
+    const std::array<float, 2> probabilities{0.25f, 0.75f};
+    std::memcpy(row.data() + strata::core::kSpecQEntries, probabilities.data(), sizeof(probabilities));
+    check(cudaMemcpy(logits, values.data(), sizeof(values), cudaMemcpyHostToDevice), "single upload logits");
+    check(cudaMemcpy(draft, &proposed, sizeof(proposed), cudaMemcpyHostToDevice), "single upload draft");
+    check(cudaMemcpy(q, row.data(), sizeof(row), cudaMemcpyHostToDevice), "single upload q");
+    SamplerParams p;
+    p.top_k = 2; p.top_p = 1.0f; p.min_p = 0.0f; p.temperature = 1.0f; p.counter = 0;
+    int failures = 0;
+    for (uint64_t seed : {uint64_t(1), uint64_t(3)}) {
+        p.seed = seed;
+        if (!strata::kernels::sample_tokens_spec(logits, 1, 2, nullptr, 0, p, draft, q, 1, 1, out, nullptr))
+            { std::fprintf(stderr, "single predictor rejection sampling unavailable\n"); ++failures; continue; }
+        int32_t token = -1;
+        check(cudaMemcpy(&token, out, sizeof(token), cudaMemcpyDeviceToHost), "single output");
+        if (token != (seed == 1 ? 1 : 0)) ++failures;
+    }
+    p.seed = 1;
+    if (!strata::kernels::sample_tokens_spec(logits, 1, 2, nullptr, 0, p, nullptr, nullptr, 0, 0, out, nullptr))
+        ++failures;
+    else {
+        int32_t token = -1;
+        check(cudaMemcpy(&token, out, sizeof(token), cudaMemcpyDeviceToHost), "single bonus output");
+        if (token != 0) ++failures;
+    }
+    cudaFree(logits); cudaFree(draft); cudaFree(q); cudaFree(out);
+    std::printf("spec_verify single-row contract: 3 cases, %d failures\n", failures);
+    return failures ? 1 : 0;
+}
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    (void) argc; (void) argv;
+    if (argc == 2 && std::strcmp(argv[1], "--single-row") == 0) return single_row_contract();
+    if (single_row_contract()) return 1;
     std::mt19937_64 g(777);
     long long rows = 0, accepted = 0, rejected = 0, plain = 0, bad = 0, qrows_total = 0;
     const int vocabs[] = {1000, 50000, 248320};
@@ -207,7 +254,7 @@ int main(int argc, char** argv) {
                 check(cudaMemcpy(d_dtok, dtok.data(), dtok.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "up dtok");
                 check(cudaMemcpy(d_q, qbuf.data(), qbuf.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "up q");
                 const bool ran = strata::kernels::sample_tokens_spec(d_logits, T, nv, pen ? d_hist : nullptr, pen ? 64 : 0, p,
-                                                                     d_dtok, d_q, n_q, d_out, nullptr);
+                                                                     d_dtok, d_q, T - 1, n_q, d_out, nullptr);
                 if (!ran) { std::printf("sample_tokens_spec did not run (nv %d T %d)\n", nv, T); return 1; }
                 check(cudaDeviceSynchronize(), "sync");
                 int out[kMaxT];

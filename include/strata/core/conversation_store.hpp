@@ -159,8 +159,11 @@ struct ConversationStoreOptions {
     // Hard ceiling on this module's in-RAM index *and* preparation: no job descriptor, token/image copy or index
     // entry is allocated that would cross it.
     uint64_t metadata_bytes = uint64_t(64) << 20;
-    // Hard retained-head ceiling: a publication that cannot obtain a slot (every head pinned or leased) is refused
-    // instead of overrunning it.  The protected segment is capped at three quarters of it.
+    // Hard retained-head ceiling *per execution domain*: each domain's publications retire only that domain's heads,
+    // so one profile's writes can never evict another profile's completed history.  A publication that cannot obtain
+    // a slot (every head of its own domain pinned or leased) is refused instead of overrunning it.  The protected
+    // segment is capped at three quarters of one domain's allowance.  `quota_bytes`, `min_free_bytes` and
+    // `metadata_bytes` stay global: they describe the one shared device and its one in-RAM index.
     size_t head_limit = 128;
     uint64_t chunk_bytes = uint64_t(1) << 20;      // immutable object size (the tail may be shorter)
     // One materialized incoming image at a time by default.  The slot is held from the moment a read starts

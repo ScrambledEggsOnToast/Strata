@@ -26,6 +26,7 @@
 #include "strata/core/operation_canary.hpp"
 #include "strata/core/operation_lease.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/neural_drafter.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -42,9 +43,9 @@ namespace strata::core {
 
 class NativeHead;
 
-class MtpDrafter {
+class MtpDrafter : public NeuralDrafter {
 public:
-    MtpDrafter() = default;
+    MtpDrafter() { identity_.kind = DraftKind::mtp; identity_.format = 1; }
     ~MtpDrafter();
     MtpDrafter(const MtpDrafter&) = delete;
     MtpDrafter& operator=(const MtpDrafter&) = delete;
@@ -62,12 +63,13 @@ public:
     /// table.  nullptr switches it off.
     void set_route_resident(const int32_t* res_row, float margin, int lo, int hi) {
         rr_res_ = res_row; rr_margin_ = margin; rr_lo_ = lo; rr_hi_ = hi;
+        refresh_configuration_identity();
     }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
     /// --mtp-hnorm stream (opt-in; before the first draft or prefill): pre_fc_norm_hidden normalizes each
     /// hyper-connection stream on its own, as llama.cpp's qwen4exp MTP graph does, instead of one RMS over all four.
-    void set_hnorm_per_stream(bool on) { hnorm_stream_ = on; }
+    void set_hnorm_per_stream(bool on) { hnorm_stream_ = on; refresh_configuration_identity(); }
     bool hnorm_per_stream() const { return hnorm_stream_; }
     /// --mtp-q4 (opt-in; before load): the draft layer's Q8_0 projections and its draft head run from 4-bit (Q4_0)
     /// copies made at load/bind - fewer bytes per draft step; drafts only, the verify window decides every token.
@@ -200,12 +202,8 @@ public:
     const float* tensor_f32(const char* name) const { return f32(name); }
     const uint16_t* tensor_bf16(const char* name) const { return bf16(name); }
     const void* tensor_q8(const char* name) const { return q8(name); }
-    bool bind_request(int slot, uint64_t request, std::string& err);
     int64_t first_needed(int slot = 8) const;
     int device() const { return device_; }
-    bool idle(std::string& err);
-    /// Lifecycle preflight: unlike idle(), also rejects an owned/poisoned lease.
-    bool context_idle(std::string& err);
 
     // Resident requests share immutable MTP weights and serialized operation
     // scratch, never K/V. Allocate/capture once before requests are admitted.
@@ -219,68 +217,42 @@ public:
                       bool reset, std::string& err);
     bool prefill_slot(int slot, const float* residuals, const int32_t* next_tokens,
                       int64_t rows, int64_t position, std::string& err);
-    int64_t slot_cells(int slot) const;
-    int64_t slot_begin(int slot) const;
-    int64_t slot_prompt_len(int slot) const;
-    int32_t slot_next_token(int slot) const;
-    bool slot_covers(int slot, int64_t cells, int64_t prompt_length = 0) const;
-    // The cell a resume judges the chain at: its own certified extent. A park copies every row its slot
-    // holds but certifies only the cells the chain completed, so a resumed resident prefix can reach
-    // past it. Judging the resume at that prefix refused a real continuation (2026-10-18).
-    int64_t slot_resume_frontier(int slot, int64_t cells) const;
     bool advance_slot(int slot, const float* residual, int32_t next_token,
-                      int64_t cell, std::string& err);
-    // Drained producer certification; unknown state is never inferred from length.
-    void certify_view(ConversationView& view, int slot = 8) const;
-    void restored_snapshot(const SavedConversation& image, int64_t cells);
-    void invalidate_coverage();
-    // Opt-in seam capture: source rows are copied during their owning operation,
-    // before another verifier/prefill can replace them. -1 disables capture.
-    void set_boundary_capture(int64_t position);
-    bool capture_boundary(const float* residual, int64_t position, uint64_t request, std::string& err);
-    ConversationDraftCoverage completed_coverage() const {
-        return async_owned_ ? ConversationDraftCoverage{} : coverage_;
-    }
-    void set_batch_drafting(bool on) { batch_drafting_ = on; }
+                      int64_t cell, std::string& err) override;
+    using NeuralDrafter::propose_slot;
     bool propose_slot(int slot, const float* residual, int32_t next_token, int64_t cell,
                       int32_t& proposal, std::string& err);
+    bool enabled() const override { return st_.max_cells > 0; }
+    DraftAllocationPlan allocation_plan() const override;
+    const QsaState* legacy_state(int slot = 8) const override {
+        return slot == 8 ? &st_ : slot_state(slot);
+    }
+    uint64_t copy_bytes(int slot, int64_t cells, bool direct, std::string&) const override;
+    bool snapshot_capture(SavedConversation&, Operation&, std::string&) override;
+    bool snapshot_preflight(const SavedConversation&, int slot, int64_t cells,
+                            ConversationSnapshotExpectation, std::string&) const override;
+    bool snapshot_restore(const SavedConversation&, Operation&, int64_t cells, int64_t prompt_length,
+                          int32_t next_token, ConversationSnapshotExpectation, std::string&) override;
     const QsaState* slot_state(int slot) const;
 
 private:
     friend class strata::prefill::Prefill;
-    friend class strata::program::ResidentSlots;
     friend struct strata::program::ResidentDraftReadinessFixture;
     friend struct MtpDrafterCertificationFixture;
     friend struct MtpDraftFrontierFixture;
     friend struct MtpResumedParkFixture;
-    // Prompt and resident operations serialize shared scratch with a bounded wait.
-    // Failed work stays poisoned; only a successfully drained operation releases it.
-    class Operation {
-    public:
-        Operation(MtpDrafter& owner, std::string& err, int slot = 8, cudaStream_t external = nullptr,
-                  int32_t token = 0, int32_t position = 0);
-        ~Operation();
-        explicit operator bool() const { return acquired_; }
-        bool finish(std::string& err);
-        void writes(int64_t begin, int64_t end, int32_t next_token);
-        bool boundary(const float* rows, int64_t begin, int64_t count, std::string& err);
-        void detach() { finished_ = true; owner_.async_owned_ = true; lease_.complete(); }
-    private:
-        MtpDrafter& owner_;
-        OperationLease::Guard lease_;
-        bool acquired_ = false, finished_ = false;
-        int slot_ = 8;
-        cudaStream_t external_ = nullptr;
-    };
-    OperationLease scratch_;
-    bool idle_owned(std::string& err); // caller holds scratch_, including detached-work completion
-    bool scratch_idle(std::string& err, bool wait); // resident preflight may wait; lifecycle checks may not
-    OperationCanary canary_;
+    DraftSlotState* slot_metadata(int slot) override;
+    const DraftSlotState* slot_metadata(int slot) const override;
+    int64_t state_capacity(int slot) const override;
+    bool proposal_preflight(int, const float*, int32_t, int64_t, std::string&) const override;
+    bool propose_impl(Operation&, const float*, int32_t, int64_t, DraftProposal&, std::string&) override;
+    bool drain_adapter(std::string&) override { return true; }
+    void refresh_configuration_identity();
     bool draft_impl(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                     float* probs, float min_p, int* n_drafts);
     bool restore_ring(int64_t upto, std::string& err);
-    bool catchup_slot(int slot, const ConversationBuffer& residual, int32_t next_token,
-                      int64_t cell, std::string& err);
+    bool catchup_owned(Operation&, int slot, const ConversationBuffer&, int32_t next_token,
+                       int64_t cell, std::string& error);
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err,
                         const QsaState* state = nullptr);
     bool prepare_slots(std::string& err);
@@ -314,7 +286,6 @@ private:
     const uint16_t* bf16(const char* name) const;
     const void* q8(const char* name) const;
 
-    const ModelGeometry* g_ = nullptr;
     SessionState* ss_ = nullptr;
     SessionState* ple_ss_ = nullptr;
     const WeightTable* wt_ = nullptr;
@@ -322,7 +293,6 @@ private:
     const float* window_R_ = nullptr;
     int max_t_ = 0;
     strata::plan::QsaPlacement state_placement_; // finalized before capture; default slots inherit it
-    int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;
     bool hnorm_stream_ = false;
     bool q4_ = false, q4_head_ = false;
@@ -340,7 +310,7 @@ private:
     std::vector<float> lg_host_;
     // --pipeline-windows 2 (chain_launch)
     bool stage_source_R(int T, std::string& err);   ///< set_source_R's rows into the bound buffer
-    bool force_on_ = false, chain_live_ = false;
+    bool force_on_ = false;
     const float* src_R_ = nullptr;
     int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick
     cudaEvent_t ev_chain_ = nullptr;
@@ -350,7 +320,6 @@ private:
     float chain_prob_[8] = {};
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
-    cudaStream_t cs_ = nullptr;
     cudaGraphExec_t prefill_exec_[9] = {};
     cudaGraphExec_t prefill_dev_exec_[9] = {};
     PinnedRing pf_ring_;          ///< #1996: the records above go up from a pinned slot, not from the pageable vector they are built in
@@ -366,36 +335,15 @@ private:
     uint8_t* experts_ = nullptr;
     void* state_arena_ = nullptr;
     QsaState st_;
-    struct SlotState {
+    struct SlotState : DraftSlotState {
         QsaState state;
         void* arena = nullptr;
         cudaGraphExec_t advance = nullptr;
-        int64_t cells = 0;
-        // Logical main progress may be one cell ahead at ambient admission;
-        // only this independently completed extent can certify draft reuse.
-        int64_t completed_cells = -1;
-        int64_t begin = 0, prompt_len = 0;
-        bool certified = false;
-        int32_t tail_token = -1;
-        uint64_t request = 0;
         SessionState* session = nullptr;
         uint64_t arena_bytes = 0;
-        int32_t proposal = -1;
-        int64_t proposal_cell = -1;
-        int32_t proposal_token = -1;
     };
     static_assert(sizeof(SlotState) <= 4096, "resident.hpp slot owner envelope");
     std::vector<SlotState> slots_;
-    bool batch_drafting_ = false;
-    bool async_owned_ = false;
-    ConversationDraftCoverage coverage_, pending_coverage_;
-    uint64_t working_request_ = 0, coverage_owner_ = 0;
-    int pending_slot_ = 8;
-    bool pending_writes_ = false, pending_boundary_ = false;
-    int64_t boundary_capture_ = -1, boundary_position_ = -1;
-    uint64_t boundary_owner_ = 0;
-    ConversationBuffer boundary_residual_;
-    void complete_writes();
     void* arena_ = nullptr;
 
     // mapped staging: tokens, step records (2*max_t rows), positions per head (2*max_t rows), the selected row,
@@ -409,8 +357,6 @@ private:
     int32_t* dvocab_ = nullptr;
     int64_t n_dvocab_ = 0;
     std::string rt_dir_;
-    int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
-    int64_t prompt_len_ = 0;
     const int32_t* rr_res_ = nullptr;
     float rr_margin_ = 0.0f;
     int rr_lo_ = 6, rr_hi_ = 9;

@@ -18,6 +18,7 @@ inline constexpr int hidden_size = 2560;
 inline constexpr int vocabulary_size = 248320;
 inline constexpr int mask_token = 248077;
 inline constexpr int block_size = 4;
+inline constexpr int max_verify_rows = 8; // engine mixed-policy target window, not the fixed drafter block
 inline constexpr int context_rows = 2047;
 inline constexpr int max_position = 262144;
 inline constexpr std::array<int, 5> tap_layers{5, 15, 25, 35, 45};
@@ -67,13 +68,19 @@ class CaptureStore {
 public:
     CaptureStore(std::string request_id, int64_t incarnation, int origin = 0,
                  int capture_capacity = context_rows);
+    // Native resident mode: only the committed ring/tags belong to this owner.
+    // Staging and lease outlive every store. The held common lease authorizes
+    // every use, so independently bound requests cannot overlap this staging.
+    CaptureStore(std::string request_id, int64_t incarnation, int origin,
+                 std::span<uint16_t> shared_tentative, OperationLease& shared_lease);
     ~CaptureStore();
     CaptureStore(const CaptureStore&) = delete;
     CaptureStore& operator=(const CaptureStore&) = delete;
 
     // Rebind only a drained, unattached store with a newer buffer incarnation.
     void reset(std::string request_id, int64_t incarnation, int origin = 0);
-    void begin(const Operation&, int start, int count, CapturePhase);
+    void begin(const Operation&, int start, int count, CapturePhase,
+               const OperationLease::Guard* lease = nullptr);
     // materialized_layer is the tap itself in prefill, tap+1 in verification.
     // Verification must read the previous layer's completed R, not mixed, after
     // the next layer's FIRST gr_read_group and before its attention writes R.
@@ -93,6 +100,13 @@ public:
     bool poisoned() const noexcept { return poisoned_; }
     bool capturing() const noexcept { return active_; }
     size_t storage_bytes() const noexcept;
+    static constexpr size_t committed_bytes() {
+        return size_t(context_rows) * (feature_row_bytes + sizeof(int64_t));
+    }
+    static constexpr size_t tentative_bytes() { return max_feature_bytes; }
+    // An actually restored context authorizes only this future capture frontier,
+    // never reconstructed feature rows or a producer readiness certificate.
+    void resume(std::string_view request_id, int64_t incarnation, int origin, int frontier);
     static constexpr size_t planned_bytes(int capacity = context_rows) {
         return (size_t(context_rows) + size_t(capacity)) * feature_row_bytes +
                size_t(context_rows) * sizeof(int64_t);
@@ -107,6 +121,9 @@ private:
     int64_t incarnation_, generation_ = 0;
     int origin_, capacity_, end_, retained_ = 0, head_ = 0;
     std::unique_ptr<uint16_t[]> ring_, tentative_;
+    uint16_t* tentative_data_ = nullptr;
+    OperationLease* shared_lease_ = nullptr;
+    const OperationLease::Guard* active_lease_ = nullptr;
     std::unique_ptr<int64_t[]> ring_generations_;
     Operation operation_;
     int start_ = 0, count_ = 0;

@@ -291,11 +291,17 @@ bool draft_view_validate(const ConversationView& view, const ModelGeometry& g, b
                          size_t& boundary_bytes, std::string& error) {
     boundary_bytes = 0;
     const int64_t live = int64_t(view.ids.size());
+    const bool native = view.draft_identity.kind == DraftKind::dflash2;
+    owns = owns || native;
     const bool unknown = view.draft_begin == -1 && view.draft_tokens == -1 && view.draft_next_token == -1;
     if (!unknown && (!owns || view.draft_begin < 0 || view.draft_tokens < view.draft_begin ||
-        view.draft_tokens > live || (view.draft_tokens == live ? view.draft_next_token < 0 :
-                                                                view.draft_next_token != -1)))
+        view.draft_tokens > live || (native ? view.draft_tokens != live || view.draft_next_token != -1 :
+            (view.draft_tokens == live ? view.draft_next_token < 0 : view.draft_next_token != -1))))
         return fail(error, "incoherent completed draft interval");
+    if (native && (!view.draft_identity.bound() || !view.draft_owner ||
+        view.draft_origin < 0 || view.draft_origin > view.draft_begin ||
+        view.draft_tokens - view.draft_begin > 2047 || view.draft_boundary_residual))
+        return fail(error, "native draft lacks drained committed context certification");
     if (view.draft_boundary_residual) {
         if (!owns || unknown || view.draft_tokens != live - 1 || !view.draft_owner ||
             view.draft_boundary_owner != view.draft_owner || view.draft_boundary_position != live - 1 ||
@@ -306,9 +312,9 @@ bool draft_view_validate(const ConversationView& view, const ModelGeometry& g, b
     } else if (view.draft_boundary_position != -1 || view.draft_boundary_owner)
         return fail(error, "boundary ownership without a residual");
     if (view.exact_cut && (!view.images.empty() || !view.checkpoints.empty() ||
-        (owns && (unknown || view.draft_tokens != live - 1 ||
-                  (view.draft_owner && !view.draft_boundary_residual)))))
-        return fail(error, "exact cut requires completed N-1 draft cells and its owned boundary residual");
+        (owns && (unknown || view.draft_tokens != live - (native ? 0 : 1) ||
+                  (!native && view.draft_owner && !view.draft_boundary_residual)))))
+        return fail(error, "exact cut lacks its kind-specific producer certificate");
     return true;
 }
 }
@@ -367,6 +373,15 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
         !product(layers, {qsa + (draft ? 1 : 0), sizeof(ConversationKv)}) ||
         !product(tails, {qsa, z.tail}) || !product(dead, {qsa, z.dead}) ||
         !product(positions, {qsa, z.block_pos})) return fail(error, "snapshot metadata byte count overflow");
+    if (view.draft_identity.kind == DraftKind::dflash2) {
+        const uint64_t rows = uint64_t(view.draft_tokens - view.draft_begin);
+        ConversationBuffer buffer;
+        const size_t part = buffer.allocation_peak(size_t(rows) * 8 * 128 * sizeof(uint16_t));
+        size_t native = 0;
+        if (part == SIZE_MAX || !product(native, {10, part}) ||
+            !add(bytes, native) || !add(bytes, 5 * sizeof(ConversationKv)))
+            return fail(error, "native draft snapshot byte count overflow");
+    }
     for (size_t n : {ids, images, checkpoints, layers, tails, dead, positions, z.gdn, ss.ple_hist ? z.ple : 0})
         if (!add(bytes, n)) return fail(error, "snapshot byte count overflow");
     if (immutable_checkpoints_enabled()) {
@@ -394,7 +409,9 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
         return fail(error, "an exact shared cut cannot retain bytes from another captured image");
     if (reuse.kv.empty()) return true;
     const size_t layers = owned_qsa(ss) + (draft ? 1 : 0);
-    if (reuse.kv.size() != layers || reuse.unchanged_tokens < 0 ||
+    const bool native = view.draft_identity.kind == DraftKind::dflash2;
+    const size_t directory_layers = layers + (native ? 5 : 0);
+    if (reuse.kv.size() != directory_layers || reuse.unchanged_tokens < 0 ||
         reuse.unchanged_tokens > reuse.captured_tokens || reuse.unchanged_tokens > int64_t(view.ids.size()))
         return fail(error, "invalid retained K/V prefix");
     for (size_t i = 0; i < layers; ++i) {
@@ -407,8 +424,22 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
         bytes -= fresh;
         if (!add(bytes, retained)) return fail(error, "retained K/V allocation overflow");
     }
+    if (native) {
+        const size_t rows = size_t(view.draft_tokens - view.draft_begin);
+        const size_t part = rows * 8 * 128 * sizeof(uint16_t);
+        ConversationBuffer empty;
+        const size_t fresh = empty.allocation_peak(part);
+        for (size_t layer = layers; layer < directory_layers; ++layer)
+            for (const auto* buffer : {&reuse.kv[layer].k, &reuse.kv[layer].v}) {
+                bytes -= fresh;
+                const size_t peak = buffer->allocation_peak(part);
+                if (peak == SIZE_MAX || !add(bytes, peak))
+                    return fail(error, "native draft retained buffer allocation overflow");
+            }
+    }
     size_t directory = 0;
-    if (!product(directory, {reuse.kv.capacity() - layers, sizeof(ConversationKv)}) || !add(bytes, directory))
+    if (!product(directory, {reuse.kv.capacity() - directory_layers, sizeof(ConversationKv)}) ||
+        !add(bytes, directory))
         return fail(error, "retained K/V directory overflow");
     return true;
 }
@@ -427,7 +458,9 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     captured.live.ids = view.ids; captured.live.imgs = view.images;
     captured.cvec = view.cvec; captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints);
-    if (draft && view.draft_owner) {
+    captured.draft_identity = view.draft_identity;
+    captured.draft_origin = view.draft_origin;
+    if ((draft || view.draft_identity.kind == DraftKind::dflash2) && view.draft_owner) {
         captured.draft_begin = view.draft_begin; captured.draft_cells = view.draft_tokens;
         captured.draft_next_token = view.draft_next_token;
         if (view.draft_boundary_residual)
@@ -460,7 +493,8 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
         }
     };
     captured.kv = std::move(reuse.kv);
-    captured.kv.resize(layers + (draft ? 1 : 0));
+    captured.kv.resize(layers + (draft ? 1 : 0) +
+                       (view.draft_identity.kind == DraftKind::dflash2 ? 5 : 0));
     if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
     const int64_t upto = (int64_t) view.ids.size();
     for (size_t j = 0; j < layers; ++j) {
@@ -533,12 +567,24 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
                                    const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
                                    const QsaState* draft, std::string& error) {
     if (view.exact_cut) return fail(error, "an exact cut requires the sanitizing snapshot capture");
-    if (!view_validate(view, ss, g, error) || !sync(error)) return false;
+    if (view.draft_identity.kind == DraftKind::dflash2 ||
+        (view.draft_identity.kind == DraftKind::mtp && !draft))
+        return fail(error, "kind-tagged native capture requires its neural owner, not a QSA source");
+    size_t boundary_bytes = 0;
+    if (!draft_view_validate(view, g, draft != nullptr, boundary_bytes, error) ||
+        !view_validate(view, ss, g, error) || !sync(error)) return false;
     SavedConversation captured;
     captured.geometry = geometry_key(g);
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     captured.live.ids = view.ids; captured.live.imgs = view.images;
     captured.cvec = view.cvec; captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints);
+    captured.draft_identity = view.draft_identity; captured.draft_origin = view.draft_origin;
+    if (draft && view.draft_owner) {
+        captured.draft_begin = view.draft_begin; captured.draft_cells = view.draft_tokens;
+        captured.draft_next_token = view.draft_next_token;
+        if (view.draft_boundary_residual)
+            captured.draft_boundary_residual = view.draft_boundary_residual->frozen_alias();
+    }
     if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
     const int64_t upto = (int64_t) view.ids.size();
     const size_t layers = owned_qsa(ss);
@@ -570,6 +616,10 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
     l.geometry = geometry_key(g);
     l.layer_range = std::make_pair(ss.layer_lo, ss.layer_hi);
     l.max_state_bytes = {z.gdn, ss.ple_hist ? z.ple : 0, tails, dead, block_pos};
+    size_t boundary_limit = 0;
+    if (draft && !product(boundary_limit, {uint64_t(g.n_embd), uint64_t(g.hc), sizeof(float)}))
+        return fail(error, "draft boundary read limit overflow");
+    l.max_draft_boundary_bytes = boundary_limit;
     l.max_kv_bytes.assign(l.max_kv_layers, {});
     for (size_t j = 0; j < layers; ++j) {
         const auto& st = owned(ss, j);
@@ -586,9 +636,14 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
 
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss,
                                     const ModelGeometry& g, const QsaState* draft,
-                                    ConversationSnapshotExpectation expectation, std::string& error) {
+                                    ConversationSnapshotExpectation expectation, std::string& error,
+                                    const DraftIdentity* identity) {
+    const bool native = image.draft_identity.kind == DraftKind::dflash2;
     if (!image.live.stage_parts.empty())
         return fail(error, "a running checkpoint's stage parts belong in the stage images, not in live.stage_parts");
+    if ((image.draft_identity.kind != DraftKind::none &&
+         (!identity || !identity->content_matches(image.draft_identity))) || (native && draft))
+        return fail(error, "foreign draft kind/weights/borrowed target/geometry");
     if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
     // an image holds exactly one carve's running state and K/V: same layer range or nothing
     if (image.layer_lo != ss.layer_lo || image.layer_hi != ss.layer_hi)
@@ -596,14 +651,33 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     const ConversationView view{image.live.ids, image.live.imgs, image.checkpoints, image.cvec};
     if (!view_validate(view, ss, g, error) || !conversation_checkpoint_validate(image.live, ss, g, error)) return false;
     const size_t layers = owned_qsa(ss);
-    if (image.kv.size() != layers + (draft ? 1 : 0)) return fail(error, "invalid K/V layer count");
+    if (image.kv.size() != layers + (native ? 5 : draft ? 1 : 0))
+        return fail(error, "invalid kind-specific K/V layer count");
     const int64_t upto = (int64_t) image.live.ids.size();
     size_t boundary_bytes = 0;
     const bool unknown = image.draft_begin == -1 && image.draft_cells == -1 && image.draft_next_token == -1;
-    if (!unknown && (!draft || image.draft_begin < 0 || image.draft_cells < image.draft_begin ||
+    if (!unknown && ((!draft && !native) || image.draft_begin < 0 || image.draft_cells < image.draft_begin ||
         image.draft_cells > upto || image.draft_cells > image.kv.back().cells ||
-        (image.draft_cells == upto ? image.draft_next_token < 0 : image.draft_next_token != -1)))
+        (native ? image.draft_cells != upto || image.draft_next_token != -1 :
+         (image.draft_cells == upto ? image.draft_next_token < 0 : image.draft_next_token != -1))))
         return fail(error, "incoherent saved draft interval");
+    if (native) {
+        if (unknown || !image.draft_identity.bound() || image.draft_identity.format != 1 ||
+            image.draft_identity.geometry != std::array<int64_t, 8>{5, 2560, 8, 128, 2047, 4, 262144, 16} ||
+            image.draft_origin < 0 || image.draft_origin > image.draft_begin ||
+            image.draft_cells > 262144 || image.draft_cells - image.draft_begin > 2047 ||
+            !image.draft_boundary_residual.empty())
+            return fail(error, "invalid native context identity/origin/certification");
+        const uint64_t bytes = uint64_t(image.draft_cells - image.draft_begin) * 8 * 128 * sizeof(uint16_t);
+        for (size_t layer = layers; layer < image.kv.size(); ++layer) {
+            const auto& kv = image.kv[layer];
+            if (kv.format != 0 || kv.cells != image.draft_cells || kv.heads != 8 ||
+                kv.head_dim != 128 || kv.page_size != 1 || kv.pooled_rows || kv.idx_dim ||
+                kv.k.size() != bytes || kv.v.size() != bytes || !kv.k_scale.empty() ||
+                !kv.v_scale.empty() || !kv.pooled.empty())
+                return fail(error, "invalid five-layer 8x128 BF16 native K/V payload");
+        }
+    }
     if (!image.draft_boundary_residual.empty() && (!draft || unknown || image.draft_cells != upto - 1 ||
         !product(boundary_bytes, {uint64_t(g.n_embd), uint64_t(g.hc), sizeof(float)}) ||
         !boundary_bytes || image.draft_boundary_residual.size() != boundary_bytes))
@@ -659,8 +733,10 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
                                                    const ModelGeometry& g, const QsaState* draft,
                                                    ConversationSnapshotExpectation expectation, std::string& error,
-                                                   const ConversationCheckpoint* selected) {
-    if (!conversation_snapshot_validate(image, ss, g, draft, expectation, error)) return ConversationRestore::invalid;
+                                                   const ConversationCheckpoint* selected,
+                                                   const DraftIdentity* identity) {
+    if (!conversation_snapshot_validate(image, ss, g, draft, expectation, error, identity))
+        return ConversationRestore::invalid;
     // A cut is an existing sealed checkpoint of this exact image, never an arbitrary token junction.
     if (selected && std::none_of(image.checkpoints.begin(), image.checkpoints.end(),
             [&](const auto& c) { return &c == selected; })) {
@@ -674,7 +750,8 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
     for (size_t j = 0; j < owned_qsa(ss); ++j)
         if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, expectation, error, captured))
             return ConversationRestore::transfer_failed;
-    if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, expectation, error, captured)) ||
+    if ((draft && !identity && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false,
+                                                      expectation, error, captured)) ||
         !conversation_checkpoint_restore(running, ss, g, error)) return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
 }
