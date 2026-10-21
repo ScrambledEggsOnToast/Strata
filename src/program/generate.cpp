@@ -937,6 +937,7 @@ struct Options {
     /// this probability under the draft layer; 0 = always --spec-1 drafts.
     double spec_min_p = 0.0;
     bool dflash2_accept_hist = false;   // opt-in: per-(offered,accepted) histogram on resident completion
+    int dflash2_max_proposals = 3;      // native drafter: proposals verified per step (1..3); lossless truncation
     /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
     bool stop_eos = false;
     std::vector<int64_t> eos_ids = {248044, 248046};
@@ -3126,6 +3127,13 @@ int main(int argc, char** argv) {
         else if (a == "--adapt-min-gain") o.adapt_min_gain = (float) std::atof(next("--adapt-min-gain"));
         else if (a == "--adapt-async") o.adapt_async = std::atoi(next("--adapt-async")) != 0 ? 1 : 0;
         else if (a == "--dflash2-accept-hist") o.dflash2_accept_hist = true;
+        else if (a == "--dflash2-proposals") {
+            o.dflash2_max_proposals = std::atoi(next("--dflash2-proposals"));
+            if (o.dflash2_max_proposals < 1 || o.dflash2_max_proposals > 3) {
+                std::fprintf(stderr, "strata generate: --dflash2-proposals takes 1, 2 or 3\n");
+                return 2;
+            }
+        }
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
@@ -17088,9 +17096,12 @@ int main(int argc, char** argv) {
         // the stage-to-verifier mapping: one definition, before every use below (`batch_step` and the pipelined pump)
         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
         auto neural_row_width = [&](const BSlot& slot) {
-            const int proposals = use_dflash ? strata::spec::neural_window_width(slot.proposal.confidence.data(),
+            int proposals = use_dflash ? strata::spec::neural_window_width(slot.proposal.confidence.data(),
                 slot.proposal.count, S_mtp, float(slot.input.spec_min_probability),
                 !slot.sampling.greedy && slot.sampling.temperature > 0) - 1 : 1;
+            // Truncating the draft width is lossless: unverified proposals are simply discarded, exactly as if the
+            // drafter had offered fewer. It is the knob that trades verified rows against acceptance length.
+            if (use_dflash) proposals = std::min(proposals, o.dflash2_max_proposals);
             return int(std::max<int64_t>(1, std::min<int64_t>(
                 proposals + 1, std::min(slot.max_new - slot.produced, o.max_context - slot.p))));
         };
