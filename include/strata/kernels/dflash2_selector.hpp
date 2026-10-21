@@ -6,7 +6,7 @@
 
 namespace strata::kernels::dflash2 {
 
-inline constexpr int selector_rows = 7;
+inline constexpr int selector_rows = 3;
 inline constexpr int selector_hidden = 2560;
 inline constexpr int selector_vocabulary = 248320;
 inline constexpr int selector_rank = 256;

@@ -38,10 +38,10 @@ constexpr size_t logit_elements = size_t(gpu::selector_rows) * gpu::selector_voc
 constexpr double attention_absolute_tolerance = 1e-3;
 constexpr double probability_absolute_tolerance = 2e-6;
 constexpr double probability_mass_tolerance = 16 * double(std::numeric_limits<float>::epsilon());
-static_assert(gpu::capacity == 2047 && gpu::block == 8 && gpu::layers == 5);
+static_assert(gpu::capacity == 2047 && gpu::block == 4 && gpu::layers == 5);
 static_assert(gpu::query_heads == 32 && gpu::kv_heads == 8 && gpu::head_dim == 128);
 static_assert(gpu::hidden == 2560 && gpu::groups == 160 && gpu::dynamic_width == 640);
-static_assert(gpu::selector_rows == 7 && gpu::selector_candidates == 16);
+static_assert(gpu::selector_rows == 3 && gpu::selector_candidates == 16);
 static_assert(gpu::selector_hidden == gpu::hidden && gpu::selector_rank == 256);
 static_assert(gpu::selector_vocabulary == 248320);
 
