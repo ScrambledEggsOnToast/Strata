@@ -687,7 +687,7 @@ struct Options {
     std::string dump_routing;
     bool no_capture = false;          // run the layers directly instead of replaying graphs
     bool dflash2_capture = false;     // opt-in committed feature producer, also required by the native drafter
-    std::string dflash2, dflash2_manifest_sha256, dflash2_tokenizer;
+    std::string dflash2, dflash2_manifest_sha256, dflash2_tokenizer, target_verity_roots;
     /// Issue #60: the enforced MPS client ceiling this configuration is launched under, and
     /// the finite allowances the operator commits for the two classes that have no size API.
     /// The declared caps and outside-client allowance are explicit. Opaque-class allowances
@@ -1112,6 +1112,8 @@ void usage() {
                  "  --dflash2-capture   own the five committed target taps (opt-in CUDA build; serial fresh serve only)\n"
                  "  --dflash2 DIR       select the strict native DFlash2 drafter instead of --mtp (CUDA opt-in)\n"
                  "  --dflash2-manifest-sha256 SHA  independently pinned converted-directory manifest identity\n"
+                 "  --target-verity-roots FILE     release digest/fs-verity-root pins; sealed target files are\n"
+                 "                                 measured by root instead of being read in full\n"
                  "  --dflash2-tokenizer DIR  actual selected tokenizer/template directory for borrowed-target binding\n"
                  "  --rope-scaling T     extend the context past the trained one: none, linear\n"
                  "                       (position interpolation) or yarn - llama.cpp's types and names.\n"
@@ -3008,6 +3010,7 @@ int main(int argc, char** argv) {
         else if (a == "--dflash2") o.dflash2 = next("--dflash2");
         else if (a == "--dflash2-manifest-sha256") o.dflash2_manifest_sha256 = next("--dflash2-manifest-sha256");
         else if (a == "--dflash2-tokenizer") o.dflash2_tokenizer = next("--dflash2-tokenizer");
+        else if (a == "--target-verity-roots") o.target_verity_roots = next("--target-verity-roots");
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
@@ -8433,9 +8436,15 @@ int main(int argc, char** argv) {
     if (!o.dflash2.empty()) {
         try {
             const auto& target_head = last_st ? last_st->head : native_head;
+            std::map<std::string, strata::core::dflash2::VerityPin> verity_roots;
+            if (!o.target_verity_roots.empty()) {
+                std::string pin_error;
+                if (!strata::core::dflash2::load_verity_roots(o.target_verity_roots, verity_roots, pin_error))
+                    throw strata::core::dflash2::Refusal(pin_error);
+            }
             auto target = strata::core::dflash2::VerifiedDailyTarget::identify(
                 o.pack, o.dflash2_tokenizer, {o.native_shards[0], o.native_shards[1]}, g,
-                native_embed.identity(), target_head.identity());
+                native_embed.identity(), target_head.identity(), std::chrono::seconds(300), verity_roots);
             dflash_weights = std::make_unique<strata::core::dflash2::RuntimeWeights>(
                 o.dflash2, o.dflash2_manifest_sha256, target.binding().identity);
             if (dflash_weights->dense().size_bytes() != dflash_dense_bytes)

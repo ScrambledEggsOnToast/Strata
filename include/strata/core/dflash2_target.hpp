@@ -16,6 +16,16 @@ inline constexpr char daily_profile[] = "swift-1.5-flash-next-256k-kv-concurrenc
 struct TargetFile {
     std::string path, sha256;
 };
+/// One release artifact's content digest and its fs-verity root. A sealed file
+/// whose measured root equals this root is the pinned bytes without being read:
+/// enabling verity is one-way and the kernel verifies every page the engine
+/// then reads. Keyed by absolute path in `identify`'s optional roots argument.
+struct VerityPin {
+    std::string sha256, root;
+};
+/// Reads `<sha256>\t<verity-root>\t<absolute-path>` lines, `#` comments allowed.
+/// A malformed line refuses the whole file rather than dropping a pin.
+bool load_verity_roots(const std::string& path, std::map<std::string, VerityPin>& out, std::string& error);
 struct DailyTargetFiles {
     std::string profile_name;
     // Exactly the two resolved native shards, in load order. Expected digests
@@ -40,14 +50,16 @@ public:
     static VerifiedDailyTarget identify(const std::string& pack, const std::string& tokenizer,
                                         const std::array<std::string, 2>& shards, const ModelGeometry&,
                                         const NativeTensorIdentity& embedding, const NativeTensorIdentity& head,
-                                        std::chrono::milliseconds timeout = std::chrono::seconds(300));
+                                        std::chrono::milliseconds timeout = std::chrono::seconds(300),
+                                        const std::map<std::string, VerityPin>& verity_roots = {});
     const BorrowedBinding& binding() const { return binding_; }
     const NativeTensorIdentity& embedding() const { return embedding_; }
     const NativeTensorIdentity& head() const { return head_; }
 private:
     static VerifiedDailyTarget verify_impl(const DailyTargetFiles&, const ModelGeometry&,
                                            const NativeTensorIdentity&, const NativeTensorIdentity&,
-                                           std::chrono::milliseconds, bool check_digests);
+                                           std::chrono::milliseconds, bool check_digests,
+                                           const std::map<std::string, VerityPin>& verity_roots);
     VerifiedDailyTarget(BorrowedBinding binding, NativeTensorIdentity embedding, NativeTensorIdentity head)
         : binding_(std::move(binding)), embedding_(std::move(embedding)), head_(std::move(head)) {}
     BorrowedBinding binding_;
