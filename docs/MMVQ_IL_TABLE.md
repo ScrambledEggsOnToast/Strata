@@ -10,7 +10,8 @@ Which table a card gets:
 
 | card | table |
 |---|---|
-| sm_86 (Ampere consumer) and sm_120 (Blackwell consumer) | `kIlRowsShared`, measured on an RTX 3060 and an RTX 5070 together (a cell is non-zero only if the worse of the two cards still gains 3%) |
+| sm_86 (Ampere consumer) | `kIlRows_86`, the dedicated dispatch table, including shared-table entries and separately measured Q3_K cells |
+| sm_120 (Blackwell consumer) | `kIlRowsShared`, measured on an RTX 3060 and an RTX 5070 together (a cell is non-zero only if the worse of the two cards still gains 3%) |
 | sm_89 (Ada) and every other sm_80+ card | `kIlRowsShared` too. Nobody has measured sm_89 yet (we have no such card). |
 | sm_70 (Volta) with `STRATA_SM70_TABLE=1` | the already-shipped `kIlRows_70`, measured on a V100-SXM2-32GB and registered as cc 70 in `kIlArch` |
 | sm_70 without that flag, and other cards below sm_80 | the path is off; the plain kernels run |
@@ -23,9 +24,29 @@ key/value projections. A new local timing table is not required to try this exis
 `STRATA_MMVQ_IL_ROWS` for that comparison: its override applies to every card, including sm_86.
 
 `STRATA_SM70_TABLE` also selects resident expert mode 8 and the latency-hidden hyperconnection norm/up
-on sm_70. It does not change sm_86's shared matvec table, default expert mode 0 or ordinary norm/up.
+on sm_70. It does not change sm_86's matvec table, default expert mode 0 or ordinary norm/up.
 Restart with `STRATA_SM70_TABLE=0` for the established Volta path; unset the independent
 `STRATA_EXP_MODE`, `STRATA_GR_FAST` and table overrides for a clean bundle comparison.
+
+## Opt-in wide verifier-head splitting
+
+`STRATA_VERIFY_HEAD_SPLIT_IL=1` tries the measured Q6_K output head on SM86 at
+2560 input features and 248320 vocabulary rows. Six verifier rows split into
+3+3 columns, seven into 4+3, and eight into 4+4. This reuses the existing Q8_1
+activation image and four-column interleaved scratch, without changing the
+per-column arithmetic or adding workspace. The default is off.
+
+The option respects `STRATA_MMVQ_IL=0` and requires both sub-widths to be eligible
+in the actual device table. Other types, shapes and devices keep their previous
+dispatch. In particular, this does not globally force a table entry: the SM86
+Q6_K two-column vocabulary cell remains plain, while three and four columns use IL.
+
+A bounded `VERIFY_HEAD_SPLIT_IL completed=1` receipt identifies the first matching
+batch graph per verifier that actually completed its existing drains and checks.
+Eager non-batch windows can use the optimization without emitting that batch
+receipt. Compare real service off/on before retaining a profile change; a faster
+isolated projection does not establish a whole-model speedup.
+
 
 ## Checking enablement before timing
 

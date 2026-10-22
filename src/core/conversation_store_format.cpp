@@ -899,7 +899,7 @@ RestoreTarget target_for(CheckpointBytes& bytes, const char* what) {
             why = std::string(what) + " write is out of range";
             return false;
         }
-        auto& dst = bytes.write();
+        std::vector<uint8_t>& dst = bytes.write();
         std::memcpy(dst.data() + offset, src, n);
         return true;
     };
@@ -1373,7 +1373,7 @@ bool image_layout(const SavedConversation& image, const Digest& seed, const Conv
                     case Buffer::dead: bytes = &record->dead; break;
                     default: bytes = &record->block_pos; break;
                 }
-                const auto* payload = &bytes->read();
+                const std::vector<uint8_t>* payload = &bytes->read();
                 const uint64_t length = payload->size();
                 return add_stream(slot, length, 1,
                                   [payload, length](uint64_t offset, uint8_t* dst, size_t n, std::string& why) {

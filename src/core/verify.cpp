@@ -358,6 +358,26 @@ bool device_is_sm75() {
 #endif
 }
 
+bool head_split_il_sm86() {
+#if defined(STRATA_USE_HIP)
+    return false;
+#else
+    static const bool enabled = env_on("STRATA_VERIFY_HEAD_SPLIT_IL");
+    if (!enabled || !g_mmvq_il()) return false;
+    static thread_local int per_device[64]{}; // 0 unknown, 1 ineligible, 2 measured SM86.
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64) return false;
+    if (!per_device[device]) {
+        int major = 0, minor = 0;
+        const bool known = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+                           cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess;
+        if (!known) cudaGetLastError();
+        per_device[device] = known && major == 8 && minor == 6 ? 2 : 1;
+    }
+    return per_device[device] == 2;
+#endif
+}
+
 bool fuse_wait_on() {
 #if defined(STRATA_USE_HIP)
     static const int env = [] {
@@ -1607,6 +1627,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     ss_ = &ss;
     hits_ = hits;
     head_ = head;
+    head_split_trace_pending_ = head_split_trace_completed_ = false;
     max_t_ = max_t;
     commit_timing_.on = env_on("STRATA_COMMIT_TIMING");
     sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
@@ -2944,29 +2965,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                       attn_scratch_ + (size_t) t * attn_scratch_floats_,
                                                       attn_ + t * NH * HD, 1, cs);
                     }
-                } else if (batch_rec_) {
-                    static const bool owner_groups = env_on("STRATA_QSA_OWNER_GROUPS");
-                    static const bool owner_groups_trace = env_on("STRATA_QSA_OWNER_GROUPS_TRACE");
-                    for (int t = tb; t < te;) {
+                } else if (batch_rec_) {   // each row selects and attends over its own slot's K/V
+                    for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
-                        const int count = qsa_owner_group_rows(owner_groups && same_slot_rows,
-                                                               brow_ + t, te - t, sx.kv_mode != 1);
-                        // Each run reads one owner's resident pools and writes only its own rows.
-                        // Streamed KV retains the original resolve-then-attend order, one row at a time.
-                        if (count > 1 && owner_groups_trace)
-                            std::fprintf(stderr, "QSA_OWNER_GROUP selected=1 device=%d layer=%lld "
-                                "batch_rows=%d offset=%d rows=%d owner=%d scope=graph_capture\n",
-                                device_, (long long) l, T, t, count, brow_[t]);
-                        qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, count,
+                        qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, 1,
                                          max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
-                        qsa_block_topk(scores_ + (size_t) t * max_blocks_, step_ + t * kStepCount, count, max_blocks_, cap_, s,
+                        qsa_block_topk(scores_ + (size_t) t * max_blocks_, step_ + t * kStepCount, 1, max_blocks_, cap_, s,
                                        sel_ + (size_t) t * cap_, cs);
-                        qsa_kv_resolve(sx, *g_, sel_ + (size_t) t * cap_, step_ + t * kStepCount, count, cap_, cs);
+                        qsa_kv_resolve(sx, *g_, sel_ + (size_t) t * cap_, step_ + t * kStepCount, 1, cap_, cs);
                         const QsaAttnPools px = qsa_attn_pools(sx);
                         qsa_decode_attn_batch(qcur_ + t * NH * HD, px, sel_ + (size_t) t * cap_, step_ + t * kStepCount,
                                               cap_, s, attn_scratch_ + (size_t) t * attn_scratch_floats_,
-                                              attn_ + t * NH * HD, count, cs);
-                        t += count;
+                                              attn_ + t * NH * HD, 1, cs);
                     }
                 } else {
                 if (!sidem) idx_select(cs);
@@ -3444,7 +3454,27 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (head_ != nullptr && head_->loaded()) {
             try {
                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
-                if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_)) {
+                // Measured real Q6_K head only. Reuse the already-priced Q8_1/IL
+                // scratch, stream-ordering both halves without changing column arithmetic.
+                const int first = T == 6 ? 3 : 4;
+                const bool split_head = T >= 6 && T <= 8 && N == 2560 && n_vocab_ == 248320 &&
+                    head_->type() == 14 && head_split_il_sm86() &&
+                    strata::kernels::native_mmvq_il_supported(14, first, (int) n_vocab_) &&
+                    strata::kernels::native_mmvq_il_supported(14, T - first, (int) n_vocab_);
+                if (split_head) {
+                    for (int offset : {0, first}) {
+                        const int width = offset == 0 ? first : T - first;
+                        const auto* input = reinterpret_cast<const uint8_t*>(xq_) +
+                            (size_t) offset * strata::kernels::native_q8_1_bytes((int) N, 1);
+                        strata::kernels::native_q8_1_interleave(input, xil_, (int) N, width, cs);
+                        strata::kernels::native_mmvq_il(14, head_->weights(), input, xil_,
+                            head_logits_ + (size_t) offset * n_vocab_, (int) N, (int) n_vocab_, width, cs);
+                    }
+                    if (batch_rec_ && !head_split_trace_pending_ && !head_split_trace_completed_) {
+                        head_split_trace_key_ = bkey(brow_, T, row_base_);
+                        head_split_trace_pending_ = true;
+                    }
+                } else if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_)) {
                     if (T >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) T, cs);
                     strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, head_logits_, (int) N,
                                                     (int) n_vocab_, (int) T, cs);
@@ -5145,6 +5175,20 @@ void Verifier::trace_qsa_same_slot_completed(const int* owners, int rows, int hb
     trace_qsa_same_slot_receipt(true, route);
 }
 
+void Verifier::trace_head_split_completed(const int* owners, int rows, int hbase, const char* route) {
+    if (!head_split_trace_pending_ || head_split_trace_completed_ ||
+        bkey(owners, rows, hbase) != head_split_trace_key_) return;
+    const auto graph = exec_bm_.find(head_split_trace_key_);
+    if (graph == exec_bm_.end() || !graph->second) return;
+    // The matching executable passed the existing compute/copy drains and canaries.
+    head_split_trace_pending_ = false;
+    head_split_trace_completed_ = true;
+    const int first = rows == 6 ? 3 : 4;
+    std::fprintf(stderr, "VERIFY_HEAD_SPLIT_IL completed=1 device=%d rows=%d first=%d second=%d "
+                         "type=14 input=2560 vocabulary=248320 workspace_growth=0 route=%s\n",
+                 device_, rows, first, rows - first, route);
+}
+
 bool Verifier::release_batch_graphs(std::string& err) {
     if (!context_idle(err)) return false;
     const OnDevice on_device(device_);
@@ -5157,6 +5201,7 @@ bool Verifier::release_batch_graphs(std::string& err) {
     // Never join an earlier selection to a recaptured/rebound executable with a reused key.
     // Do not re-arm: diagnostics stay bounded to one selected/completed pair per Verifier.
     if (qsa_trace_state_ == QsaTraceState::selected) qsa_trace_state_ = QsaTraceState::invalidated;
+    if (!head_split_trace_completed_) head_split_trace_pending_ = false;
     for (auto* graphs : {&exec_bm_, &commit_bm_}) {
         for (auto& entry : *graphs) {
             if (entry.second && cudaGraphExecDestroy(entry.second) != cudaSuccess) {
@@ -5662,6 +5707,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             if (!finish_dflash2_batch(err)) return false;
             if (qsa_copy_drain == cudaSuccess) {
                 trace_qsa_same_slot_completed(rows, S, 0, "run_slot_rows");
+                trace_head_split_completed(rows, S, 0, "run_slot_rows");
                 if (!complete_expert_reuse_trace("run_slot_rows", err)) return false;
             }
             guard.keep = true;                                                                          // FORK
@@ -5676,6 +5722,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         if (!finish_dflash2_batch(err)) return false;
         if (qsa_copy_drain == cudaSuccess) {
             trace_qsa_same_slot_completed(rows, S, 0, "run_slot_rows");
+            trace_head_split_completed(rows, S, 0, "run_slot_rows");
             if (!complete_expert_reuse_trace("run_slot_rows", err)) return false;
         }
         guard.keep = true;                                                                              // FORK
@@ -5757,6 +5804,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         if (!scratch_.ready()) { err = "verify: batch ownership was poisoned"; return false; }
         if (!finish_dflash2_batch(err)) return false;
         trace_qsa_same_slot_completed(rows, S, 0, "run_slot_rows");
+        trace_head_split_completed(rows, S, 0, "run_slot_rows");
         guard.keep = true;
         return true;
     }
@@ -5768,6 +5816,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     if (!scratch_.ready()) { err = "verify: batch ownership was poisoned"; return false; }
     if (!finish_dflash2_batch(err)) return false;
     trace_qsa_same_slot_completed(rows, S, 0, "run_slot_rows");
+    trace_head_split_completed(rows, S, 0, "run_slot_rows");
     guard.keep = true;
     return true;
 }
@@ -6098,6 +6147,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     if (!(b_deferred_ ? scratch_.ready() : scratch_.finish_batch())) { err = "verify: batch ownership was poisoned"; return -1; }
     if (!finish_dflash2_batch(err)) return -1;
     trace_qsa_same_slot_completed(last_rows_, S, row_base_, "batch_poll");
+    trace_head_split_completed(last_rows_, S, row_base_, "batch_poll");
     if (!complete_expert_reuse_trace("batch_poll", err)) return -1;
     guard.keep = true;
     progress_beat();

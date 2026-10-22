@@ -565,6 +565,9 @@ private:
     void trace_qsa_same_slot_selected(int64_t layer, int rows);
     void trace_qsa_same_slot_completed(const int* owners, int rows, int hbase, const char* route);
     void trace_qsa_same_slot_receipt(bool completed, const char* route) const;
+    bool head_split_trace_pending_ = false, head_split_trace_completed_ = false;
+    BatchKey head_split_trace_key_{};
+    void trace_head_split_completed(const int* owners, int rows, int hbase, const char* route);
     // Optional completed mode8/type21 exposure. Device bytes are part of layout_arena.
     uint32_t* expert_reuse_counts_ = nullptr;
     uint32_t* expert_reuse_counts_h_ = nullptr;
