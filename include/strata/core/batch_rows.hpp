@@ -42,7 +42,7 @@ inline constexpr VerifyBatchKey verify_batch_graph_key(const int* rows, int S, i
     return key;
 }
 
-/// Only a resident batch consisting entirely of one owner's 2..4 consecutive rows may
+/// Only a resident run consisting entirely of one owner's 2..4 consecutive rows may
 /// share its QSA pools across a multi-query launch. Batch graph keys above include every
 /// owner ID, so same-width mixed-owner captures remain distinct executable graphs.
 inline constexpr bool qsa_same_slot_rows_eligible(bool enabled, bool batch, const int* rows, int count,
@@ -51,6 +51,16 @@ inline constexpr bool qsa_same_slot_rows_eligible(bool enabled, bool batch, cons
     for (int i = 1; i < count; ++i)
         if (rows[i] != rows[0]) return false;
     return true;
+}
+
+/// Number of leading rows that may share one owner's QSA pools; zero for a missing or empty extent.
+/// Larger/mixed windows split into resident 2..4-row runs, preserving the streamed one-row order.
+inline constexpr int qsa_owner_group_rows(bool enabled, const int* rows, int remaining, bool resident_kv) {
+    if (!rows || remaining <= 0) return 0;
+    int count = 1;
+    if (enabled && resident_kv)
+        while (count < remaining && count < 4 && rows[count] == rows[0]) ++count;
+    return qsa_same_slot_rows_eligible(enabled, true, rows, count, resident_kv) ? count : 1;
 }
 
 /// Native DFlash2's priced production families, without restricting the general row validator:

@@ -160,9 +160,8 @@ struct Probe {
     void launch(const std::vector<int>& owners, bool candidate, bool resident = true, int part = 0) {
         require(int(owners.size()) == count, "owner extent");
         const int arm = candidate ? 1 : 0;
-        const bool grouped = c::qsa_same_slot_rows_eligible(candidate, true, owners.data(), count, resident);
-        const int stride = grouped ? count : 1;
-        for (int row = 0; row < count; row += stride) {
+        for (int row = 0; row < count;) {
+            const int stride = c::qsa_owner_group_rows(candidate, owners.data() + row, count - row, resident);
             const Pool& pool = pools[owners[size_t(row)]];
             if (part == 0 || part == 1)
                 k::qsa_block_scores(pool.pooled.data, pool.dead.data, query_index.data + row * qi,
@@ -174,6 +173,7 @@ struct Probe {
                 k::qsa_decode_attn_batch(query.data + row * qo, pool.view, selection[arm].data + row * cap,
                     steps.data + row * k::kStepCount, cap, shapes, scratch[arm].data + size_t(row) * scratch_stride,
                     output[arm].data + row * qo, stride, stream);
+            row += stride;
         }
     }
     std::unique_ptr<Graph> capture(const std::vector<int>& owners, bool candidate, bool resident = true, int part = 0) {
@@ -185,7 +185,13 @@ struct Probe {
         ck(cudaGraphGetNodes(graph->graph, nullptr, &count_nodes));
         std::vector<cudaGraphNode_t> nodes(count_nodes);
         ck(cudaGraphGetNodes(graph->graph, nodes.data(), &count_nodes));
-        const bool grouped = c::qsa_same_slot_rows_eligible(candidate, true, owners.data(), count, resident);
+        std::vector<unsigned> expected_widths, actual_widths;
+        if (part == 0 || part == 3)
+            for (int row = 0; row < count;) {
+                const int stride = c::qsa_owner_group_rows(candidate, owners.data() + row, count - row, resident);
+                expected_widths.push_back(unsigned(stride));
+                row += stride;
+            }
         for (auto node : nodes) {
             cudaGraphNodeType type;
             ck(cudaGraphNodeGetType(node, &type));
@@ -197,14 +203,15 @@ struct Probe {
             ck(cudaFuncGetName(&name, params.func));
             if (name && std::strstr(name, "attn_chunk_kernel_pre75")) {
                 ++graph->pre75_nodes;
-                require(params.gridDim.z == unsigned(grouped ? count : 1), "pre75 live query grid");
+                actual_widths.push_back(params.gridDim.z);
             }
 #else
             require(false, "CUDA >=12.3 required to establish actual kernel exposure");
 #endif
         }
-        require(graph->pre75_nodes == ((part == 0 || part == 3) ? (grouped ? 1 : count) : 0),
-                "actual pre75 route must execute; fallback is not acceptance");
+        std::sort(expected_widths.begin(), expected_widths.end());
+        std::sort(actual_widths.begin(), actual_widths.end());
+        require(actual_widths == expected_widths, "actual pre75 owner-group widths; fallback is not acceptance");
         ck(cudaGraphInstantiate(&graph->exec, graph->graph, nullptr, nullptr, 0));
         return graph;
     }
@@ -296,7 +303,9 @@ void policy_checks() {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool functional_only = argc == 2 && std::strcmp(argv[1], "--functional-only") == 0;
+    require(argc == 1 || functional_only, "usage: qsa_same_slot_test [--functional-only]");
     policy_checks();
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
@@ -318,7 +327,7 @@ int main() {
         require(first != changed, "same captured graph must observe changed queries/steps");
         require(&p.cached(owners) == &candidate, "replay must reuse original cached executable");
         p.input(0); p.replay(owners, *reference, candidate);
-        p.micro(owners);
+        if (!functional_only) p.micro(owners);
     }
     // Same width, three distinct owner layouts; different pools must never share an executable.
     Probe p(4, 2050); // crosses the 2051-cell selection-width boundary and 4-cell block/page boundary
@@ -341,6 +350,22 @@ int main() {
     // claim real streamed-KV resolution coverage, whose production path is left untouched.
     auto fallback = p.capture(layouts[0], true, false);
     p.replay(layouts[0], *references[0], *fallback);
+    // Mixed-owner windows exercise nonzero row/scratch offsets and a short trailing/leading owner.
+    for (const std::vector<int>& owners : {
+            std::vector<int>{0, 0, 0, 0, 1, 1, 1, 1},
+            std::vector<int>{0, 0, 0, 1, 1, 1, 1},
+            std::vector<int>{0, 1, 1, 1, 1}}) {
+        Probe mixed(int(owners.size()), 2047);
+        mixed.input(0);
+        auto reference = mixed.capture(owners, false);
+        auto& candidate = mixed.cached(owners);
+        const auto first = mixed.replay(owners, *reference, candidate);
+        mixed.input(1);
+        require(first != mixed.replay(owners, *reference, candidate), "mixed owners consume changed inputs");
+        auto streamed = mixed.capture(owners, true, false);
+        mixed.replay(owners, *reference, *streamed);
+        if (!functional_only && owners.size() == 8) mixed.micro(owners);
+    }
     std::puts("PASS same-slot QSA: exact scores/IDs/attention, actual pre75 route, cache-layout isolation, guards and changed-input replay");
     return 0;
 }

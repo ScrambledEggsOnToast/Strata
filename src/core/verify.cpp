@@ -2944,18 +2944,29 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                       attn_scratch_ + (size_t) t * attn_scratch_floats_,
                                                       attn_ + t * NH * HD, 1, cs);
                     }
-                } else if (batch_rec_) {   // each row selects and attends over its own slot's K/V
-                    for (int t = tb; t < te; ++t) {
+                } else if (batch_rec_) {
+                    static const bool owner_groups = env_on("STRATA_QSA_OWNER_GROUPS");
+                    static const bool owner_groups_trace = env_on("STRATA_QSA_OWNER_GROUPS_TRACE");
+                    for (int t = tb; t < te;) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
-                        qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, 1,
+                        const int count = qsa_owner_group_rows(owner_groups && same_slot_rows,
+                                                               brow_ + t, te - t, sx.kv_mode != 1);
+                        // Each run reads one owner's resident pools and writes only its own rows.
+                        // Streamed KV retains the original resolve-then-attend order, one row at a time.
+                        if (count > 1 && owner_groups_trace)
+                            std::fprintf(stderr, "QSA_OWNER_GROUP selected=1 device=%d layer=%lld "
+                                "batch_rows=%d offset=%d rows=%d owner=%d scope=graph_capture\n",
+                                device_, (long long) l, T, t, count, brow_[t]);
+                        qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, count,
                                          max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
-                        qsa_block_topk(scores_ + (size_t) t * max_blocks_, step_ + t * kStepCount, 1, max_blocks_, cap_, s,
+                        qsa_block_topk(scores_ + (size_t) t * max_blocks_, step_ + t * kStepCount, count, max_blocks_, cap_, s,
                                        sel_ + (size_t) t * cap_, cs);
-                        qsa_kv_resolve(sx, *g_, sel_ + (size_t) t * cap_, step_ + t * kStepCount, 1, cap_, cs);
+                        qsa_kv_resolve(sx, *g_, sel_ + (size_t) t * cap_, step_ + t * kStepCount, count, cap_, cs);
                         const QsaAttnPools px = qsa_attn_pools(sx);
                         qsa_decode_attn_batch(qcur_ + t * NH * HD, px, sel_ + (size_t) t * cap_, step_ + t * kStepCount,
                                               cap_, s, attn_scratch_ + (size_t) t * attn_scratch_floats_,
-                                              attn_ + t * NH * HD, 1, cs);
+                                              attn_ + t * NH * HD, count, cs);
+                        t += count;
                     }
                 } else {
                 if (!sidem) idx_select(cs);
