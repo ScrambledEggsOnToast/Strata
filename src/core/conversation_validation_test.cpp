@@ -75,7 +75,8 @@ struct MtpDrafterCertificationFixture {
         MtpDrafter draft;
         std::string error;
         draft.cs_ = reinterpret_cast<cudaStream_t>(uintptr_t(2));
-        draft.working_request_ = 17;
+        draft.st_.max_cells = 32;
+        check(draft.bind_request(8, 17, error, 1), "bind host-backend draft producer");
         {
             MtpDrafter::Operation operation(draft, error);
             check(bool(operation), "acquire actual draft operation in host backend");
@@ -178,6 +179,74 @@ struct MtpDrafterCertificationFixture {
             parked.certify_view(view, 8, &outgoing);
             check(view.draft_owner == 0 && view.draft_tokens == -1,
                   "later numerical generation still refuses the displaced source");
+        }
+        {
+            // sebad10m: 199 fresh cells, then 199 reused + one new cell, parked
+            // with a 192-cell checkpoint. Rebinding must not turn [0,200) into
+            // the observed suffix-only [199,200) certificate.
+            MtpDrafter continued;
+            continued.st_.max_cells = 256;
+            check(continued.bind_request(8, 61, error, 1), "bind first retained-prefix producer");
+            {
+                MtpDrafter::Operation operation(continued, error);
+                operation.writes(0, 199, 12305);
+                check(operation.finish(error), "complete the first prompt's real producer operation");
+            }
+            const auto outgoing = continued.owner();
+            check(continued.bind_request(8, 62, error, 2), "reserve successor before retained-prefix handoff");
+            continued.kv_restore(199, 12305, &outgoing);
+            auto coverage = continued.slot_coverage(8);
+            check(coverage.present && coverage.coherent && coverage.owner == continued.owner() &&
+                  coverage.certified_begin == 0 && coverage.certified_end == 199,
+                  "ring restore publishes the retained certificate under the successor's completed operation");
+            {
+                MtpDrafter::Operation operation(continued, error);
+                operation.writes(199, 200, 12305);
+                check(operation.finish(error), "append the successor's one-cell suffix");
+            }
+            const std::vector<int32_t> ids(size_t(200), 12305);
+            const std::vector<ConversationImageKey> no_images;
+            const std::vector<ConversationCheckpoint> no_checks;
+            ConversationView view{ids, no_images, no_checks, true};
+            continued.certify_view(view);
+            check(view.draft_owner == 62 && view.draft_begin == 0 && view.draft_tokens == 200 &&
+                  view.draft_next_token == 12305,
+                  "parked continuation preserves the actual prefix and suffix, not only the last request's writes");
+            SavedConversation image;
+            image.live.ids = ids;
+            image.draft_begin = view.draft_begin; image.draft_cells = view.draft_tokens;
+            image.draft_next_token = view.draft_next_token;
+            image.draft_identity = view.draft_identity;
+            check(continued.snapshot_preflight(image, 8, 192, ConversationSnapshotExpectation::ordinary, error),
+                  "the parked producer certificate covers the original 192-cell checkpoint");
+            image.draft_begin = 199;
+            check(!continued.snapshot_preflight(image, 8, 192, ConversationSnapshotExpectation::ordinary, error),
+                  "the captured suffix-only certificate still refuses the earlier checkpoint");
+            image.draft_begin = 0; image.draft_identity.kind = DraftKind::dflash2;
+            check(!continued.snapshot_preflight(image, 8, 192, ConversationSnapshotExpectation::ordinary, error),
+                  "a foreign DFlash2 certificate cannot use the retained MTP handoff");
+        }
+        for (int damage = 0; damage < 5; ++damage) {
+            MtpDrafter refused;
+            refused.st_.max_cells = 256;
+            check(refused.bind_request(8, 71, error, 1), "bind negative retained-prefix producer");
+            {
+                MtpDrafter::Operation operation(refused, error);
+                operation.writes(0, 199, 12305);
+                check(operation.finish(error), "complete negative retained-prefix source");
+            }
+            auto outgoing = refused.owner();
+            check(refused.bind_request(8, 72, error, 2), "bind negative retained-prefix successor");
+            if (damage == 1) ++outgoing.request;
+            if (damage == 2) ++outgoing.incarnation;
+            if (damage == 3) ++outgoing.generation;
+            if (damage == 4) {
+                MtpDrafter::Operation operation(refused, error);
+                check(operation.finish(error), "complete intervening operation before stale handoff");
+            }
+            refused.kv_restore(199, 12305, damage == 0 ? nullptr : &outgoing);
+            check(!refused.completed_coverage().known() && !refused.slot_coverage(8).present,
+                  "absent, foreign, reincarnated or numerically stale source cannot transfer old certification");
         }
     }
 };

@@ -161,6 +161,12 @@ public:
     /// on their own devices. Keep a denying GraphCaptureObservationScope while serving to
     /// prohibit unseen captures; observed preparation is not an opaque allocator hard bound.
     bool prepare_graphs(std::string& err);
+    /// Explicit startup-only subset, after init_slots and every capture-affecting setter.
+    /// Capture/upload (never launch) resident slot zero's singleton depths 1..owner_rows
+    /// at its actual handoff base; base zero also prepares those ordinary widths and commit.
+    /// At most four depths; every chained stage must be idle before any capture.
+    /// Other slots/layouts/bases/residency variants retain normal lazy capture and key caps.
+    bool prepare_startup_graphs(int hbase, int owner_rows, std::string& err);
     /// Distinguishes independently in-flight verifier stages sharing one dispatch.
     void set_worker_lane(int lane) { worker_lane_ = lane; }
 
@@ -192,6 +198,7 @@ public:
     /// Actual page-rounded mapped allocation for this physical owner, including
     /// its replay flag. Price independently for each concurrent verifier.
     uint64_t dflash2_staging_bytes() const { return dflash2_staging_bytes_; }
+    uint64_t dflash2_device_staging_bytes() const { return dflash2_device_staging_bytes_; }
     /// One window: tokens[0..T) at consecutive positions, out[t] = head pick.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
@@ -545,6 +552,7 @@ private:
     using BatchKey = VerifyBatchKey;
     std::map<BatchKey, cudaGraphExec_t> exec_bm_, commit_bm_;
     size_t batch_graph_limit_ = kVerifyBatchGraphKeys;
+    bool graph_preparing_ = false;         ///< labels explicit pre-READY captures, never a graph-key input
     int last_rows_[8] = {};                ///< the slots of the last batch window's rows
     BatchKey bkey(const int* rows, int S, int hbase) const {
         return verify_batch_graph_key(rows, S, hbase, bool(ar_off_));
@@ -768,6 +776,13 @@ private:
     cudaGraphExec_t commit_exec_ = nullptr;
 
     bool dflash2_enabled_ = false;
+    bool dflash2_device_features_ = false, dflash2_phases_ = false;
+    bool dflash2_phase_pending_ = false, dflash2_phase_batch_ = false;
+    int dflash2_phase_rows_ = 0;
+    std::array<uint16_t*, dflash2::tap_layers.size()> dflash2_device_{};
+    std::array<std::array<std::array<cudaEvent_t, 2>, 2>, dflash2::tap_layers.size()> dflash2_events_{};
+    uint64_t dflash2_device_staging_bytes_ = 0;
+    bool report_dflash2_capture(std::string& err);
     dflash2::TapCaptureState dflash2_capture_;
     struct Dflash2SeatCapture {
         dflash2::TapCaptureState state;

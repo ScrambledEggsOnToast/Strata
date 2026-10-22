@@ -35,6 +35,7 @@
 #include "strata/core/execution_identity.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/graph.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -48,6 +49,7 @@
 #include "strata/core/weights.hpp"
 #if defined(STRATA_DFLASH2_CAPTURE)
 #include "strata/core/dflash2_drafter.hpp"
+#include "strata/core/dflash2_forward.hpp"
 #include "strata/core/dflash2_weights.hpp"
 #include "strata/program/dflash2_parity_capture.hpp"
 #include "strata/program/dflash2_serving.hpp"
@@ -185,6 +187,8 @@ int resident_model_checks(strata::program::ResidentSlots&, strata::core::ExpertD
 int resident_host_model_checks(strata::program::ResidentSlots&, strata::core::ExpertDispatch&,
                                const strata::core::ModelGeometry&, const std::vector<strata::program::ResidentStage>&,
                                strata::core::MtpDrafter&);
+int verifier_startup_model_checks(const strata::core::ModelGeometry&,
+                                 const std::vector<strata::program::ResidentStage>&, int, int);
 #if defined(STRATA_DFLASH2_CAPTURE)
 int resident_native_model_checks(strata::program::ResidentSlots&, strata::core::ExpertDispatch&,
                                  const strata::core::ModelGeometry&,
@@ -3432,6 +3436,30 @@ int main(int argc, char** argv) {
     const bool packed_prefill = strata::prefill::packed_prefill_enabled();
     const bool retained_prompt = strata::prefill::retained_prompt_enabled();
     const bool private_preparation = packed_prefill || retained_prompt;
+    const char* graph_startup_value = std::getenv("STRATA_VERIFY_GRAPH_STARTUP");
+    const bool graph_startup = graph_startup_value && std::strcmp(graph_startup_value, "1") == 0;
+    for (const char* name : {"STRATA_VERIFY_GRAPH_STARTUP", "STRATA_VERIFY_GRAPH_CAPTURE_WALL"}) {
+        const char* value = std::getenv(name);
+        if (value && std::strcmp(value, "0") != 0 && std::strcmp(value, "1") != 0) {
+            std::fprintf(stderr, "strata verify: %s must be unset, 0 or exactly 1\n", name); return 2;
+        }
+    }
+    if (graph_startup) {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_USE_SYCL) || defined(STRATA_GPU_METAL)
+        std::fprintf(stderr, "strata verify: startup graph preparation requires CUDA\n"); return 2;
+#else
+        if (!o.serve || !o.host_native || o.batch != 4 || o.batch_groups != 2 ||
+            !o.batch_mtp_pipeline || !o.batch_mtp_floating || o.batch_mtp_third ||
+            o.pipeline_windows > 0 || o.adapt_async || o.adapt_swaps != 0 ||
+            o.kv_grow || o.vram_elastic || private_preparation ||
+            o.graph_capture_allowance_bytes == 0 || o.guest_opaque_allowance_bytes == 0 ||
+            o.mps_cap_bytes.empty()) {
+            std::fprintf(stderr, "strata verify: startup preparation requires the fixed host B4/G2 floating "
+                "batch-MTP pipeline, stable resident resources and existing independent graph/host allowances\n");
+            return 2;
+        }
+#endif
+    }
     const char* retained_setting = std::getenv("STRATA_RETAINED_PROMPT");
     if (retained_setting && std::strcmp(retained_setting, "0") != 0 && std::strcmp(retained_setting, "1") != 0) {
         std::fprintf(stderr, "strata retained prompt: STRATA_RETAINED_PROMPT must be unset, 0 or exactly 1\n");
@@ -5114,6 +5142,20 @@ int main(int argc, char** argv) {
     std::array<uint64_t, SplitDrive::kMax> admitted_working_session_bytes{};
     std::array<uint64_t, SplitDrive::kMax> admitted_slot_session_bytes{};
     std::array<uint64_t, SplitDrive::kMax> full_generation_cache_bytes{};
+    if (!strata::core::dflash2::validate_feature_flags(err)) {
+        std::fprintf(stderr, "%s\n", err.c_str()); return 2;
+    }
+    const bool device_features = strata::core::dflash2::device_features_enabled();
+    if (device_features && (o.dflash2.empty() || !o.dflash2_capture || split_auto)) {
+        std::fprintf(stderr, "strata dflash2: device features require native capture and resolved non-auto layer placement\n");
+        return 2;
+    }
+#if !defined(STRATA_DFLASH2_CAPTURE)
+    if (device_features) {
+        std::fprintf(stderr, "strata dflash2: device features require the CUDA native adapter\n"); return 2;
+    }
+#endif
+    std::array<uint64_t, SplitDrive::kMax> capture_device_bytes{};
     strata::core::dflash2::CaptureAllocation capture_allocation;
     if (o.dflash2_capture) {
         if (g.n_embd != strata::core::dflash2::hidden_size || g.hc != 4 || g.n_layers != 48 ||
@@ -5125,12 +5167,14 @@ int main(int argc, char** argv) {
             if (!strata::core::dflash2::CaptureAllocation::stage(
                     st ? split_at[st - 1] : 0, st < split_at.size() ? split_at[st] : g.n_layers, part, err,
                     !o.dflash2.empty() || o.batch > 0 ? strata::kernels::kVerifyMaxT
-                        : std::max(o.spec, strata::core::dflash2::block_size))) {
+                        : std::max(o.spec, strata::core::dflash2::block_size), device_features)) {
                 std::fprintf(stderr, "strata dflash2 capture: %s\n", err.c_str()); return 2;
             }
             capture_allocation.prefill += part.prefill;
             const size_t verifiers = 1 + size_t(o.batch_mtp_pipeline) + size_t(o.batch_mtp_third);
             capture_allocation.verify += part.verify * verifiers;
+            capture_device_bytes[st] = part.verify_device * verifiers;
+            capture_allocation.verify_device += capture_device_bytes[st];
             capture_allocation.flags += part.flags * (verifiers + 1) / 2;
         }
     }
@@ -5138,6 +5182,15 @@ int main(int argc, char** argv) {
     strata::core::DraftAllocationPlan dflash_allocation;
     uint64_t dflash_dense_bytes = 0;
     const int dflash_device = split_devs.empty() ? primary_device : split_devs.back();
+    if (device_features) {
+        std::array<int, SplitDrive::kMax> sources{};
+        sources[0] = primary_device;
+        std::copy(split_devs.begin(), split_devs.end(), sources.begin() + 1);
+        if (!strata::core::dflash2::DeviceForward::prepare_feature_peers(
+                {sources.data(), split_devs.size() + 1}, dflash_device, err)) {
+            std::fprintf(stderr, "%s\n", err.c_str()); return 2;
+        }
+    }
     const size_t dflash_head_scratch = strata::core::NativeHead::planned_projection_scratch_bytes(
         int(g.n_embd), strata::core::dflash2::block_size - 1);
     if (!o.dflash2.empty()) {
@@ -5759,6 +5812,9 @@ int main(int argc, char** argv) {
                 if (found == devs.end()) {
                     std::fprintf(stderr, "strata dflash2: missing resolved device admission scope\n"); return 2;
                 }
+                if (capture_device_bytes[stage])
+                    found->vram.add("dflash2_verifier_device_taps", capture_device_bytes[stage],
+                        "bounded BF16 taps for every physical verifier; gather reuses preallocated DeviceForward input");
                 if (id == dflash_device) {
                     found->vram.add("dflash2_weights_and_scratch", dflash_allocation.shared_device,
                         "strict converted dense bytes, five-layer scratch, selector and borrowed native-head scratch");
@@ -6055,8 +6111,9 @@ int main(int argc, char** argv) {
         if (o.dflash2_capture) {
             ram("dflash2_raw_prefill", capture_allocation.prefill,
                 "five stage-owned FP32 four-stream 2047-row tap buffers; not BF16 features");
-            ram("dflash2_raw_verify", capture_allocation.verify,
-                "five stage-owned FP32 four-stream bounded verifier-row tap buffers");
+            ram(device_features ? "dflash2_compact_verify" : "dflash2_raw_verify", capture_allocation.verify,
+                device_features ? "page-rounded stage-owned BF16 verifier mirrors; cross-device host staging counted honestly"
+                                : "five stage-owned FP32 four-stream bounded verifier-row tap buffers");
             ram("dflash2_replay_flags", capture_allocation.flags,
                 "one page-rounded replay flag per prefill/physical-verifier stage owner");
             if (o.dflash2.empty())
@@ -11573,6 +11630,12 @@ int main(int argc, char** argv) {
         return false;
     };
     if (o.serve) {
+        const char* bgen_windows = std::getenv("STRATA_DFLASH2_BGEN_WINDOWS");
+        if (bgen_windows && std::strcmp(bgen_windows, "1") != 0 && std::strcmp(bgen_windows, "2") != 0) {
+            std::fprintf(stderr, "strata serve: STRATA_DFLASH2_BGEN_WINDOWS must be 1 or 2\n");
+            return 2;
+        }
+        const int native_bgen_windows = bgen_windows && std::strcmp(bgen_windows, "2") == 0 ? 2 : 1;
         uint64_t committed_logit_bytes = 0;
         uint64_t teacher_logit_bytes = 0;
         if (o.spec < 2 || o.prefill_chunk <= 0 ||
@@ -12867,6 +12930,15 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "host resident fixture requires three stages, four slots and two owners\n");
                 return 1;
             }
+            if (std::getenv("STRATA_TEST_VERIFY_GRAPH_STARTUP")) {
+                for (int stage = 0; stage < n_stages; ++stage)
+                    for (auto* owner : {&stage_ver(stage), &stage_peer(stage)}) {
+                        owner->set_split(o.spec_split);
+                        owner->set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+                    }
+                const int peer_base = use_dflash ? strata::kernels::kVerifyMaxT : std::min(2 * (o.batch / o.batch_groups), 4);
+                return verifier_startup_model_checks(g, test_resident_stages, execution_plan.proposal_positions + 1, peer_base);
+            }
 #if defined(STRATA_DFLASH2_CAPTURE)
             if (dflash)
                 return resident_native_model_checks(resident, drive.d, g, test_resident_stages, *dflash);
@@ -13137,6 +13209,11 @@ int main(int argc, char** argv) {
         constexpr uint64_t kResidentOwnerFirst = 1;   // 1 + slot: one owner per resident slot's own conversation
         auto store_owner = [&](uint64_t owner) -> StoreOwner& { return publications.owner(owner); };
         uint64_t capture_generation = 0;   // publication ordering at capture, never worker completion
+        const bool durability_observe = [] {
+            const char* value = std::getenv("STRATA_STORE_TIMING");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        uint64_t durability_sources = 0, durability_heads = 0;
         uint64_t demand_serial = 0;        // demand identifiers for requests that arrived without an offer
         uint64_t publication_serial = 0;   // publication identifiers and capture generations; seeded from the store
         uint64_t store_restored = 0;
@@ -13294,7 +13371,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: domain version=%s backend=%s kv=%s mtp_window=%lld rot=%llu "
                                          "rope_type=%lld freq_base=%.17g factor=%.17g scale=%.17g ctx=%.17g "
                                          "ext=%.17g attn=%.17g fast=%.17g slow=%.17g switches=%zu\n",
-                                 config.engine_version, config.backend, config.kv, (long long) config.mtp_window,
+                                 config.engine_version.c_str(), config.backend.c_str(), config.kv.c_str(), (long long) config.mtp_window,
                                  (unsigned long long) config.kv_rot, (long long) config.rope.type,
                                  config.rope.freq_base, config.rope.factor, config.rope.freq_scale,
                                  config.rope.orig_ctx, config.rope.ext_factor, config.rope.attn_factor,
@@ -13626,7 +13703,7 @@ int main(int argc, char** argv) {
         auto publication_drain = [&] {
             phase_publication_drain();
             strata::program::PublicationReceipt receipt;
-            while (publications.take_receipt(receipt))
+            while (publications.take_receipt(receipt)) {
                 std::fprintf(stderr, "strata serve: publication receipt: id=%llu owner=%llu generation=%llu "
                     "capture_epoch=%llu status=%s head=%llu epoch=%llu new=%llu reused=%llu released=%d\n",
                     (unsigned long long) receipt.handle.publication_id, (unsigned long long) receipt.handle.owner,
@@ -13635,6 +13712,35 @@ int main(int argc, char** argv) {
                     strata::program::publication_status_name(receipt.status), (unsigned long long) receipt.head,
                     (unsigned long long) receipt.epoch, (unsigned long long) receipt.new_bytes,
                     (unsigned long long) receipt.reused_bytes, int(receipt.released));
+                // Existing catalog metadata, only after the real publication terminal.
+                // No observer allocation, metadata lock or I/O when diagnostics are off.
+                if (durability_observe && durability_heads < 256) {
+                    ++durability_heads;
+                    try {
+                        strata::core::ConversationStoreManifestInfo info;
+                        const bool present = conversation_store && receipt.head &&
+                            conversation_store->manifest_info(receipt.head, info);
+                        std::fprintf(stderr, "DFLASH2_DURABILITY_HEAD id=%llu owner=%llu generation=%llu "
+                            "capture_epoch=%llu head=%llu epoch=%llu present=%d stages=%u cuts=%zu truncated=%d\n",
+                            (unsigned long long) receipt.handle.publication_id,
+                            (unsigned long long) receipt.handle.owner,
+                            (unsigned long long) receipt.handle.owner_generation,
+                            (unsigned long long) receipt.handle.capture_epoch,
+                            (unsigned long long) receipt.head, (unsigned long long) info.epoch,
+                            int(present), info.stages, info.cuts.size(), int(info.cuts.size() > 64));
+                        for (size_t i = 0; i < std::min<size_t>(info.cuts.size(), 64); ++i)
+                            std::fprintf(stderr, "DFLASH2_DURABILITY_STORED_CUT id=%llu head=%llu tokens=%lld\n",
+                                (unsigned long long) receipt.handle.publication_id,
+                                (unsigned long long) receipt.head, (long long) info.cuts[i]);
+                    } catch (const std::bad_alloc&) {
+                        std::fprintf(stderr, "DFLASH2_DURABILITY_HEAD id=%llu present=0 allocation_failed=1\n",
+                            (unsigned long long) receipt.handle.publication_id);
+                    }
+                } else if (durability_observe && durability_heads == 256) {
+                    ++durability_heads;
+                    std::fprintf(stderr, "DFLASH2_DURABILITY_TRUNCATED phase=completion\n");
+                }
+            }
             const auto status = publications.readiness();
             if (!persistence_status_reported || status.enabled != last_persistence_status.enabled ||
                 status.healthy != last_persistence_status.healthy || status.run_intent != last_persistence_status.run_intent ||
@@ -13858,6 +13964,10 @@ int main(int argc, char** argv) {
         // admission or the generation pipe lock, and the wait is bounded and cancellable.
         const bool store_restore_trace = [] {
             const char* value = std::getenv("STRATA_STORE_TIMING");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        const bool store_reader_progress = [] {
+            const char* value = std::getenv("STRATA_STORE_READER_PROGRESS");
             return value && std::strcmp(value, "1") == 0;
         }();
         struct StoreDemandResult {
@@ -14330,6 +14440,46 @@ int main(int argc, char** argv) {
             };
             if (!conversations.enabled() || held_entries >= conversations.slots() ||
                 !live_ok || !live_scope.valid() || live.empty()) return true;
+            // A bounded, diagnostic-only promise inventory before any optional
+            // capture refusal. Early returns still emit an unqueued END receipt.
+            struct DurabilityCapture {
+                uint64_t capture = 0, publication = 0;
+                bool queued = false;
+                ~DurabilityCapture() {
+                    if (capture)
+                        std::fprintf(stderr, "DFLASH2_DURABILITY_END capture=%llu id=%llu queued=%d\n",
+                            (unsigned long long) capture, (unsigned long long) publication, int(queued));
+                }
+            } durability;
+            if (durability_observe && durability_sources < 256) {
+                durability.capture = ++durability_sources;
+                const auto native_owner = source.resident ?
+                    strata::core::DraftOwner{source.resident->draft_slot,
+                        source.resident->owner.request, source.resident->owner.incarnation, 0} :
+                    (displaced_owner ? *displaced_owner : neural ? neural->owner(8) : strata::core::DraftOwner{});
+                char scope[65]{};
+                constexpr char hex[] = "0123456789abcdef";
+                for (size_t i = 0; i < live_scope.value.size(); ++i) {
+                    scope[i * 2] = hex[live_scope.value[i] >> 4];
+                    scope[i * 2 + 1] = hex[live_scope.value[i] & 15];
+                }
+                std::fprintf(stderr, "DFLASH2_DURABILITY_SOURCE capture=%llu owner=%llu request=%llu "
+                    "incarnation=%llu seat=%d tokens=%zu checks=%zu stages=%zu scope=%s truncated=%d "
+                    "anchor=%d generated=%lld frontier=%lld\n",
+                    (unsigned long long) durability.capture, (unsigned long long) source.owner,
+                    (unsigned long long) native_owner.request, (unsigned long long) native_owner.incarnation,
+                    native_owner.seat, live.size(), checks.size(), stages.size() + 1, scope,
+                    int(checks.size() > 64), source.resident ? source.resident->owner.x : -1,
+                    (long long) (source.resident ? source.resident->owner.produced : -1),
+                    (long long) (source.resident ? source.resident->owner.p : int64_t(live.size())));
+                for (size_t i = 0; i < std::min<size_t>(checks.size(), 64); ++i)
+                    std::fprintf(stderr, "DFLASH2_DURABILITY_SOURCE_CUT capture=%llu index=%zu tokens=%zu "
+                        "pinned=%d parts=%zu\n", (unsigned long long) durability.capture, i,
+                        checks[i].ids.size(), int(checks[i].pinned), checks[i].stage_parts.size());
+            } else if (durability_observe && durability_sources == 256) {
+                ++durability_sources;
+                std::fprintf(stderr, "DFLASH2_DURABILITY_TRUNCATED phase=capture\n");
+            }
             if (source.shared_prefix && source.resident) {
                 const auto& owner = source.resident->owner;
                 const bool foreign = owner.stop || owner.tainted || !owner.preparing ||
@@ -14482,6 +14632,16 @@ int main(int argc, char** argv) {
             strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached,
                                                 source.shared_prefix};
             certify_capture(view, draft0);
+            if (durability.capture) {
+                // These are the production parked_history selection's actual
+                // retained cuts, not a second implementation of that policy.
+                std::fprintf(stderr, "DFLASH2_DURABILITY_SELECTED capture=%llu tokens=%zu pinned=0 live=1\n",
+                    (unsigned long long) durability.capture, live.size());
+                for (size_t i = 0; i < std::min<size_t>(view.checkpoints.size(), 64); ++i)
+                    std::fprintf(stderr, "DFLASH2_DURABILITY_SELECTED capture=%llu tokens=%zu pinned=%d live=0\n",
+                        (unsigned long long) durability.capture, view.checkpoints[i].ids.size(),
+                        int(view.checkpoints[i].pinned));
+            }
             auto reuse = source.resident || source.shared_prefix
                 ? strata::core::ConversationKvReuse{} : conversations.take_reuse();
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
@@ -14759,6 +14919,18 @@ int main(int argc, char** argv) {
                             const auto admitted = publications.capture(conversations, std::move(image),
                                 std::move(queued), held + (size_t) external_now, held_entries);
                             stored = admitted.parked;
+                            if (durability.capture) {
+                                durability.publication = admitted.handle.publication_id;
+                                durability.queued = admitted.queued;
+                                std::fprintf(stderr, "DFLASH2_DURABILITY_LINK capture=%llu id=%llu owner=%llu "
+                                    "generation=%llu capture_epoch=%llu queued=%d parked=%d\n",
+                                    (unsigned long long) durability.capture,
+                                    (unsigned long long) admitted.handle.publication_id,
+                                    (unsigned long long) admitted.handle.owner,
+                                    (unsigned long long) admitted.handle.owner_generation,
+                                    (unsigned long long) admitted.handle.capture_epoch,
+                                    int(admitted.queued), int(admitted.parked));
+                            }
                             publication_drain();
                         }
                     }
@@ -16560,7 +16732,108 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        // This is deliberately after every capture-affecting setter and resource
+        // owner has settled, and before READY permits the first request. Both
+        // drafter families use this same generic verifier path when opted in.
+        if (graph_startup) {
+            if (!batch_mtp_pipeline || o.batch != 4 || o.batch_groups != 2 || pipe ||
+                execution_plan.proposal_positions < 0 || execution_plan.proposal_positions > 3 ||
+                !neural->idle(err)) {
+                std::fprintf(stderr, "strata verify: resolved startup graph contract refused: %s\n", err.c_str());
+                return 1;
+            }
+            const auto started = Clock::now();
+            struct Budget {
+                std::array<int, 4> devices{};
+                std::array<uint64_t, 4> initial_free{}, minimum_free{}, reserve{};
+                std::array<bool, 4> sampled{};
+                int count = 0;
+                uint64_t graph_allowance = 0, host_allowance = 0, host_initial = 0, host_peak = 0;
+                uint64_t guest_reserve = 0, physical_reserve = 0;
+                bool host_sampled = false;
+            } budget;
+            budget.count = n_stages;
+            budget.graph_allowance = o.graph_capture_allowance_bytes;
+            budget.host_allowance = o.guest_opaque_allowance_bytes;
+            budget.guest_reserve = uint64_t(o.guest_reserve_mib) << 20;
+            budget.physical_reserve = uint64_t(o.host_reserve_mib) << 20;
+            if (n_stages > int(budget.devices.size())) {
+                std::fprintf(stderr, "strata verify: startup stage count exceeds the bounded observation\n"); return 1;
+            }
+            for (int stage = 0; stage < n_stages; ++stage) {
+                budget.devices[size_t(stage)] = stage_ver(stage).device();
+                budget.reserve[size_t(stage)] = uint64_t(stage > 0 && o.vram_reserve_later_mib >= 0
+                    ? o.vram_reserve_later_mib : o.vram_reserve_mib) << 20;
+                for (auto* owner : {&stage_ver(stage), &stage_peer(stage)})
+                    if (!owner->context_idle(err)) {
+                        std::fprintf(stderr, "strata verify: startup owner not idle: %s\n", err.c_str()); return 1;
+                    }
+            }
+            auto observe = +[](void* opaque, const strata::core::GraphCaptureKey&,
+                              strata::core::GraphCapturePhase,
+                              const strata::core::GraphCaptureSample& sample, std::string& why) -> bool {
+                auto& b = *static_cast<Budget*>(opaque);
+                int stage = 0;
+                while (stage < b.count && b.devices[size_t(stage)] != sample.device) ++stage;
+                if (stage == b.count || !sample.host_rss_available) {
+                    why = "startup graphs: required stage or host memory observation unavailable"; return false;
+                }
+                const size_t index = size_t(stage);
+                if (!b.sampled[index]) {
+                    b.initial_free[index] = b.minimum_free[index] = sample.free_device_bytes;
+                    b.sampled[index] = true;
+                }
+                b.minimum_free[index] = std::min(b.minimum_free[index], sample.free_device_bytes);
+                if (!b.host_sampled) { b.host_initial = sample.host_rss_bytes; b.host_sampled = true; }
+                b.host_peak = std::max(b.host_peak, sample.host_rss_bytes);
+                uint64_t available = 0, physical = 0;
+                if (sample.free_device_bytes < b.reserve[index] ||
+                    b.initial_free[index] - b.minimum_free[index] > b.graph_allowance ||
+                    b.host_peak - b.host_initial > b.host_allowance ||
+                    !strata::core::available_memory_bytes(available, nullptr, &physical) ||
+                    available < b.guest_reserve || physical < b.physical_reserve) {
+                    why = "startup graphs: independent graph/host allowance or unchanged reserve exhausted";
+                    return false;
+                }
+                return true;
+            };
+            const int owner_rows = execution_plan.proposal_positions + 1;
+            const int peer_base = use_dflash ? strata::kernels::kVerifyMaxT : std::min(2 * (o.batch / o.batch_groups), 4);
+            for (int group = 0; group < 2; ++group) {
+                budget.sampled.fill(false); // separately priced graph allowance per physical replay owner
+                const strata::core::GraphCaptureObservationScope scope(observe, &budget);
+                if (!(group == 0 ? ver : ver_b).prepare_startup_graphs(group * peer_base, owner_rows, err)) {
+                    std::fprintf(stderr, "VERIFY_GRAPH_STARTUP status=refused group=%d wall_ms=%.6f reason=%s\n",
+                        group, std::chrono::duration<double, std::milli>(Clock::now() - started).count(), err.c_str());
+                    return 1; // no cache shrink, residency change, cap increase or fallback
+                }
+                for (int stage = 0; stage < n_stages; ++stage)
+                    std::fprintf(stderr, "VERIFY_GRAPH_STARTUP_RESOURCE group=%d device=%d sampled_device_growth=%llu "
+                        "graph_allowance=%llu reserve=%llu hard_bound=MPS_client sample_not_peak_bound=1\n",
+                        group, budget.devices[size_t(stage)],
+                        (unsigned long long)(budget.initial_free[size_t(stage)] - budget.minimum_free[size_t(stage)]),
+                        (unsigned long long)budget.graph_allowance, (unsigned long long)budget.reserve[size_t(stage)]);
+            }
+            const double wall_ms = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+            std::fprintf(stderr, "VERIFY_GRAPH_STARTUP status=complete wall_ms=%.6f groups=2 stages=%d "
+                "owner_rows=%d host_sampled_growth=%llu host_allowance=%llu "
+                "coverage=ordinary_and_singletons_only unseen_valid_keys=lazy kernels_launched=0\n",
+                wall_ms, n_stages, owner_rows, (unsigned long long)(budget.host_peak - budget.host_initial),
+                (unsigned long long)budget.host_allowance);
+            std::printf("INFO verify_graph_startup=1 verify_graph_startup_wall_ms=%.6f "
+                "verify_graph_startup_owner_rows=%d verify_graph_startup_coverage=singletons "
+                "verify_graph_startup_unseen=lazy\n", wall_ms, owner_rows);
+        }
         // Advertise before readiness, including replicas that have not received work yet.
+        const bool native_bgen_first_block = [&] {
+#if defined(STRATA_DFLASH2_CAPTURE)
+            const char* value = std::getenv("STRATA_DFLASH2_BGEN_FIRST_BLOCK");
+            return value && std::strcmp(value, "1") == 0 && use_dflash && !pipe && o.batch > 0 && o.spec_corrupt <= 0;
+#else
+            return false;
+#endif
+        }();
+        if (native_bgen_first_block) std::printf("INFO bgen_first_block=1 bgen_first_block_version=1\n");
         if (report_throughput) std::printf("INFO throughput_progress=1\n");
         if (packed_prefill) std::printf("INFO packed_prefill=1 packed_prefill_version=1 packed_prefill_owners=4\n");
         if (retained_prompt) std::printf("INFO retained_prompt=1 retained_prompt_version=1 retained_prompt_owners=4 "
@@ -16994,6 +17267,10 @@ int main(int argc, char** argv) {
         // callback can suppress a speculative read whose bytes generation would never use.  Called at the owner's own
         // mutation points, never from the channel thread.
         publish_ram_view = [&]() {
+            if (store_reader_progress && ram_view_deferred) {
+                ram_view_dirty = true;
+                return; // the reader can still be changing live checkpoint coverage
+            }
             auto view = std::make_shared<RamView>();
             auto add = [&](const strata::core::ConversationScope& scope, bool cvec, const std::vector<int32_t>& ids) {
                 if (!scope.valid() || ids.empty()) return;
@@ -17105,6 +17382,7 @@ int main(int argc, char** argv) {
         Clock::time_point bt_start = Clock::now();
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
         long long admit_max_new = 0;
+        bool admit_first_block = false;
         auto batch_on = [&] { return resident.active(); };
         auto try_next_line = [&](std::string& out) -> bool {
             std::lock_guard<std::mutex> lk(in_mu);
@@ -19874,6 +20152,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             admit_slot = -1;
+            admit_first_block = false;
             if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
                 const bool bimg = line.rfind("BGENI ", 0) == 0;
                 char* e1 = nullptr;
@@ -19886,11 +20165,32 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     continue;
                 }
+                // Internal negotiated key: refuse unsupported requests before begin_request
+                // or any slot mutation. Legacy BGEN remains a single-token admission.
+                std::string admission_tail(e2);
+                std::istringstream admission_keys(admission_tail);
+                std::string key;
+                bool requested_block = false, bad_block = false, seen_block = false;
+                while (admission_keys >> key) {
+                    if (key.find('=') == std::string::npos) break;
+                    if (key.rfind("first_block=", 0) != 0) continue;
+                    bad_block = bad_block || seen_block || key != "first_block=1";
+                    seen_block = true;
+                    requested_block = true;
+                }
+                if (bad_block || (requested_block && (!native_bgen_first_block || bimg))) {
+                    phase_finish("rejected");
+                    phase_error("ERR unsupported BGEN first_block request\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                admit_first_block = requested_block;
                 admit_slot = (int) b;
                 if (phase_current) phase_current->slot = admit_slot;
                 admit_max_new = mn;
                 adm_drain_ms = line_drain_ms;
-                line = std::string(bimg ? "GENI 1" : "GEN 1") + e2;
+                line = std::string(bimg ? "GENI " : "GEN ") +
+                    std::to_string(admit_first_block ? mn : 1) + admission_tail;
             }
             // #477: every --expert-profile-save-every minutes, before the next request (at QUIT: after the loop)
             if (!heat.empty() && line != "QUIT" && o.expert_profile_save_min > 0 &&
@@ -20522,9 +20822,10 @@ int main(int argc, char** argv) {
             // begin() rebinds the working drafter before the outgoing live image is parked.
             // Preserve its producer's drained interval and owned boundary row together.
             strata::core::ConversationView outgoing_draft{live, live_imgs, checks, cvec_cached};
+            const auto outgoing_draft_owner = neural->owner(8);
             neural->certify_view(outgoing_draft);
             displaced_draft.emplace(outgoing_draft);
-            displaced_owner = neural->owner(8);
+            displaced_owner = outgoing_draft_owner;
             if (!resident.begin(admit_slot, ids, input, err)) {
                 phase_error("ERR %s\n", err.c_str()); return 1;
             }
@@ -21452,7 +21753,7 @@ int main(int argc, char** argv) {
             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
             // host copies and slots are always current (every writer writes both), so they need nothing
             if (use_mtp) mtp.kv_restore(reread_to > 0 ? 0 : resume,
-                                      int32_t(cur[size_t(reread_to > 0 ? 0 : resume)]));
+                                      int32_t(cur[size_t(reread_to > 0 ? 0 : resume)]), &outgoing_draft_owner);
             tr("request", n, geni ? 1 : 0);
             // A shared cut's draft state must be reusable with any suffix. Do not
             // skip prefix rows based on this request's longer private suffix.
@@ -22339,6 +22640,19 @@ int main(int argc, char** argv) {
                         // Published only by the reader; the owner loop reads these after join.
                         bool read_fatal = false;
                         int64_t read_reached = q0;
+                        // Declared before the reader so ReadEnd joins before deferral
+                        // unwinds. Failure keeps the RAM view absent and dirty.
+                        struct ReaderViewDeferral {
+                            unsigned& depth;
+                            bool active;
+                            ReaderViewDeferral(unsigned& value, bool enabled) noexcept
+                                : depth(value), active(enabled) { if (active) ++depth; }
+                            ~ReaderViewDeferral() { release(); }
+                            void release() noexcept {
+                                if (active) { --depth; active = false; }
+                            }
+                        } defer_reader_view(ram_view_deferred, store_reader_progress && store_on);
+                        if (defer_reader_view.active) invalidate_ram_view();
                         in_prompt_read = true;
                         sp.stop_at_chunk = [&] {
                             return abort_read.load(std::memory_order_acquire) ||
@@ -22436,6 +22750,14 @@ int main(int argc, char** argv) {
                                 pump_ok = false;
                                 break;
                             }
+                            if (store_reader_progress && store_on && publications.holds_work()) {
+                                // CPU ownership handoff only: no checks traversal,
+                                // capture, payload copy or positive-timeout wait.
+                                invalidate_ram_view();
+                                store_allowance();
+                                publications.flush(0);
+                                publication_drain();
+                            }
                             {
                                 std::lock_guard<std::mutex> lk(in_mu);
                                 // only the front BYIELD: a control behind an admission waits for the read's end
@@ -22502,6 +22824,11 @@ int main(int argc, char** argv) {
                                      (long long) committed, batch_mtp ? "committed tokens" : "rows",
                                      1000.0 * committed / std::max(read_ms, 1e-9), per.c_str());
                         if (!read_ok) { e = read_err; return false; }
+                        if (defer_reader_view.active) {
+                            defer_reader_view.release(); // reader joined; every consumer drained successfully
+                            refresh_parked_view(conversations.size(), conversations.evictions(),
+                                                conversations.superseded());
+                        }
                         if (q > read_from && q < b0 && want_yield.load(std::memory_order_acquire) >= 0) {
                             bool fatal = false;
                             if (park_partial(want_yield.load(std::memory_order_acquire), q, fatal)) return false;
@@ -22987,6 +23314,20 @@ int main(int argc, char** argv) {
                              (unsigned long long) drive.d.request_generation, o.suffix_draft, sfx.size(),
                              (size_t) o.max_context + 4096);
             bool first_window = true;
+            // Research-only serial GEN scheduling: the completed prompt context
+            // can condition a proposal whose anchor is its last unread token.
+            // Negotiated BGEN yields after its bounded window quantum, not a shortened output budget.
+#if defined(STRATA_DFLASH2_CAPTURE)
+            static const bool native_first_block = [] {
+                const char* value = std::getenv("STRATA_DFLASH2_FIRST_BLOCK");
+                return value && std::strcmp(value, "1") == 0;
+            }();
+            static const bool native_first_block_trace = [] {
+                const char* value = std::getenv("STRATA_DFLASH2_FIRST_BLOCK_TRACE");
+                return value && std::strcmp(value, "1") == 0;
+            }();
+#endif
+            bool initial_native_proposal = false;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t corrupt_counter = 0;   // request-local, including after cancellation or prefix reuse
             const float* last_committed_residual = nullptr;
@@ -23687,10 +24028,32 @@ int main(int argc, char** argv) {
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 const bool sampled_request = !req_sp.greedy && req_sp.temperature > 0;
+#if defined(STRATA_DFLASH2_CAPTURE)
+                if (first_window && ((native_first_block && admit_slot < 0) || admit_first_block) &&
+                    dflash && !input.images &&
+                    !pipe && merge_T == 0 && o.spec_corrupt <= 0 && S_mtp > 1 &&
+                    max_new > 1 && p > 0 && o.max_context - p > 1 &&
+                    p <= strata::core::dflash2::max_position - strata::core::dflash2::block_size &&
+                    !stop_req.load()) {
+                    const auto coverage = neural->slot_coverage(8);
+                    if (coverage.present && coverage.coherent && coverage.certified_end == p) {
+                        const auto draft_started = Clock::now();
+                        if (!prepare_native_uniforms(8, p, req_sp, err) ||
+                            !neural->propose_slot(8, nullptr, x, p - 1, serial_proposal, err)) {
+                            phase_error("ERR initial native proposal: %s\n", err.c_str()); return 1;
+                        }
+                        std::copy_n(serial_proposal.tokens.data(), serial_proposal.count, drafts.data());
+                        std::copy_n(serial_proposal.confidence.data(), serial_proposal.count, dprob.data());
+                        initial_native_proposal = true;
+                        dt_draft += std::chrono::duration<double, std::milli>(Clock::now() - draft_started).count();
+                    }
+                }
+#endif
+                const bool initial_native_window = first_window && initial_native_proposal;
                 int T = !use_neural ? 1 : strata::spec::neural_window_width(dprob.data(),
                     use_dflash ? serial_proposal.count : S_mtp - 1, S_mtp,
                     float(req_spec_min_p), sampled_request);
-                if (first_window) T = merge_T > 0 ? merge_T : 1;
+                if (first_window && !initial_native_window) T = merge_T > 0 ? merge_T : 1;
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
@@ -23832,7 +24195,7 @@ int main(int argc, char** argv) {
                 // Unchanged MTP q must never judge a modified draft token.
                 ver.set_spec_q(nullptr, 0, 0);
 #if defined(STRATA_DFLASH2_CAPTURE)
-                if (dflash && !from_sfx && !first_window && T_mtp > 1) {
+                if (dflash && !from_sfx && (!first_window || initial_native_window) && T_mtp > 1) {
                     const bool sampled = !req_sp.greedy && req_sp.temperature > 0;
                     if (serial_proposal.frontier != p || serial_proposal.owner != neural->owner(8) ||
                         serial_proposal.count < T_mtp - 1 ||
@@ -23886,7 +24249,7 @@ int main(int argc, char** argv) {
                     {window.data(), size_t(T)}, a, keep, max_new - produced_n, req_sp,
                     uint64_t(consumed.size()), request_bias_hash, o.eos_ids,
                     from_sfx ? "lookup" : chain_n ? "neural+lookup" : "neural",
-                    from_sfx || first_window ? 0 : T_mtp - 1);
+                    from_sfx || (first_window && !initial_native_window) ? 0 : T_mtp - 1);
 #endif
                 lookup_positions += T;
                 if (lookup_trace)
@@ -24076,11 +24439,23 @@ int main(int argc, char** argv) {
                                  (unsigned long long) h.gdn, (unsigned long long) strata::program::fingerprint_ple(h, ss),
                                  (unsigned long long) strata::program::fingerprint_kv(h), (unsigned long long) h.draft);
                 }
+                const bool admission_yield = admit_first_block && dec_windows >= native_bgen_windows;
 #if defined(STRATA_DFLASH2_CAPTURE)
+                // Completed evidence only: target commit, numerical checks,
+                // native capture and output emission have all succeeded above.
+                if (initial_native_window && native_first_block_trace) {
+                    const auto owner = serial_proposal.owner;
+                    std::fprintf(stderr, "DFLASH2_FIRST_BLOCK completed=1 request=%llu incarnation=%llu "
+                        "seat=%d frontier=%lld next_frontier=%lld width=%d offered=%d accepted=%d "
+                        "keep=%d sampled=%d eos=%d terminal=%d\n",
+                        (unsigned long long) owner.request, (unsigned long long) owner.incarnation,
+                        owner.seat, (long long) p, (long long) (p + keep), T, T_mtp - 1,
+                        std::min(a, keep - 1), keep, int(sampled_request), int(eos), int(terminal));
+                }
                 if (dflash) {
                     const auto draft_started = Clock::now();
                     serial_proposal.clear();
-                    if (!terminal && S_mtp > 1 && max_new - produced_n > 1 &&
+                    if (!terminal && !admission_yield && S_mtp > 1 && max_new - produced_n > 1 &&
                         o.max_context - (p + keep) > 1 && p + keep <= strata::core::dflash2::max_position - 4) {
                         drafted = prepare_native_uniforms(8, p + keep, req_sp, err) &&
                             neural->propose_slot(8, nullptr, outv[size_t(keep - 1)], p + keep - 1, serial_proposal, err);
@@ -24103,6 +24478,10 @@ int main(int argc, char** argv) {
                 p += keep;
                 if (eos) { finish = "stop"; break; }
                 if (stop_req.load()) { finish = "cancel"; break; }
+                if (admission_yield) {
+                    if (produced_n < max_new && p < o.max_context) finish = "admit";
+                    break; // completed-window quantum, including rejections keeping only one row
+                }
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
@@ -24250,8 +24629,10 @@ int main(int argc, char** argv) {
                 phase_error("ERR %s\n", err.c_str()); return 1;
             }
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
-                bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
-                            (int64_t) live.size() == p;
+                bool cont = !cancelled && (!admit_first_block || !stop_req.load()) &&
+                    produced_n > 0 && produced_n < admit_max_new &&
+                    (admit_first_block ? std::strcmp(finish, "admit") == 0 :
+                     produced_n == 1 && std::strcmp(finish, "length") == 0) && (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
                 static const bool admission_timing = [] {
                     const char* v = std::getenv("STRATA_ADMISSION_TIMING");
@@ -24269,12 +24650,15 @@ int main(int argc, char** argv) {
                         drop_capture("the completed resident conversation");
                     }
                     const strata::program::ResidentAdmission request{
-                        x, &checks, batch_mtp ? last_committed_residual : nullptr, (int64_t) live.size() - 1};
+                        x, &checks, batch_mtp ? last_committed_residual : nullptr,
+                        (int64_t) live.size() - 1, 0, {}, produced_n};
                     if (!executor_retire(admit_slot)) { phase_error("ERR %s\n", err.c_str()); return 1; }
                     if (!resident.admit(admit_slot, live, request, err)) {
                         std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                         phase_error("ERR %s\n", err.c_str()); return 1;
                     }
+                    if (admit_first_block)
+                        batch_drafts[admit_slot] = {bs[size_t(admit_slot)].request, draft_offered, draft_accepted};
                     if (use_dflash && !resident_propose(admit_slot, last_committed_residual, err)) {
                         phase_error("ERR native resident proposal: %s\n", err.c_str()); return 1;
                     }

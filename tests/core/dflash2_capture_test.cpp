@@ -211,6 +211,11 @@ void producer_split_tail() {
             int stage = 0;
             while (d::tap_layers[size_t(tap)] >= bounds[size_t(stage)][1]) ++stage;
             std::vector<float> residuals(size_t(captured) * d::residual_width);
+            std::vector<uint16_t> compact(size_t(captured) * d::hidden_size);
+            for (int row = 0; row < captured; ++row)
+                std::fill_n(compact.data() + size_t(row) * d::hidden_size, d::hidden_size,
+                    phase == d::CapturePhase::verify && row >= keep ? uint16_t(0x7fc0) :
+                        strata::kernels::bf16_from_f32(feature_value(first + row, tap)));
             for (int row = 0; row < captured; ++row) for (int stream = 0; stream < 4; ++stream) {
                 const float value = phase == d::CapturePhase::verify && row >= keep
                     ? std::numeric_limits<float>::quiet_NaN() // rejected rows must NEVER be reduced
@@ -219,7 +224,10 @@ void producer_split_tail() {
             }
             const auto before = residuals;
             d::TapView view;
-            check(stages[size_t(stage)].view(ticket, tap, residuals.data(), view, err), "completed stage-owned tap");
+            if (phase == d::CapturePhase::verify && (keep & 1))
+                check(stages[size_t(stage)].view_reduced(ticket, tap,
+                    reinterpret_cast<const float*>(compact.data()), view, err), "completed reduced verifier tap");
+            else check(stages[size_t(stage)].view(ticket, tap, residuals.data(), view, err), "completed stage-owned tap");
             check(view.owner == ticket && producer.consume(view, err), "assemble by global layer/absolute position");
             check(std::memcmp(residuals.data(), before.data(), residuals.size() * sizeof(float)) == 0,
                   "observer preserves target local state including rejected rows");
@@ -372,11 +380,58 @@ void reduced_prefill() {
           view.reduced.size() == rows * d::hidden_size, "compact reduced view shape");
     check(!capture.view_reduced(owner(2), 0, staging.data(), view, err), "reduced view fences stale owner");
 }
+void reduced_verification() {
+    std::string error;
+    size_t device_bytes = 0, mirror_bytes = 0;
+    for (const auto bounds : {std::array{0, 20}, std::array{20, 39}, std::array{39, 48}}) {
+        d::CaptureAllocation compact, raw;
+        check(d::CaptureAllocation::stage(bounds[0], bounds[1], compact, error, 8, true) &&
+              d::CaptureAllocation::stage(bounds[0], bounds[1], raw, error, 8, false),
+              "price real compact verifier stage owners before expert admission");
+        check(compact.prefill == raw.prefill && compact.flags == raw.flags &&
+              compact.verify_device * 8 == raw.verify && compact.verify == compact.verify_device,
+              "compact host/device taps replace raw verifier payload only");
+        device_bytes += compact.verify_device; mirror_bytes += compact.verify;
+    }
+    check(device_bytes == size_t(8) * d::feature_row_bytes && mirror_bytes == device_bytes,
+          "five eight-row device taps and compact mirrors have exact independently charged extents");
+    for (int keep : {1, 2, 4, 8}) {
+        d::CaptureProducer producer;
+        d::TapCaptureState capture;
+        constexpr int count = 8, first = 3;
+        std::vector<uint16_t> packed(size_t(first + count) * d::hidden_size, uint16_t(0x7fc0));
+        check(capture.configure(d::CapturePhase::verify, 8, 0, 48, 2560, 4, 48, error) &&
+              producer.reset(7, 9, 37, error) && producer.begin(d::CapturePhase::verify, 37, count, error),
+              "start bounded reduced verification at the committed input frontier");
+        const auto ticket = producer.owner();
+        check(capture.arm(ticket, 37, 37, count, error) && capture.begin_run(7, 37, count, error) &&
+              capture.finish_run(error) && capture.committed(keep, error), "target commits only its accepted prefix");
+        d::TapView view;
+        auto* mirror = packed.data() + size_t(first) * d::hidden_size;
+        check(!capture.view_reduced(ticket, 0, reinterpret_cast<const float*>(mirror), view, error),
+              "reduced verifier does not expose uncompleted target state");
+        check(capture.waited(error), "reduced verifier waits for the actual target drain");
+        for (int tap = 0; tap < 5; ++tap) {
+            for (int row = 0; row < keep; ++row)
+                std::fill_n(mirror + size_t(row) * d::hidden_size, d::hidden_size,
+                    strata::kernels::bf16_from_f32(feature_value(37 + row, tap)));
+            check(capture.view_reduced(ticket, tap, reinterpret_cast<const float*>(mirror), view, error) &&
+                  view.reduced.data() == mirror && producer.consume(view, error),
+                  "consume only accepted compact rows from the packed first-row offset");
+        }
+        check(producer.publish(error) && producer.frontier() == 37 + keep &&
+              producer.rejected_rows() == count - keep, "nonfinite rejected compact suffix is neither validated nor published");
+        check(!capture.release({7, 9, ticket.generation + 1}, error) &&
+              capture.release(ticket, error) &&
+              !capture.view_reduced(ticket, 0, reinterpret_cast<const float*>(mirror), view, error),
+              "compact views preserve generation fencing and release lifetime");
+    }
+}
 } // namespace
 
 int main() {
     try {
-        reduced_prefill(); verification(); frontier(); prefill_tail(); split_stages(); producer_split_tail(); producer_refusals();
+        reduced_prefill(); reduced_verification(); verification(); frontier(); prefill_tail(); split_stages(); producer_split_tail(); producer_refusals();
         std::printf("dflash2 capture: %d CPU checks passed\n", checks);
         return 0;
     } catch (const std::exception& error) {

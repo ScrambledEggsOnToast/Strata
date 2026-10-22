@@ -5,6 +5,7 @@
 #include "strata/prefill/prefill.hpp"
 
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <span>
@@ -80,9 +81,16 @@ public:
     // consumed. Once projection starts, failure poisons the real common lease.
     bool finish(std::string& error, uint32_t discard_seats = 0) {
         if (!draft_ || !count_) return true;
+        using Clock = std::chrono::steady_clock;
+        const bool phases = core::dflash2::feature_phases_enabled();
+        const auto wait_started = phases ? Clock::now() : Clock::time_point{};
         if (phase_ == core::dflash2::CapturePhase::verify)
             for (int stage = 0; stage < stages_; ++stage)
                 if (!verifiers_[size_t(stage)]->wait_commit(error)) return false;
+        const auto waited = phases ? Clock::now() : Clock::time_point{};
+        if (phases) std::fprintf(stderr, "DFLASH2_PHASE capture_wait completed=1 phase=%s owners=%d target_wait_ms=%.6f\n",
+            phase_ == core::dflash2::CapturePhase::prefill ? "prefill" : "verify", count_,
+            std::chrono::duration<double, std::milli>(waited - wait_started).count());
         for (int index = 0; index < count_; ++index) {
             const auto& seat = seats_[size_t(index)];
             if (!draft_->owns(seat.ticket)) return refuse(error, "stale target completion ticket");
@@ -96,6 +104,7 @@ public:
                     bool published = false;
                     ~AbortUnpublished() { if (!published) producer.abort(); }
                 } completion{producer};
+                const auto assembly_started = phases ? Clock::now() : Clock::time_point{};
                 for (size_t tap = 0; tap < core::dflash2::tap_layers.size(); ++tap) {
                     const int stage = tap_stages_[tap];
                     core::dflash2::TapView view;
@@ -110,9 +119,23 @@ public:
                 }
                 if (!producer.publish(error)) return false;
                 completion.published = true;
+                const auto assembled = phases ? Clock::now() : Clock::time_point{};
                 const int64_t from = std::max<int64_t>(producer.store().retained_start(), seat.project_from);
                 const auto features = producer.store().committed_since(int(from));
                 if (!draft_->ingest_committed(operation, features, error) || !operation.finish(error)) return false;
+                if (phases) {
+                    const auto completed = Clock::now();
+                    auto ms = [](auto a, auto b) {
+                        return std::chrono::duration<double, std::milli>(b - a).count();
+                    };
+                    std::fprintf(stderr, "DFLASH2_PHASE capture_assembly completed=1 request=%llu incarnation=%llu "
+                        "generation=%llu slot=%d phase=%s start=%d rows=%d "
+                        "host_assembly_ms=%.6f ingest_completed_ms=%.6f\n",
+                        (unsigned long long)seat.capture.request, (unsigned long long)seat.capture.incarnation,
+                        (unsigned long long)seat.capture.generation, seat.ticket.seat,
+                        phase_ == core::dflash2::CapturePhase::prefill ? "prefill" : "verify", features.start, features.count,
+                        ms(assembly_started, assembled), ms(assembled, completed));
+                }
                 if (diagnostic_logging()) std::fprintf(stderr, "DFLASH2_COMMITTED request=%llu incarnation=%llu generation=%llu slot=%d "
                     "phase=%s frontier=%d retained_start=%d committed_rows=%lld rejected_rows=%lld taps=5\n",
                     (unsigned long long)seat.capture.request, (unsigned long long)seat.capture.incarnation,

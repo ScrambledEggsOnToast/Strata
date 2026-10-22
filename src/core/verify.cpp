@@ -97,6 +97,58 @@ using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
 inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE"); return v != nullptr && v[0] == '1'; }(); return on; }
+
+// Host wall attribution only: capture + instantiate + completed upload, not GPU
+// kernel time. Cache hits construct no timer and the disabled path reads no clock.
+class VerifyGraphCaptureWall {
+public:
+    VerifyGraphCaptureWall(const void* owner, int device, int lane, int64_t lo, int64_t hi,
+                          uint64_t request, bool startup, const char* kind, int width,
+                          bool doorbell, const int* rows = nullptr, int hbase = 0)
+        : owner_(owner), device_(device), lane_(lane), lo_(lo), hi_(hi), request_(request),
+          startup_(startup), doorbell_(doorbell), kind_(kind), width_(width) {
+        static const bool enabled = [] {
+            const char* value = std::getenv("STRATA_VERIFY_GRAPH_CAPTURE_WALL");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        on_ = enabled;
+        if (!on_) return;
+        if (rows) { key_ = verify_batch_graph_key(rows, width, hbase, doorbell); batch_ = true; }
+        start_ = Clock::now();
+    }
+    ~VerifyGraphCaptureWall() { if (on_) emit("failed"); }
+    void retained() { if (on_) emit("retained"); }
+private:
+    void emit(const char* status) {
+        const auto end = Clock::now();
+        char layout[40] = "-";
+        if (batch_) {
+            size_t used = 0;
+            for (int row = 0; row < key_[1]; ++row)
+                used += size_t(std::snprintf(layout + used, sizeof(layout) - used,
+                                            row ? ",%d" : "%d", key_[3 + row]));
+        }
+        std::fprintf(stderr, "VERIFY_GRAPH_CAPTURE phase=%s verifier=%p device=%d lane=%d "
+            "layers=%lld:%lld request=%llu kind=%s width=%d doorbell=%d base=%d rows=%s "
+            "start_ns=%lld end_ns=%lld wall_ms=%.6f status=%s "
+            "scope=capture_instantiate_upload_host_wall\n",
+            startup_ ? "startup" : "request", owner_, device_, lane_, (long long)lo_, (long long)hi_,
+            (unsigned long long)request_, kind_, width_, int(doorbell_), batch_ ? key_[0] : -1, layout,
+            (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(start_.time_since_epoch()).count(),
+            (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count(),
+            std::chrono::duration<double, std::milli>(end - start_).count(), status);
+        on_ = false;
+    }
+    const void* owner_;
+    int device_, lane_;
+    int64_t lo_, hi_;
+    uint64_t request_;
+    bool startup_, doorbell_, on_ = false, batch_ = false;
+    const char* kind_;
+    int width_;
+    VerifyBatchKey key_{};
+    Clock::time_point start_{};
+};
 // STRATA_ROUTE_RESIDENT=<margin logits> (+ STRATA_ROUTE_RESIDENT_RANKS=lo-hi, default 6-9): residency-biased routing.
 struct RouteResidentCfg;
 RouteResidentCfg& route_resident_cfg();
@@ -1123,6 +1175,12 @@ Verifier::~Verifier() {
     if (h_route_trace_) cudaFreeHost(h_route_trace_);
     if (causal_x_h_) cudaFreeHost(causal_x_h_);
     for (float* host : dflash2_h_) if (host) cudaFreeHost(host);
+    for (uint16_t* device : dflash2_device_)
+        if (device && cudaFree(device) != cudaSuccess) std::terminate();
+    for (auto& tap : dflash2_events_)
+        for (auto& group : tap)
+            for (cudaEvent_t event : group)
+                if (event && cudaEventDestroy(event) != cudaSuccess) std::terminate();
     if (dflash2_on_h_) cudaFreeHost(dflash2_on_h_);
     if (residency_) {
         if (residency_->host) cudaFreeHost(residency_->host);
@@ -1315,6 +1373,9 @@ bool Verifier::enable_dflash2_capture(std::string& err) {
     if (g_ || max_t_ || dflash2_enabled_) {
         err = "dflash2 capture: enable once before verifier init/graph preparation"; return false;
     }
+    if (!dflash2::validate_feature_flags(err)) return false;
+    dflash2_device_features_ = dflash2::device_features_enabled();
+    dflash2_phases_ = dflash2::feature_phases_enabled();
     dflash2_enabled_ = true;
     return true;
 #endif
@@ -1327,13 +1388,19 @@ bool Verifier::arm_dflash2_capture(dflash2::CaptureOwner owner, int64_t frontier
         return false;
     }
     if (!dflash2_capture_.arm(owner, frontier, start, count, err)) return false;
+    dflash2_phase_pending_ = dflash2_phases_;
+    dflash2_phase_batch_ = false; dflash2_phase_rows_ = count;
     // Acceptance diagnostics poison only idle observer storage. A missing device
     // write then fails the producer's finite-value check instead of reusing a
     // previous generation's apparently valid payload.
     if (std::getenv("STRATA_STATE_HASH"))
-        for (float* host : dflash2_h_)
-            if (host) std::fill_n(host, size_t(count) * dflash2::residual_width,
-                                 std::numeric_limits<float>::quiet_NaN());
+        for (float* host : dflash2_h_) {
+            if (!host) continue;
+            if (dflash2_device_features_)
+                std::fill_n(reinterpret_cast<uint16_t*>(host), size_t(count) * dflash2::hidden_size, uint16_t(0x7fc0));
+            else std::fill_n(host, size_t(count) * dflash2::residual_width,
+                             std::numeric_limits<float>::quiet_NaN());
+        }
     return true;
 }
 
@@ -1341,8 +1408,13 @@ bool Verifier::dflash2_tap(dflash2::CaptureOwner owner, int tap_layer, dflash2::
                           std::string& err) const {
     if (released_.load()) { err = "dflash2 capture: verifier scratch is poisoned"; return false; }
     for (size_t i = 0; i < dflash2::tap_layers.size(); ++i)
-        if (tap_layer == dflash2::tap_layers[i])
-            return dflash2_capture_.view(owner, int(i), dflash2_h_[i], out, err);
+        if (tap_layer == dflash2::tap_layers[i]) {
+            if (!dflash2_device_features_)
+                return dflash2_capture_.view(owner, int(i), dflash2_h_[i], out, err);
+            if (!dflash2_capture_.view_reduced(owner, int(i), dflash2_h_[i], out, err)) return false;
+            out.device = dflash2::DeviceTapView(&dflash2_capture_, owner, int(i), out, dflash2_device_[i], device_);
+            return true;
+        }
     err = "dflash2 capture: unknown tap layer"; return false;
 }
 
@@ -1402,10 +1474,16 @@ bool Verifier::arm_dflash2_batch(std::span<const dflash2::BatchCaptureRow> rows,
     dflash2_batch_rows_ = int(rows.size());
     dflash2_batch_phase_ = Dflash2BatchPhase::armed;
     *dflash2_on_h_ = 0;
+    dflash2_phase_pending_ = dflash2_phases_;
+    dflash2_phase_batch_ = true; dflash2_phase_rows_ = int(rows.size());
     if (std::getenv("STRATA_STATE_HASH"))
-        for (float* host : dflash2_h_)
-            if (host) std::fill_n(host, rows.size() * dflash2::residual_width,
-                                 std::numeric_limits<float>::quiet_NaN());
+        for (float* host : dflash2_h_) {
+            if (!host) continue;
+            if (dflash2_device_features_)
+                std::fill_n(reinterpret_cast<uint16_t*>(host), rows.size() * dflash2::hidden_size, uint16_t(0x7fc0));
+            else std::fill_n(host, rows.size() * dflash2::residual_width,
+                             std::numeric_limits<float>::quiet_NaN());
+        }
     return true;
 }
 
@@ -1472,8 +1550,15 @@ bool Verifier::dflash2_batch_tap(dflash2::CaptureOwner owner, int slot, int tap_
     for (size_t i = 0; i < dflash2::tap_layers.size(); ++i)
         if (tap_layer == dflash2::tap_layers[i]) {
             const float* host = dflash2_h_[i];
-            return seat.state.view(owner, int(i),
-                host ? host + size_t(seat.first) * dflash2::residual_width : nullptr, out, err);
+            if (!dflash2_device_features_)
+                return seat.state.view(owner, int(i),
+                    host ? host + size_t(seat.first) * dflash2::residual_width : nullptr, out, err);
+            const auto* compact = reinterpret_cast<const uint16_t*>(host);
+            const auto* mirror = compact ? compact + size_t(seat.first) * dflash2::hidden_size : nullptr;
+            if (!seat.state.view_reduced(owner, int(i), reinterpret_cast<const float*>(mirror), out, err)) return false;
+            out.device = dflash2::DeviceTapView(&seat.state, owner, int(i), out,
+                dflash2_device_[i] + size_t(seat.first) * dflash2::hidden_size, device_);
+            return true;
         }
     err = "dflash2 capture: unknown tap layer"; return false;
 }
@@ -1588,18 +1673,34 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         dflash2_staging_bytes_ = pages(sizeof(uint32_t));
         for (size_t i = 0; i < dflash2_h_.size(); ++i)
             if (dflash2_capture_.owns_tap(int(i))) {
-                const size_t bytes = size_t(dflash2_raw_rows_) * dflash2::residual_row_bytes;
+                const size_t bytes = size_t(dflash2_raw_rows_) *
+                    (dflash2_device_features_ ? dflash2::reduced_tap_row_bytes : dflash2::residual_row_bytes);
                 if (!mapped(bytes, (void**) &dflash2_h_[i], (void**) &dflash2_m_[i])) {
                     err = "dflash2 capture: mapped verifier tap allocation failed"; return false;
                 }
                 dflash2_staging_bytes_ += pages(bytes);
+                if (dflash2_device_features_) {
+                    if (cudaMalloc(reinterpret_cast<void**>(&dflash2_device_[i]), bytes) != cudaSuccess ||
+                        cudaMemset(dflash2_device_[i], 0, bytes) != cudaSuccess) {
+                        err = "dflash2 capture: bounded BF16 verifier device allocation failed"; return false;
+                    }
+                    dflash2_device_staging_bytes_ += bytes;
+                }
+                if (dflash2_phases_)
+                    for (auto& group : dflash2_events_[i])
+                        for (cudaEvent_t& event : group)
+                            if (cudaEventCreate(&event) != cudaSuccess) {
+                                err = "dflash2 capture: diagnostic completion-event allocation failed"; return false;
+                            }
             }
         if (std::getenv("STRATA_STATE_HASH"))
             std::fprintf(stderr, "DFLASH2_STAGE_ALLOCATION phase=verify device=%d layers=%lld:%lld "
-                "owner=%p raw_rows=%d payload_bytes=%zu flag_bytes=%zu mapped_bytes=%llu\n",
+                "owner=%p raw_rows=%d raw_equivalent_bytes=%zu flag_bytes=%zu mapped_bytes=%llu "
+                "device_feature_bytes=%llu device_features=%d\n",
                 device_, (long long) lb_, (long long) le_, static_cast<const void*>(this), dflash2_raw_rows_,
                 dflash2_capture_.staging_bytes(),
-                sizeof(uint32_t), (unsigned long long) dflash2_staging_bytes_);
+                sizeof(uint32_t), (unsigned long long) dflash2_staging_bytes_,
+                (unsigned long long)dflash2_device_staging_bytes_, int(dflash2_device_features_));
     }
     const WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }
@@ -2305,9 +2406,31 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // Publish unmixed FP32 R, before this layer's attention can write it.
         if (dflash2_enabled_)
             for (size_t i = 0; i < dflash2::tap_layers.size(); ++i)
-                if (l == dflash2::tap_layers[i] + 1 && dflash2_m_[i])
-                    tap_publish(Rt(tb), dflash2_m_[i] + size_t(tb) * HC * N,
-                                int64_t(n) * HC * N, dflash2_on_m_, cs);
+                if (l == dflash2::tap_layers[i] + 1 && dflash2_m_[i]) {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+                    auto& events = dflash2_events_[i][size_t(grp)];
+                    if (dflash2_phases_ &&
+                        cudaEventRecordWithFlags(events[0], cs, cudaEventRecordExternal) != cudaSuccess) {
+                        err = "dflash2 capture: diagnostic capture-start event failed"; return false;
+                    }
+                    if (dflash2_device_features_) {
+                        auto* destination = dflash2_device_[i] + size_t(tb) * N;
+                        tap_reduce_publish(Rt(tb), destination, n, int(N), dflash2_on_m_, cs);
+                        if (cudaMemcpyAsync(reinterpret_cast<uint16_t*>(dflash2_h_[i]) + size_t(tb) * N,
+                                destination, size_t(n) * N * sizeof(uint16_t), cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
+                            err = "dflash2 capture: compact verifier mirror copy failed"; return false;
+                        }
+                    } else
+#endif
+                        tap_publish(Rt(tb), dflash2_m_[i] + size_t(tb) * HC * N,
+                                    int64_t(n) * HC * N, dflash2_on_m_, cs);
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+                    if (dflash2_phases_ &&
+                        cudaEventRecordWithFlags(events[1], cs, cudaEventRecordExternal) != cudaSuccess) {
+                        err = "dflash2 capture: diagnostic capture-end event failed"; return false;
+                    }
+#endif
+                }
 #endif
         {   // measurement only: STRATA_DUMMY_NODES=k adds k empty kernel nodes per layer (what one node costs in a window)
             static const int dummy = [] { const char* e = std::getenv("STRATA_DUMMY_NODES"); return e != nullptr ? std::atoi(e) : 0; }();
@@ -3390,6 +3513,84 @@ bool Verifier::prepare_graphs(std::string& err) {
     return true;
 }
 
+bool Verifier::prepare_startup_graphs(int hbase, int owner_rows, std::string& err) {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_USE_SYCL) || defined(STRATA_GPU_METAL)
+    err = "verify: explicit startup graph preparation requires CUDA";
+    return false;
+#else
+    if (hbase < 0 || owner_rows < 1 || owner_rows > 4) {
+        err = "verify: startup preparation needs a nonnegative base and 1..4 owner rows"; return false;
+    }
+    // Validate the complete chain before acquiring or capturing anything. In
+    // particular, never synchronize another owner's uncommitted or armed frame.
+    for (const Verifier* stage = this; stage; stage = stage->next_) {
+        if (!stage->wt_ || !stage->ss_ || !stage->cs_ || !stage->arena_b_ ||
+            stage->slots_.empty() || stage->slots_.size() > 4 || owner_rows > stage->max_t_ ||
+            stage->max_t_ > strata::kernels::kVerifyMaxT) {
+            err = "verify: startup preparation requires initialized bounded resident owners"; return false;
+        }
+        if (stage->released_.load() || stage->scratch_.phase() != VerifyScratchOwnership::Phase::idle ||
+            stage->fl_active_ || stage->b_running_.load() || stage->commit_live_ ||
+            !stage->dflash2_capture_.idle() || stage->dflash2_batch_phase_ != Dflash2BatchPhase::idle) {
+            err = "verify: startup preparation requires every operation and capture owner idle"; return false;
+        }
+        const int handoff = stage->handoff_rows_ > 0 ? stage->handoff_rows_ : strata::kernels::kVerifyMaxT;
+        if ((stage->next_ || stage->lb_ > 0) && (hbase > handoff || owner_rows > handoff - hbase)) {
+            err = "verify: startup preparation exceeds the actual handoff extent"; return false;
+        }
+        if (stage->dflash2_enabled_ && hbase != 0 && hbase != 8) {
+            err = "verify: startup preparation base is outside the admitted native graph schedule"; return false;
+        }
+    }
+    for (Verifier* stage = this; stage; stage = stage->next_) {
+        const OnDevice on_device(stage->device_);
+        if (!stage->acquire_scratch(err)) return false;
+        ScratchGuard guard{*stage};
+        struct Restore {
+            Verifier& v;
+            bool preparing, ar;
+            int base;
+            std::array<int, 8> rows;
+            ~Restore() {
+                v.graph_preparing_ = preparing; v.ar_off_ = ar; v.row_base_ = base;
+                std::copy(rows.begin(), rows.end(), v.brow_);
+            }
+        } restore{*stage, stage->graph_preparing_, bool(stage->ar_off_), stage->row_base_, {}};
+        std::copy(std::begin(stage->brow_), std::end(stage->brow_), restore.rows.begin());
+        stage->graph_preparing_ = true;
+        stage->refresh_ar();
+        const bool doorbell = stage->ar_off_;
+        const auto before = stage->batch_resources();
+        const auto start = Clock::now();
+        // Only the base-zero working chain executes ordinary prompt/serial
+        // windows. Its hot singleton depth is smaller than the packed capacity.
+        const int ordinary_widths = hbase == 0 ? owner_rows : 0;
+        for (int width = 1; width <= ordinary_widths; ++width)
+            if (!stage->capture(width, err)) return false;
+        if (ordinary_widths && !stage->capture_commit(err)) return false;
+        // Warm the first resident singleton, not the slot-by-depth product.
+        // Other resident seats and multi-owner layouts keep their lazy full keys.
+        const int rows[8] = {};
+        for (int width = 1; width <= owner_rows; ++width)
+            if (!stage->capture_batch(rows, width, hbase, err) ||
+                !stage->capture_commit_batch(rows, width, hbase, err)) return false;
+        if (!stage->scratch_.abandon_unlaunched()) {
+            err = "verify: startup preparation ownership was poisoned"; return false;
+        }
+        guard.keep = true;
+        const auto after = stage->batch_resources();
+        std::fprintf(stderr, "VERIFY_GRAPH_PREP phase=startup verifier=%p device=%d lane=%d layers=%lld:%lld "
+            "base=%d doorbell=%d ordinary_widths=%d slots=%zu singleton_slot=0 singleton_depths=%d "
+            "keys_before=%zu keys_after=%zu execs_after=%zu wall_ms=%.6f "
+            "coverage=singletons_only lazy_unseen=1 kernels_launched=0 status=complete\n",
+            (const void*)stage, stage->device_, stage->worker_lane_, (long long)stage->lb_, (long long)stage->le_,
+            hbase, int(doorbell), ordinary_widths, stage->slots_.size(), owner_rows, before.graph_keys,
+            after.graph_keys, after.graph_execs, ms_since(start));
+    }
+    return true;
+#endif
+}
+
 // #871: is the zero-doorbell graph right for the next window?  Only while every expert of [lb_, le_) is in VRAM now
 // (the host table is the one the device copy was uploaded from; a loan, a VRAM shrink or a swap in flight has
 // marked some -1).  Not: the doorbell graph, which asks the pool for what the device does not hold.
@@ -3421,6 +3622,8 @@ bool Verifier::capture(int T, std::string& err) {
         else
             (void) cudaGetLastError();
     }
+    VerifyGraphCaptureWall wall(this, device_, worker_lane_, lb_, le_, request_id_, graph_preparing_,
+                               "window", T, bool(ar_off_));
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin capture failed";
         return false;
@@ -3551,6 +3754,7 @@ bool Verifier::capture(int T, std::string& err) {
         exec_t = nullptr;
         return false;
     }
+    wall.retained();
     std::fprintf(stderr, "strata verify: captured and uploaded the %d-token window\n", T);
     return true;
 }
@@ -3568,6 +3772,8 @@ bool Verifier::capture_commit(std::string& err) {
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
+    VerifyGraphCaptureWall wall(this, device_, worker_lane_, lb_, le_, request_id_, graph_preparing_,
+                               "commit", max_t_, bool(ar_off_));
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin commit capture failed";
         return false;
@@ -3692,6 +3898,7 @@ bool Verifier::capture_commit(std::string& err) {
         commit_exec_ = nullptr;
         return false;
     }
+    wall.retained();
     return true;
 }
 
@@ -4785,6 +4992,36 @@ bool Verifier::wait_commit(std::string& err) {
     }
     if (next_ && !next_->wait_commit(err)) return fail_operation(err);
     if (!dflash2_capture_.waited(err)) return false;
+    if (!report_dflash2_capture(err)) return fail_operation(err);
+    return true;
+}
+
+bool Verifier::report_dflash2_capture(std::string& err) {
+    if (!dflash2_phase_pending_ || (dflash2_phase_batch_
+            ? dflash2_batch_phase_ != Dflash2BatchPhase::ready : !dflash2_capture_.ready())) return true;
+    const int groups = dflash2_phase_batch_ ? 1 : groups_[dflash2_phase_rows_];
+    double elapsed_ms = 0;
+    size_t taps = 0;
+    for (size_t tap = 0; tap < dflash2_events_.size(); ++tap) {
+        if (!dflash2_capture_.owns_tap(int(tap))) continue;
+        ++taps;
+        for (int group = 0; group < groups; ++group) {
+            float milliseconds = 0;
+            const auto& events = dflash2_events_[tap][size_t(group)];
+            if (cudaEventElapsedTime(&milliseconds, events[0], events[1]) != cudaSuccess) {
+                err = "dflash2 capture: completed capture timing unavailable"; return false;
+            }
+            elapsed_ms += milliseconds;
+        }
+    }
+    const size_t rows = size_t(dflash2_phase_rows_) * taps;
+    std::fprintf(stderr, "DFLASH2_PHASE capture completed=1 device=%d physical_owner=%p rows=%d taps=%zu "
+        "route=%s capture_gpu_ms=%.6f raw_host_bytes=%zu compact_host_bytes=%zu\n",
+        device_, static_cast<const void*>(this), dflash2_phase_rows_, taps,
+        dflash2_device_features_ ? "device_reduce_compact_mirror" : "raw_mapped",
+        elapsed_ms, dflash2_device_features_ ? 0 : rows * dflash2::residual_row_bytes,
+        dflash2_device_features_ ? rows * dflash2::reduced_tap_row_bytes : 0);
+    dflash2_phase_pending_ = false;
     return true;
 }
 
@@ -4978,11 +5215,12 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     // A graph is instantiated only through the qualification seam, the batch window included: the key carries the
     // row count and the stage's layer range, so a denying observation scope ("no new graph-cache growth while
     // serving") refuses this capture before the stream capture starts instead of growing the cache behind it.
-    // Preparing the batch keys that a run will use is part of the same contract as prepare_graphs and is not done
-    // here; until it is, a prepared-service scope reports the first unseen batch key as a denial rather than
-    // letting the capture through.
+    // Explicit startup preparation covers only its published singleton subset;
+    // other valid full keys remain lazy unless the observer explicitly denies them.
     const GraphCaptureProbe probe({"verify", "batch-window", lb_, S, le_});
     if (!probe.check(GraphCapturePhase::BeforeCapture, err)) return false;
+    VerifyGraphCaptureWall wall(this, device_, worker_lane_, lb_, le_, request_id_, graph_preparing_,
+                               "batch-window", S, bool(ar_off_), rows, hbase);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin batch capture failed";
         return false;
@@ -5011,6 +5249,7 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
         ex = nullptr;
         return false;
     }
+    wall.retained();
     std::string list;
     for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
     std::fprintf(stderr, "strata verify: captured the batch window over slots %s\n", list.c_str());
@@ -5033,6 +5272,8 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
+    VerifyGraphCaptureWall wall(this, device_, worker_lane_, lb_, le_, request_id_, graph_preparing_,
+                               "batch-commit", S, bool(ar_off_), rows, hbase);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin batch commit capture failed";
         return false;
@@ -5141,6 +5382,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
         cex = nullptr;
         return false;
     }
+    wall.retained();
     return true;
 }
 
@@ -5608,6 +5850,7 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
         }
         dflash2_batch_phase_ = Dflash2BatchPhase::ready;
         *dflash2_on_h_ = 0;
+        if (!report_dflash2_capture(err)) return false;
     }
     guard.keep = true;
     return true;

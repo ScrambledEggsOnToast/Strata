@@ -1017,7 +1017,7 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     const bool timing = admission_timing_enabled();
     auto phase = timing ? Clock::now() : Clock::time_point{};
     if (request.checkpoint_limit < -1 || working_failed_ || !available(slot) || !working_.request || prefix.empty() || prefix.size() >= (uint64_t) context_ ||
-        (!parked && (input_.max_new <= 1 || destination_ != slot)) ||
+        (!parked && (request.initial_generated < 1 || request.initial_generated >= input_.max_new || destination_ != slot)) ||
         (parked && (!cache_ || input_.images || !working_prompt_ || (destination_ >= 0 && destination_ != slot) ||
          prefix.size() >= working_prompt_->size() || !std::equal(prefix.begin(), prefix.end(), working_prompt_->begin())))) {
         error = "resident admission: invalid or unavailable slot/request"; return false;
@@ -1121,7 +1121,7 @@ bool ResidentSlots::bind(int slot, const std::vector<int32_t>& prefix, const Res
     state.x = request.next_token;
     state.proposal.clear();
     state.p = (int64_t) prefix.size();
-    state.produced = parked ? 0 : 1;
+    state.produced = parked ? 0 : request.initial_generated;
     state.max_new = input_.max_new;
     state.t0 = Clock::now();
     state.cvec = input_.steering;

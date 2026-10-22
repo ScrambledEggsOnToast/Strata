@@ -888,6 +888,7 @@ class SpeculationPolicy:
         self.handoffs = {}
         self.probed = {}
         self.solo = self.control = self.epoch = None
+        self.admission_tokens = 0
         self.slots = {}
         self.defer_until = None
 
@@ -935,6 +936,7 @@ class SpeculationPolicy:
                 self.slots[slot] = context
                 self._reset_batch(now)
             self.control = [path, slot, now, transition, False]
+            self.admission_tokens = 0
 
     def wire(self, line, now=None):
         """One native frame. Advisory: a malformed or unexpected line is ignored,
@@ -948,6 +950,8 @@ class SpeculationPolicy:
             if f[0] == "REUSED" and self.solo is not None:
                 self.solo[1] = now       # prefix restore/prefill is priced by the handoff, not steady decode
             elif f[0] in ("T", "BT"):
+                if f[0] == "T" and self.control and self.control[0] == "batch":
+                    self.admission_tokens += 1
                 if f[0] == "T" and self.control and not self.control[4]:
                     path, cslot, started, transition, _ = self.control
                     self.control[4] = True
@@ -980,8 +984,16 @@ class SpeculationPolicy:
                 if slot is not None:
                     self.slots.pop(slot, None)
                 self._reset_batch(now)
+                if f[0] == "BADM" and self.control and self.control[0] == "batch" and self.control[1] == slot:
+                    self.control = None
+                    self.admission_tokens = 0
             elif f[0] == "BADM":
+                if self.control and self.control[0] == "batch" and self.control[1] == slot and slot in self.slots:
+                    self.slots[slot] += max(0, self.admission_tokens - 1)
+                    self._flush_batch(now)
+                    self._reset_batch(now)
                 self.control = None
+                self.admission_tokens = 0
 
     def yield_solo(self, context, left, waiters, foreground_pending=False, now=None):
         now = time.monotonic() if now is None else now
@@ -1090,6 +1102,8 @@ class StrataEngine:
         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
         self.session_save_reclaim = '--session-save-reclaim' in args
         self.resident_multiplex = "--resident-multiplex" in args
+        native_env = os.environ if env is None else env
+        self.bgen_first_block = native_env.get("STRATA_DFLASH2_BGEN_FIRST_BLOCK") == "1"
         spec_policy = os.environ.get("STRATA_SPEC_POLICY", "static")
         if spec_policy not in ("static", "adaptive"):
             raise ValueError("STRATA_SPEC_POLICY must be static or adaptive")
@@ -1286,6 +1300,10 @@ class StrataEngine:
         # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
+        if self.bgen_first_block and (self.batch < 1 or self.info.get("bgen_first_block") != 1 or
+                                      self.info.get("bgen_first_block_version") != 1):
+            self.close()
+            raise RuntimeError("BGEN first block requires the enabled engine capability version 1")
         self.foreground_budget_s = float(self.info.get("foreground_budget_ms") or 0) / 1000.0
         self.background_share = float(self.info.get("background_share") or 0.25)
         if self.resident_multiplex and (self.batch < 2 or self.info.get("resident_multiplex") != 1):
@@ -1983,7 +2001,8 @@ class StrataEngine:
         f = (getattr(self, "_last_done", None) or "").split()
         return f[5] if len(f) > 5 else None
 
-    def _drain_control(self, until: str, timeout: float = 300.0, born: int | None = None, slot=None):
+    def _drain_control(self, until: str, timeout: float = 300.0, born: int | None = None, slot=None,
+                       on_token=None):
         """After a consumer left early: read the control lines up to the next `until` line (DONE or BADM) so the next
         request does not read this one's leftovers. A missing live boundary poisons the process.
         `born` identifies the process that owns the request: never drain a successor's lines."""
@@ -2006,6 +2025,8 @@ class StrataEngine:
             if line.startswith("REJECT bounded=1 ") and until == "BADM" and slot is not None:
                 rejected = True
                 continue
+            if line.startswith("T ") and on_token is not None:
+                on_token(int(line[2:]))  # internal committed history, even when the consumer has closed
             if line.startswith("YIELDED "):
                 fields = line.split()
                 self._yielded = (int(fields[1]), int(fields[2]))
@@ -2035,7 +2056,24 @@ class StrataEngine:
             return None  # older engines omit the identity entirely
         return int(values["request"]), int(values["incarnation"])
 
+    def _bgen_block_key(self, embeddings) -> str:
+        # This is an internal negotiated key, never copied from client sampling parameters.
+        if not getattr(self, "bgen_first_block", False) or embeddings:
+            return ""
+        if self.info.get("bgen_first_block") != 1 or self.info.get("bgen_first_block_version") != 1:
+            raise EngineDied("BGEN first block capability is missing from this engine incarnation")
+        return " first_block=1"
+
+    def _check_block_admission(self, slot: int, emitted: int, continues: bool) -> None:
+        if not isinstance(self.last, dict) or self.last.get("generated") != emitted:
+            raise self._silent("BGEN first block DONE does not match committed admission tokens")
+        if continues and (emitted < 1 or self.last.get("finish") != "admit" or
+                          self._slot_identity[slot] is None):
+            raise self._silent("BGEN first block continuation lacks its count, yield or owner identity")
+
     def _record_badm(self, fields: list[str], slot: int | None) -> None:
+        if getattr(self, "bgen_first_block", False) and slot is not None and int(fields[1]) != slot:
+            raise self._silent("BGEN first block boundary names another slot")
         if slot is not None and 0 <= slot < len(getattr(self, "_slot_identity", [])):
             identity = self._resident_identity(fields[3:])
             self._slot_identity[slot] = identity if identity and identity[0] else None
@@ -2058,10 +2096,18 @@ class StrataEngine:
         if len(f) >= 5 and isinstance(self.last, dict):
             admission = _native_leg("admission", self.last, int(f[1]))
             counters = dict(field.split("=", 1) for field in f[5:] if "=" in field)
-            self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
+            # Only the negotiated route changes duration accounting. Its final counts
+            # include all admission outputs, so retain both decode phases exactly once.
+            block_admission = self.last.get("finish") == "admit"
+            resident_ms = float(f[4])
+            total_ms = resident_ms + (float(self.last["decode_ms"]) if block_admission else 0.0)
+            self.last = {**self.last, "finish": f[3], "decode_ms": total_ms,
                          "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated"),
                          "drafts_accepted": int(counters["draft_accepted"]) if "draft_accepted" in counters else None,
                          "drafts_offered": int(counters["draft_offered"]) if "draft_offered" in counters else None}
+            if block_admission:
+                self.last["admission_decode_ms"] = admission["decode_ms"]
+                self.last["resident_decode_ms"] = resident_ms
             self.last["legs"] = [{**_native_leg("batch", self.last, int(f[1])), "admission": admission}]
             work = getattr(getattr(self, "_tl", None), "native_work", None)
             if work is not None:
@@ -2907,6 +2953,7 @@ class StrataEngine:
         slot_owner = (born, slot_queues, slot_busy, slot_held, slot_claims, slot_releasing, slot_identities)
         btrace("ctl acquired")
         gen0, reserved = None, None
+        block_key = ""
         expected_identity = None
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
@@ -3074,7 +3121,8 @@ class StrataEngine:
                         self.slot_q[slot].get_nowait()
                     if getattr(self, "resident_multiplex", False):
                         self._send(f"BPRIORITY {slot} {(sampling or {}).get('strata_priority', 'foreground')}")
-                    leg_keys = keys + self._phase_keys(sampling or {}, slot)
+                    block_key = self._bgen_block_key(embeddings)
+                    leg_keys = keys + self._phase_keys(sampling or {}, slot) + block_key
                     head = f"BGENI {slot} {left}{leg_keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{leg_keys}"
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
                             "started": time.time(), "first_token": None}
@@ -3088,6 +3136,7 @@ class StrataEngine:
                         policy.begin("batch", len(prompt), slot, transition=bool(out))
                     self._last_done = None                  # (#879: this admission's DONE decides below)
                     slot_identities[slot] = expected_identity = None  # a new admission cannot inherit the old fence
+                    gen0 = len(out)  # before streaming: all admission tokens belong to this leg
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_scope[slot] = scope
                     if callable(on_submit):
@@ -3140,6 +3189,8 @@ class StrataEngine:
                         t = pending.pop(0)
                         out.append(t)
                         yield t
+                    if block_key:
+                        self._check_block_admission(slot, len(out) - gen0, cont)
                     if not cont and self._done_finish() == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
@@ -3150,7 +3201,6 @@ class StrataEngine:
                 if not cont:
                     return
                 live.update(state="decoding", first_token=time.time(), generated=len(out))
-                gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
                 going_solo = False
                 while True:
                     try:
@@ -3226,7 +3276,13 @@ class StrataEngine:
                     self._drain_control("DONE", born=born)
                 elif phase == "admit":
                     self._send("STOP")
-                    line = self._drain_control("BADM", born=born, slot=slot)
+                    # A closed consumer may leave unobserved admission T frames. Keep
+                    # them in internal history before reconstructing a reusable prefix.
+                    out.extend(pending)
+                    pending.clear()
+                    line = self._drain_control("BADM", born=born, slot=slot, on_token=out.append)
+                    if line and block_key:
+                        self._check_block_admission(slot, len(out) - gen0, line.split()[2:3] == ["1"])
                     expected_identity = slot_identities[slot]
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
                         phase = "slot"

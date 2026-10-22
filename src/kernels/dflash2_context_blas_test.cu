@@ -123,12 +123,21 @@ void run(gpu::ContextBlas& owner, int m, int k, int n, int mode) {
 }
 } // namespace
 int main(int argc, char** argv) {
-    if (argc == 2 && std::strcmp(argv[1], "--help") == 0) { std::puts("Queued SM70 context cuBLAS fixture, no arguments; CUDA_VISIBLE_DEVICES selects card."); return 0; }
+    if (argc == 2 && std::strcmp(argv[1], "--help") == 0) { std::puts("Queued SM70/SM86 context cuBLAS fixture, no arguments; CUDA_VISIBLE_DEVICES selects card."); return 0; }
     need(argc == 1, "unsupported arguments");
-    need(setenv("STRATA_DFLASH2_CONTEXT_CUBLAS_TRACE", "1", 1) == 0, "diagnostic counters");
+    need(setenv("STRATA_DFLASH2_CONTEXT_CUBLAS", "1", 1) == 0 &&
+         setenv("STRATA_DFLASH2_CONTEXT_CUBLAS_TRACE", "1", 1) == 0, "opt-in mode and diagnostic counters");
+    ck(cudaSetDevice(0));
+    cudaDeviceProp properties{}; ck(cudaGetDeviceProperties(&properties, 0));
+    const int sm = properties.major * 10 + properties.minor;
+    need(sm == 70 || sm == 86, "fixture requires an actual SM70 or SM86 device");
+    need(gpu::context_blas_enabled() &&
+         std::strcmp(gpu::context_projection_identity(), "context-cublas-fp16-exact-fp32-n1024-m128-v1") == 0,
+         "fixture requires the actual unchanged opt-in numerical mode");
     construction(); gpu::ContextBlas owner(0);
     for (int mode = 0; mode <= 8; ++mode) run(owner, 129, 128, 71, mode);
     run(owner, 128, 67, 1057, 3); // K padding plus chunk-tail offset on both raw axes.
     run(owner, 128, 128, 1057, 0);
-    std::puts("PASS context_cublas_functional numerical_variant=1 real_model_not_exercised=1");
+    std::printf("PASS context_cublas_functional numerical_variant=1 real_model_not_exercised=1 sm=%d projection_mode=%s\n",
+        sm, gpu::context_projection_identity());
 }

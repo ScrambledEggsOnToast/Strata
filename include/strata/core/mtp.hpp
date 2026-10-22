@@ -113,7 +113,9 @@ public:
     /// Refill the drafter's resident ring from its authoritative host copy and
     /// clip certification to the resumed owner. Its last cell consumes the
     /// destination's token at `upto`; an unknown/mismatching token drops that cell.
-    void kv_restore(int64_t upto, int32_t next_token = -1);
+    /// A caller that retained the outgoing target prefix may explicitly hand off
+    /// its drained draft producer, before any intervening numerical operation.
+    void kv_restore(int64_t upto, int32_t next_token = -1, const DraftOwner* retained_source = nullptr);
     /// The VRAM bind() will allocate for a native head of `head_row_bytes` per vocabulary row: the draft logits and
     /// the draft head over rt/draft_vocab.bin's subset.  The expert cache is sized before bind(), so it reserves this.
     uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const;

@@ -11,9 +11,12 @@
 #include <string_view>
 
 namespace strata::core { class ConversationBuffer; }
+namespace strata::program { struct ResidentExecutorFixture; }
 
 namespace strata::core::dflash2 {
 class DeviceForward;
+class CaptureProducer;
+class DflashNativeDrafter;
 
 // A trace is borrowed only during capture(). A sink may enqueue a readback into
 // its OWN preallocated host storage on stream; subsequent writes are ordered on
@@ -127,9 +130,19 @@ public:
     size_t device_bytes() const noexcept;
     static size_t context_bytes() noexcept;
     static size_t scratch_bytes() noexcept;
+    // Startup only, before device telemetry/admission and expert-cache pricing.
+    // Unsupported physical peers retain an explicitly counted compact-host route.
+    static bool prepare_feature_peers(std::span<const int> sources, int destination, std::string& error);
     // Off-mode identities stay byte-for-byte compatible with prior snapshots.
     static const std::string& numerical_mode();
 private:
+    friend class DflashNativeDrafter;
+    friend struct strata::program::ResidentExecutorFixture;
+    bool ingest_producer(DeviceContext&, const FeatureView&, CaptureProducer&,
+                         const OperationLease::Guard&, int frontier, void* stream, std::string& error);
+    static bool gather_features(CaptureProducer&, const FeatureView&, const OperationLease::Guard&,
+        uint16_t* destination, int device, void* stream, uint64_t& local_bytes,
+        uint64_t& peer_bytes, uint64_t& host_bytes, std::string& error, ForwardTraceSink* trace = nullptr);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

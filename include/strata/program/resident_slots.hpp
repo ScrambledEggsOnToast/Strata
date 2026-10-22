@@ -178,6 +178,7 @@ struct ResidentAdmission {
     int64_t checkpoint_limit = -1;   // inclusive; -1 uses the admitted prefix length
     int64_t prefill_split_until = 0; // park only; zero once the selected interval has finished
     core::ConversationCheckpoint::PromptPlan prefill_plan; // park only: the plan of the segment being parked
+    int64_t initial_generated = 1; // active admission only; prefix excludes the final next_token anchor
 };
 
 // A physical seat incarnation, not an ambient working-session handle. Tokens

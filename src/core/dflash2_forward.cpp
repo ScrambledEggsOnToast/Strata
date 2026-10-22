@@ -1,4 +1,5 @@
 #include "strata/core/dflash2_forward.hpp"
+#include "strata/core/dflash2_capture.hpp"
 #include "strata/core/conversation_buffer.hpp"
 #include "strata/kernels/dflash2_forward.hpp"
 #include "strata/kernels/dflash2_context_blas.hpp"
@@ -63,6 +64,30 @@ struct DeviceAllocation {
     DeviceAllocation(const DeviceAllocation&) = delete;
     DeviceAllocation& operator=(const DeviceAllocation&) = delete;
 };
+struct PhaseEvents {
+    int device = -1;
+    std::array<cudaEvent_t, 3> events{};
+    void initialize(int ordinal) {
+        if (!feature_phases_enabled()) return;
+        device = ordinal;
+        for (auto& event : events) checked(cudaEventCreate(&event), "allocate feature phase event");
+    }
+    ~PhaseEvents() {
+        if (device < 0) return;
+        DeviceScope on(device);
+        for (auto event : events)
+            if (event && cudaEventDestroy(event) != cudaSuccess) std::terminate();
+    }
+};
+struct FeaturePeerTopology {
+    int destination = -1, count = 0;
+    std::array<int, 4> sources{};
+    std::array<bool, 4> peer{};
+};
+FeaturePeerTopology& feature_peer_topology() {
+    static FeaturePeerTopology topology;
+    return topology;
+}
 struct Scratch {
     uint16_t *features = nullptr, *target = nullptr, *context_k = nullptr, *context_v = nullptr;
     uint16_t *hidden = nullptr, *normalized = nullptr, *convolved = nullptr, *product = nullptr;
@@ -241,6 +266,8 @@ struct DeviceForward::Impl {
     bool value_reported = false;
     const bool grouped_score_trace = [] { const char* v = std::getenv("STRATA_DFLASH2_SCORE_GROUPED_TRACE"); return v && std::strcmp(v, "1") == 0; }();
     bool grouped_score_reported = false;
+    bool device_features_reported = false;
+    PhaseEvents feature_timing;
     Scratch s;
     std::array<Layer, gpu::layers> layer{};
     std::array<Entry, 81> entries;
@@ -251,6 +278,8 @@ struct DeviceForward::Impl {
     Impl(const RuntimeWeights& runtime, int ordinal)
         : device(ordinal), weight_bytes(runtime.dense().size_bytes()),
           manifest(runtime.manifest_sha256()), target_identity(runtime.target_identity()) {
+        std::string flags_error;
+        if (!validate_feature_flags(flags_error)) throw Refusal(flags_error);
         if (device < 0 || !weight_bytes) throw Refusal("dflash2 forward: invalid device/empty dense runtime");
         DeviceScope on(device);
         cudaDeviceProp properties{};
@@ -265,6 +294,7 @@ struct DeviceForward::Impl {
         weights.allocate(weight_bytes, device);
         scratch.allocate(DeviceForward::scratch_bytes(), device);
         s = scratch_layout(scratch.pointer);
+        feature_timing.initialize(device);
         auto bind = [&](std::string name, std::initializer_list<int64_t> shape) {
             const auto& tensor = runtime.tensor(name);
             size_t elements = 1;
@@ -456,7 +486,8 @@ struct DeviceForward::Impl {
         e.emit("mlp.residual", index, s.hidden, ForwardTrace::Type::bf16, {block, hidden_size}, frontier);
     }
     bool run(DeviceContext::Impl& c, const FeatureView& features, const uint16_t* embeddings, int proposal_rows,
-             int frontier, uint16_t* output, void* stream, std::string& error, ForwardTraceSink* trace) {
+             int frontier, uint16_t* output, void* stream, std::string& error, ForwardTraceSink* trace,
+             CaptureProducer* producer = nullptr, const OperationLease::Guard* producer_lease = nullptr) {
         OperationLease::Guard guard(lease);
         if (!acquire(guard, error)) return false;
         const bool proposal = embeddings != nullptr;
@@ -476,16 +507,30 @@ struct DeviceForward::Impl {
                              overlaps(output, block_size * hidden_size * sizeof(uint16_t), c.ring(), DeviceForward::context_bytes()))) {
                 guard.complete(); return refuse(error, "hidden output overlaps immutable weights or private owner storage");
             }
+            if (producer && (!producer_lease || !producer->device_preflight(features, *producer_lease, error))) {
+                guard.complete(); return false;
+            }
             submitted = true;
             e.must(cudaMemsetAsync(s.status, 0, sizeof(uint32_t), static_cast<cudaStream_t>(stream)), "reset numerical failure flag");
-            size_t uploaded = 0;
-            for (const auto part : features.segments) {
-                if (!part.empty()) {
-                    e.must(cudaMemcpyAsync(s.features + uploaded, part.data(), part.size_bytes(), cudaMemcpyHostToDevice,
-                                           static_cast<cudaStream_t>(stream)), "upload committed feature span exactly once");
-                    uploaded += part.size();
+            const bool phases = feature_phases_enabled() && features.count != 0;
+            auto& events = feature_timing.events;
+            if (phases) e.must(cudaEventRecord(events[0], static_cast<cudaStream_t>(stream)), "record feature input start");
+            const size_t uploaded = size_t(features.count) * feature_width;
+            uint64_t local_bytes = 0, peer_bytes = 0, host_bytes = 0;
+            if (producer) {
+                if (!DeviceForward::gather_features(*producer, features, *producer_lease, s.features, device,
+                        stream, local_bytes, peer_bytes, host_bytes, error, trace)) throw SubmittedFailure{};
+            } else {
+                size_t offset = 0;
+                for (const auto part : features.segments) {
+                    if (!part.empty()) {
+                        e.must(cudaMemcpyAsync(s.features + offset, part.data(), part.size_bytes(), cudaMemcpyHostToDevice,
+                                               static_cast<cudaStream_t>(stream)), "upload committed feature span exactly once");
+                        offset += part.size(); host_bytes += part.size_bytes();
+                    }
                 }
             }
+            if (phases) e.must(cudaEventRecord(events[1], static_cast<cudaStream_t>(stream)), "record completed feature input boundary");
             if (features.count) {
                 e.must(gpu::finite_bf16(s.features, uploaded, s.status, stream), "validate committed feature finiteness");
                 e.emit("context.features", -1, s.features, ForwardTrace::Type::bf16, {features.count, feature_width}, features.start);
@@ -516,11 +561,31 @@ struct DeviceForward::Impl {
                 e.must(cudaMemcpyAsync(output, s.hidden, size_t(proposal_rows) * hidden_size * sizeof(uint16_t), cudaMemcpyDeviceToDevice,
                                        static_cast<cudaStream_t>(stream)), "publish four normalized BF16 hidden rows");
             }
+            if (phases) e.must(cudaEventRecord(events[2], static_cast<cudaStream_t>(stream)), "record context projection completion");
             e.must(cudaMemcpyAsync(&numeric, s.status, sizeof(numeric), cudaMemcpyDeviceToHost,
                                    static_cast<cudaStream_t>(stream)), "read numerical failure flag");
             e.must(cudaStreamSynchronize(static_cast<cudaStream_t>(stream)), "complete all five layers and trace readbacks");
             if (numeric) { error = "dflash2 forward: nonfinite BF16/FP32 operation poisoned context and scratch"; throw SubmittedFailure{}; }
             if (context_blas) context_blas->report_completed();
+            if (phases) {
+                float input_ms = 0, projection_ms = 0;
+                e.must(cudaEventElapsedTime(&input_ms, events[0], events[1]), "read completed feature input duration");
+                e.must(cudaEventElapsedTime(&projection_ms, events[1], events[2]), "read completed context projection duration");
+                std::fprintf(stderr, "DFLASH2_PHASE feature_input completed=1 device=%d start=%d rows=%d "
+                    "route=%s input_gpu_ms=%.6f context_gpu_ms=%.6f local_device_bytes=%llu "
+                    "peer_device_bytes=%llu host_upload_bytes=%llu\n", device, features.start, features.count,
+                    producer ? "authenticated_verifier" : "host_ring", input_ms, projection_ms,
+                    (unsigned long long)local_bytes, (unsigned long long)peer_bytes, (unsigned long long)host_bytes);
+            }
+            if (producer && !device_features_reported &&
+                    (feature_phases_enabled() || std::getenv("STRATA_STATE_HASH") || std::getenv("DFLASH2_CAPTURE_DIR"))) {
+                std::fprintf(stderr, "DFLASH2_DEVICE_FEATURES completed=1 device=%d start=%d rows=%d "
+                    "producer_generation=%llu local_device_bytes=%llu peer_device_bytes=%llu host_upload_bytes=%llu "
+                    "wholly_device_resident=%d\n", device, features.start, features.count,
+                    (unsigned long long)producer->owner_.generation, (unsigned long long)local_bytes,
+                    (unsigned long long)peer_bytes, (unsigned long long)host_bytes, int(host_bytes == 0));
+                device_features_reported = true;
+            }
             publish(c, features, begin, frontier);
             if (e.split_value_submitted && value_trace && !value_reported) {
                 std::fprintf(stderr, "DFLASH2_VALUE_SPLIT completed=1 scope=DeviceForward device=%d rows=%d context=%d chunk=%d workspace=%zu mode=%s\n",
@@ -685,6 +750,121 @@ bool DeviceForward::forward(DeviceContext& context, const FeatureView& features,
 bool DeviceForward::ingest(DeviceContext& context, const FeatureView& features, int frontier,
                            void* stream, std::string& error, ForwardTraceSink* trace) {
     return impl_->run(*context.impl_, features, nullptr, 0, frontier, nullptr, stream, error, trace);
+}
+bool DeviceForward::ingest_producer(DeviceContext& context, const FeatureView& features, CaptureProducer& producer,
+        const OperationLease::Guard& lease, int frontier, void* stream, std::string& error) {
+    if (!device_features_enabled() || producer.phase_ != CapturePhase::verify)
+        return ingest(context, features, frontier, stream, error);
+    return impl_->run(*context.impl_, features, nullptr, 0, frontier, nullptr, stream, error, nullptr, &producer, &lease);
+}
+bool DeviceForward::prepare_feature_peers(std::span<const int> sources, int destination, std::string& error) {
+    if (!validate_feature_flags(error)) return false;
+    if (!device_features_enabled()) return true;
+    int devices = 0;
+    const auto status = cudaGetDeviceCount(&devices);
+    if (status != cudaSuccess || sources.empty() || sources.size() > 4 || destination < 0 || destination >= devices)
+        return refuse(error, "invalid startup device-feature topology");
+    for (size_t i = 0; i < sources.size(); ++i)
+        if (sources[i] < 0 || sources[i] >= devices ||
+            std::find(sources.begin(), sources.begin() + ptrdiff_t(i), sources[i]) != sources.begin() + ptrdiff_t(i))
+            return refuse(error, "device-feature sources must be distinct real device ordinals");
+    auto& topology = feature_peer_topology();
+    if (topology.count) {
+        return (topology.destination == destination && topology.count == int(sources.size()) &&
+                std::equal(sources.begin(), sources.end(), topology.sources.begin())) ||
+            refuse(error, "startup device-feature topology cannot be rebound");
+    }
+    try {
+        DeviceScope on(destination);
+        FeaturePeerTopology prepared;
+        prepared.destination = destination; prepared.count = int(sources.size());
+        std::copy(sources.begin(), sources.end(), prepared.sources.begin());
+        for (size_t i = 0; i < sources.size(); ++i) {
+            const int source = sources[i];
+            if (source != destination) {
+                int access = 0;
+                checked(cudaDeviceCanAccessPeer(&access, destination, source), "check physical feature peer access");
+                if (access) {
+                    const auto enabled = cudaDeviceEnablePeerAccess(source, 0);
+                    if (enabled == cudaErrorPeerAccessAlreadyEnabled) (void)cudaGetLastError();
+                    else checked(enabled, "enable physical feature peer access before admission");
+                    prepared.peer[i] = true;
+                }
+            }
+            std::fprintf(stderr, "DFLASH2_DEVICE_FEATURE_TOPOLOGY source=%d destination=%d "
+                "route=%s admission_pending=1\n", source, destination,
+                source == destination ? "local_device" : prepared.peer[i] ? "peer_device" : "compact_host_staging");
+        }
+        topology = prepared; error.clear(); return true;
+    } catch (const std::exception& failure) { error = failure.what(); return false; }
+}
+bool DeviceForward::gather_features(CaptureProducer& producer, const FeatureView& features,
+        const OperationLease::Guard& lease, uint16_t* destination, int device, void* stream,
+        uint64_t& local_bytes, uint64_t& peer_bytes, uint64_t& host_bytes, std::string& error,
+        ForwardTraceSink* trace) {
+    if (!producer.device_preflight(features, lease, error)) return false;
+    const auto& topology = feature_peer_topology();
+    if (!destination || topology.destination != device || !topology.count)
+        return refuse(error, "device features lack their admitted physical topology");
+    std::array<bool, tap_layers.size()> peers{};
+    for (size_t tap = 0; tap < producer.device_taps_.size(); ++tap) {
+        const int source = producer.device_taps_[tap].device_;
+        const auto end = topology.sources.begin() + topology.count;
+        const auto found = std::find(topology.sources.begin(), end, source);
+        if (found == end) return refuse(error, "device tap source was not prepared before admission");
+        peers[tap] = topology.peer[size_t(found - topology.sources.begin())];
+    }
+    bool submitted = false;
+    Execution execution{stream, error, trace};
+    try {
+        DeviceScope on(device);
+        if (!stream_preflight(stream, error)) return false;
+        local_bytes = peer_bytes = host_bytes = 0;
+        const size_t bytes = size_t(features.count) * reduced_tap_row_bytes;
+        for (size_t tap = 0; tap < producer.device_taps_.size(); ++tap) {
+            const auto& source = producer.device_taps_[tap];
+            auto* output = destination + tap * hidden_size;
+            submitted = true;
+            if (source.device_ == device) {
+                execution.must(cudaMemcpy2DAsync(output, feature_row_bytes, source.data_, reduced_tap_row_bytes,
+                    reduced_tap_row_bytes, size_t(features.count), cudaMemcpyDeviceToDevice,
+                    static_cast<cudaStream_t>(stream)), "gather accepted local verifier tap");
+                local_bytes += bytes;
+            } else if (peers[tap]) {
+                cudaMemcpy3DPeerParms copy{};
+                copy.srcDevice = source.device_; copy.dstDevice = device;
+                copy.srcPtr = make_cudaPitchedPtr(const_cast<uint16_t*>(source.data_),
+                    reduced_tap_row_bytes, reduced_tap_row_bytes, size_t(features.count));
+                copy.dstPtr = make_cudaPitchedPtr(output, feature_row_bytes, feature_row_bytes, size_t(features.count));
+                copy.extent = make_cudaExtent(reduced_tap_row_bytes, size_t(features.count), 1);
+                execution.must(cudaMemcpy3DPeerAsync(&copy, static_cast<cudaStream_t>(stream)),
+                               "gather accepted peer verifier tap");
+                peer_bytes += bytes;
+            } else {
+                // This mirror was already required and host-complete at target
+                // commit. No extra staging allocation or concealed GPU-only claim.
+                execution.must(cudaMemcpy2DAsync(output, feature_row_bytes, source.mirror_, reduced_tap_row_bytes,
+                    reduced_tap_row_bytes, size_t(features.count), cudaMemcpyHostToDevice,
+                    static_cast<cudaStream_t>(stream)), "gather accepted compact host-staged verifier tap");
+                host_bytes += bytes;
+            }
+            // Existing diagnostic seam can reject after real partial submission;
+            // failure must drain before the verifier storage or lease can release.
+            execution.emit("context.feature_gather.tap", int(tap), destination, ForwardTrace::Type::bf16,
+                           {features.count, feature_width}, features.start);
+        }
+        return true;
+    } catch (const SubmittedFailure&) {
+        if (submitted) execution.drain_or_terminate(device);
+    } catch (const std::exception& failure) {
+        if (submitted) execution.drain_or_terminate(device);
+        error = failure.what();
+    } catch (...) {
+        if (submitted) execution.drain_or_terminate(device);
+        error = "dflash2 forward: unexpected accepted-feature transfer failure";
+    }
+    if (submitted) producer.abort();
+    return false;
 }
 bool DeviceForward::reset(DeviceContext& context, int origin, std::string& error) const {
     OperationLease::Guard guard(impl_->lease);

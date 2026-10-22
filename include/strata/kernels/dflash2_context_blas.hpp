@@ -11,6 +11,7 @@ bool context_blas_enabled() noexcept;
 const char* context_projection_identity() noexcept;
 
 // One serialized owner's context-only workspace; all model weights stay BF16.
+// Linux CUDA SM70/SM86 eligibility only; runtime qualification is separate.
 // The caller drains its stream on success AND failure before releasing its lease.
 class ContextBlas {
 public:

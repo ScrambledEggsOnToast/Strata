@@ -50,9 +50,7 @@
 #include <unistd.h>
 #include <utility>
 #include <vector>
-#ifdef STRATA_STORE_TEST_HOOKS
 #include <time.h>
-#endif
 
 namespace strata::core {
 namespace {
@@ -148,6 +146,51 @@ enum class CommitOutcome : uint8_t { unchanged = 0, durable_applied = 1, uncerta
 uint64_t store_timing_ns() {
     return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// Temporary coarse publication diagnosis, enabled by the existing store timing flag.
+// Zero clocks mean the phase was not reached. No payload, paths or authority digests are printed.
+struct StoreWriterTiming {
+    uint64_t admitted = 0, started = 0, payload_start = 0, payload_end = 0;
+    uint64_t sync_start = 0, sync_end = 0, manifest_start = 0, manifest_end = 0;
+    uint64_t catalog_start = 0, catalog_end = 0, body_end = 0, settled = 0;
+    uint64_t bytes = 0, objects = 0, cpu_start = 0, cpu_ns = 0;
+    bool cpu_known = false;
+};
+thread_local StoreWriterTiming* active_writer_timing = nullptr;
+struct StoreWriterTimingScope {
+    StoreWriterTiming* previous;
+    explicit StoreWriterTimingScope(StoreWriterTiming* timing) : previous(active_writer_timing) {
+        active_writer_timing = timing;
+    }
+    ~StoreWriterTimingScope() { active_writer_timing = previous; }
+};
+uint64_t store_writer_clock_ns() {
+    const int saved_errno = errno;
+    const uint64_t result = store_timing_ns();
+    errno = saved_errno;
+    return result;
+}
+uint64_t store_writer_cpu_ns() {
+    const int saved_errno = errno;
+    timespec sample{};
+    const bool ok = ::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &sample) == 0;
+    errno = saved_errno;
+    return ok ? uint64_t(sample.tv_sec) * 1000000000 + uint64_t(sample.tv_nsec) : 0;
+}
+void emit_store_writer_timing(const StoreWriterTiming& t, uint64_t request, uint64_t generation,
+                              uint64_t epoch, int status) noexcept {
+    const int saved_errno = errno;
+    std::fprintf(stderr,
+        "STORE_WRITER_PHASE request=%" PRIu64 " generation=%" PRIu64 " epoch=%" PRIu64 " status=%d"
+        " admitted_ns=%" PRIu64 " started_ns=%" PRIu64 " payload_start_ns=%" PRIu64 " payload_end_ns=%" PRIu64
+        " sync_start_ns=%" PRIu64 " sync_end_ns=%" PRIu64 " manifest_start_ns=%" PRIu64 " manifest_end_ns=%" PRIu64
+        " catalog_start_ns=%" PRIu64 " catalog_end_ns=%" PRIu64 " body_end_ns=%" PRIu64 " settled_ns=%" PRIu64
+        " payload_bytes=%" PRIu64 " referenced_objects=%" PRIu64 " cpu_ns=%" PRIu64 " cpu_known=%d\n",
+        request, generation, epoch, status, t.admitted, t.started, t.payload_start, t.payload_end,
+        t.sync_start, t.sync_end, t.manifest_start, t.manifest_end, t.catalog_start, t.catalog_end,
+        t.body_end, t.settled, t.bytes, t.objects, t.cpu_ns, int(t.cpu_known));
+    errno = saved_errno;
 }
 
 #ifdef STRATA_STORE_TEST_HOOKS
@@ -998,6 +1041,7 @@ struct ConversationStore::Impl {
         // ledger still charges the full image and the whole counted workspace.
         uint64_t external_credit_bytes = 0;
         conversation_store_detail::ImageShape shape;   // the allocation-free count this admission was charged for
+        uint64_t timing_admitted_ns = 0;  // existing timing opt-in; no clock on the disabled path
         bool started = false;             // the writer has begun reading this image: it may never be replaced
         bool cancelled = false;
         bool coalesced = false;
@@ -1014,10 +1058,8 @@ struct ConversationStore::Impl {
         void* trace_context = nullptr;
 #endif
     };
-#ifdef STRATA_STORE_TEST_HOOKS
     static_assert(sizeof(PublishJob) + kAllocSlackBytes <= kJobFixedOverhead,
-                  "test writer instrumentation must fit the already admitted fixed job workspace");
-#endif
+                  "writer instrumentation must fit the already admitted fixed job workspace");
     std::shared_ptr<PublishJob> publishing;
     // publish() reserves one result slot per admitted job, including a coalesced predecessor. Finished results plus
     // the active writer never exceed max_pending_publishes * 4 + 4; only harvesting frees a slot.
@@ -4478,11 +4520,19 @@ void ConversationStore::Impl::writer_body() {
             continue;
         }
         if (publishing) {
-            const std::shared_ptr<PublishJob> job = publishing;
+            std::shared_ptr<PublishJob> job = publishing;
             // Once the worker has begun reading the image it may never be replaced: publish() refuses instead.
             job->started = true;
             ConversationStorePublishResult result;
             lock.unlock();
+            StoreWriterTiming writer_timing;
+            const bool writer_timed = job->timing_admitted_ns != 0;
+            StoreWriterTimingScope writer_timing_scope(writer_timed ? &writer_timing : nullptr);
+            if (writer_timed) {
+                writer_timing.admitted = job->timing_admitted_ns;
+                writer_timing.started = store_writer_clock_ns();
+                writer_timing.cpu_start = store_writer_cpu_ns();
+            }
 #ifdef STRATA_STORE_TEST_HOOKS
             PublishTraceScope trace_scope(job->trace_observer ? &job->trace : nullptr);
             const uint64_t cpu_started = job->trace_observer ? publish_thread_cpu_ns() : 0;
@@ -4507,6 +4557,7 @@ void ConversationStore::Impl::writer_body() {
                 if (job->trace_observer) job->trace.calls_complete = false;
 #endif
             }
+            if (writer_timed) writer_timing.body_end = store_writer_clock_ns();
 #ifdef STRATA_STORE_TEST_HOOKS
             if (job->trace_observer) job->trace.body_finished_ns = store_timing_ns();
 #endif
@@ -4574,9 +4625,16 @@ void ConversationStore::Impl::writer_body() {
                 job->trace.result_ready_ns = store_timing_ns();
             }
 #endif
+            const int writer_status = int(result.status);
             push_publish_result_locked(std::move(result));
             if (publishing == job) publishing.reset();
             cv_work.notify_all();
+            if (writer_timed) {
+                writer_timing.settled = store_writer_clock_ns();
+                const uint64_t cpu_end = store_writer_cpu_ns();
+                writer_timing.cpu_known = writer_timing.cpu_start && cpu_end >= writer_timing.cpu_start;
+                if (writer_timing.cpu_known) writer_timing.cpu_ns = cpu_end - writer_timing.cpu_start;
+            }
 #ifdef STRATA_STORE_TEST_HOOKS
             if (job->trace_observer) {
                 lock.unlock();
@@ -4584,6 +4642,17 @@ void ConversationStore::Impl::writer_body() {
                 lock.lock();
             }
 #endif
+            if (writer_timed) {
+                const uint64_t request = job->request.request_id;
+                const uint64_t generation = job->request.generation;
+                const uint64_t epoch = job->epoch;
+                // Release the settled job's image before unlocking for diagnostic I/O. An incoming admission
+                // must not overlap a formerly charged image retained solely by this diagnostic record.
+                job.reset();
+                lock.unlock();
+                emit_store_writer_timing(writer_timing, request, generation, epoch, writer_status);
+                lock.lock();
+            }
             continue;
         }
         if (stop.load()) break;
@@ -4796,6 +4865,10 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
     job->orphans.reserve(size_t(peak_chunks));
     job->leased_objects.reserve(size_t(peak_chunks));
 
+    if (active_writer_timing) {
+        active_writer_timing->bytes = layout.payload_bytes;
+        active_writer_timing->payload_start = store_writer_clock_ns();
+    }
 #ifdef STRATA_STORE_TEST_HOOKS
     if (job->trace_observer) {
         job->trace.logical_payload_bytes = layout.payload_bytes;
@@ -5032,6 +5105,10 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         if (!emit(covered_until, stream.info.bytes)) break;
         streams.push_back(std::move(record));
     }
+    if (active_writer_timing) {
+        active_writer_timing->payload_end = store_writer_clock_ns();
+        active_writer_timing->objects = referenced.size();
+    }
 #ifdef STRATA_STORE_TEST_HOOKS
     if (job->trace_observer) job->trace.payload_finished_ns = store_timing_ns();
 #endif
@@ -5080,6 +5157,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         // Directory fsync alone does not prove payload data durability. Linux syncfs waits for all data and
         // metadata on this filesystem, including every newly written or revived object. It can also wait for,
         // or report writeback errors from, unrelated files; either way no manifest exists until it succeeds.
+        if (active_writer_timing) active_writer_timing->sync_start = store_writer_clock_ns();
 #ifdef STRATA_STORE_TEST_HOOKS
         const bool inject_data_error = take_fault("batch-data-sync");
         if (job->trace_observer) {
@@ -5093,6 +5171,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         const int synced = ::syncfs(dirs.objects);
         const int sync_error = errno;
 #endif
+        if (active_writer_timing) active_writer_timing->sync_end = store_writer_clock_ns();
         if (synced != 0) {
             fail(ConversationStorePublishStatus::failed,
                  std::string("object data batch syncfs failed: ") + std::strerror(sync_error));
@@ -5187,6 +5266,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
             return;
         }
     }
+    if (active_writer_timing) active_writer_timing->manifest_start = store_writer_clock_ns();
 #ifdef STRATA_STORE_TEST_HOOKS
     if (job->trace_observer) job->trace.manifest_started_ns = store_timing_ns();
 #endif
@@ -5285,6 +5365,7 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         }
     }
 
+    if (active_writer_timing) active_writer_timing->manifest_end = store_writer_clock_ns();
 #ifdef STRATA_STORE_TEST_HOOKS
     if (job->trace_observer) job->trace.manifest_finished_ns = store_timing_ns();
 #endif
@@ -5413,10 +5494,12 @@ void ConversationStore::Impl::publish_body(const std::shared_ptr<PublishJob>& jo
         return;
     }
     std::string commit_why;
+    if (active_writer_timing) active_writer_timing->catalog_start = store_writer_clock_ns();
 #ifdef STRATA_STORE_TEST_HOOKS
     if (job->trace_observer) job->trace.catalog_started_ns = store_timing_ns();
 #endif
     const CommitOutcome outcome = commit_plan(plan, commit_why);
+    if (active_writer_timing) active_writer_timing->catalog_end = store_writer_clock_ns();
 #ifdef STRATA_STORE_TEST_HOOKS
     if (job->trace_observer) job->trace.catalog_finished_ns = store_timing_ns();
 #endif
@@ -6105,6 +6188,7 @@ ConversationStorePublishAdmission ConversationStore::publish(std::shared_ptr<con
         job->trace.admitted_ns = store_timing_ns();
     }
 #endif
+    if (self.read_timing) job->timing_admitted_ns = store_writer_clock_ns();
     self.publishing = job;
     self.cv_work.notify_all();
     self.cv_publish.notify_all();

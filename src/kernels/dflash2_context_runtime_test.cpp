@@ -120,6 +120,7 @@ int run(const Options& o) {
     io::require(strata::kernels::dflash2::ContextBlas::host_budget == (size_t(256) << 20),
                 "fixture requires separately authorized v2 host allowance");
     io::DeviceScope device(o.device);
+    cudaDeviceProp properties{}; io::cuda(cudaGetDeviceProperties(&properties, o.device), "read device capability");
     ModelGeometry geometry; int64_t top_k = 0; std::string error;
     {
         strata::GgufFile metadata(o.shard0);
@@ -190,13 +191,14 @@ int run(const Options& o) {
     Features peer_empty(74, 0, "202", 0);
     io::require(!forward.ingest(*b, peer_empty.view, 74, buffers.stream, error) &&
                 error.find("poisoned") != std::string::npos, "shared poisoned scratch admitted another request");
-    std::puts("PASS dflash2_context_runtime_test real_weights=1 synthetic_inputs=1 actual_q_not_exercised=1 resident_qualification=0");
+    std::printf("PASS dflash2_context_runtime_test real_weights=1 synthetic_inputs=1 actual_q_not_exercised=1 resident_qualification=0 sm=%d projection_mode=%s\n",
+        properties.major * 10 + properties.minor, df::DeviceForward::numerical_mode().c_str());
     return 0;
 }
 } // namespace
 int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--help") == 0) {
-        std::puts("Queued real-context fixture: --runtime DIR --manifest-sha256 SHA --target-pack DIR --tokenizer DIR --shard0 FILE --shard1 FILE --device N. Synthetic features/embeddings; no target inference or throughput claim.");
+        std::puts("Queued SM70/SM86 real-context fixture: --runtime DIR --manifest-sha256 SHA --target-pack DIR --tokenizer DIR --shard0 FILE --shard1 FILE --device N. Synthetic features/embeddings; no target inference or throughput claim.");
         return 0;
     }
     try {

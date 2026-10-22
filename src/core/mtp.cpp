@@ -1977,15 +1977,33 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     return finish_capture(probe, cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
 }
 
-void MtpDrafter::kv_restore(int64_t upto, int32_t next_token) {
+void MtpDrafter::kv_restore(int64_t upto, int32_t next_token, const DraftOwner* retained_source) {
     const OnDevice on_device(device_);
     std::string err;
+    const auto source = slot_coverage(8);
+    const auto bound = owner(8);
+    const bool displaced = retained_source && retained_source->seat == 8 && source.owner.seat == 8 &&
+        retained_source->request && retained_source->incarnation &&
+        retained_source->request == source.owner.request &&
+        retained_source->incarnation == source.owner.incarnation &&
+        retained_source->generation == bound.generation &&
+        source.owner.generation <= retained_source->generation;
+    auto retained = coverage_;
+    if (!bound.request || !bound.incarnation || !source.present || (!source.coherent && !displaced) ||
+        retained.begin < 0 || retained.cells < retained.begin ||
+        retained.cells > source.materialized_end || source.materialized_end > st_.max_cells)
+        retained.clear();
     Operation operation(*this, err);
     if (!operation) std::terminate();
     if (!restore_ring(upto, err)) std::terminate();
-    coverage_.rewind(std::min(upto, coverage_.cells));
-    if (upto == coverage_.cells && upto > coverage_.begin &&
-        (next_token < 0 || coverage_.next_token != next_token)) coverage_.rewind(upto - 1);
+    retained.rewind(std::min(upto, retained.cells));
+    if (upto == retained.cells && upto > retained.begin &&
+        (next_token < 0 || retained.next_token != next_token)) retained.rewind(upto - 1);
+    // Reuse is a completed ownership transfer, not merely a ring repair. Without
+    // publishing the retained interval here, the successor's first suffix write
+    // sees the old producer and discards the still-intact prefix certificate.
+    if (retained.known()) operation.writes(retained.begin, retained.cells, retained.next_token);
+    else invalidate_slot_coverage(8);
     if (!operation.finish(err)) std::terminate();
 }
 

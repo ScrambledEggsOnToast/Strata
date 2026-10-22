@@ -308,7 +308,7 @@ void CaptureStore::capture(const Operation& op, int layer, int materialized_laye
                 "capture requires the completed unmixed residual at its declared seam");
         require(positions.size() == size_t(count_) &&
                 ((reduced.empty() && residuals.size() == size_t(count_) * 4 * hidden_size) ||
-                 (phase_ == CapturePhase::prefill && residuals.empty() &&
+                 (residuals.empty() &&
                   reduced.size() == size_t(count_) * hidden_size)),
                 "capture position/residual shape mismatch");
         for (int row = 0; row < count_; ++row)

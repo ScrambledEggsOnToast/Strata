@@ -6,17 +6,74 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <span>
 #include <string>
+
+namespace strata::core { class Verifier; }
+namespace strata::program { struct ResidentExecutorFixture; }
 
 namespace strata::core::dflash2 {
 inline constexpr int residual_width = 4 * hidden_size;
 inline constexpr size_t residual_row_bytes = residual_width * sizeof(float);
+inline constexpr size_t reduced_tap_row_bytes = hidden_size * sizeof(uint16_t);
+
+inline bool device_features_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_DFLASH2_DEVICE_FEATURES");
+        return value && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
+inline bool feature_phases_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_DFLASH2_PHASES");
+        return value && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
+inline bool validate_feature_flags(std::string& error) {
+    for (const char* name : {"STRATA_DFLASH2_DEVICE_FEATURES", "STRATA_DFLASH2_PHASES"}) {
+        const char* value = std::getenv(name);
+        if (value && std::string_view(value) != "0" && std::string_view(value) != "1") {
+            error = std::string("dflash2 capture: ") + name + " must be absent, 0 or 1";
+            return false;
+        }
+    }
+    return true;
+}
 
 // Numeric engine identity, translated to Operation by the eventual host sequencer.
 struct CaptureOwner {
     uint64_t request = 0, incarnation = 0, generation = 0;
     bool operator==(const CaptureOwner&) const = default;
+};
+class TapCaptureState;
+class CaptureProducer;
+class DeviceForward;
+class DflashNativeDrafter;
+struct TapView;
+
+// Only the real physical verifier can mint this capability. Its compact mirror,
+// state, owner, accepted prefix and absolute range are inseparable from the
+// device rows. A copied capability ceases to authenticate when its stage releases.
+class DeviceTapView {
+public:
+    DeviceTapView() = default;
+    bool present() const { return state_ != nullptr; }
+private:
+    friend class strata::core::Verifier;
+    friend class CaptureProducer;
+    friend class DeviceForward;
+    DeviceTapView(const TapCaptureState* state, CaptureOwner owner, int tap,
+                  const TapView& view, const uint16_t* data, int device);
+    bool matches(const TapView&, std::string&) const;
+    bool current(std::string&) const;
+    const TapCaptureState* state_ = nullptr;
+    CaptureOwner owner_;
+    int tap_ = -1, start_ = 0, count_ = 0, keep_ = 0, device_ = -1;
+    const uint16_t* data_ = nullptr;
+    const uint16_t* mirror_ = nullptr;
 };
 struct TapView {
     int start = 0, count = 0, keep = 0, tap_layer = 0, materialized_layer = 0;
@@ -25,6 +82,7 @@ struct TapView {
     std::span<const float> residuals; // immutable [row, four streams, 2560]
     CaptureOwner owner;
     std::span<const uint16_t> reduced{}; // exclusive alternative: [row, 2560] BF16
+    DeviceTapView device{};
 };
 struct CaptureSlice {
     int source_row = 0, staging_row = 0, count = 0;
@@ -137,11 +195,13 @@ public:
         return true;
     }
     bool view_reduced(CaptureOwner owner, int tap, const float* host, TapView& out, std::string& err) const {
-        if (phase_ != CapturePhase::prefill)
-            return refuse(err, "reduced capture is supported only for prefill");
-        if (!view(owner, tap, host, out, err)) return false;
-        out.residuals = {};
-        out.reduced = {reinterpret_cast<const uint16_t*>(host), size_t(count_) * hidden_size};
+        if (status_ != Status::ready || owner != owner_ || !owns_tap(tap) || count_ == 0 || !host)
+            return refuse(err, "tap is absent, stale or not host-complete");
+        const int layer = tap_layers[size_t(tap)];
+        out = {start_, count_, keep_, layer, layer + (phase_ == CapturePhase::verify ? 1 : 0), phase_,
+               phase_ == CapturePhase::verify ? CapturePoint::next_layer_first_gr_read_group :
+                                               CapturePoint::completed_second_residual_write,
+               {}, owner_, {reinterpret_cast<const uint16_t*>(host), size_t(count_) * hidden_size}};
         return true;
     }
     bool release(CaptureOwner owner, std::string& err) {
@@ -152,6 +212,7 @@ public:
     }
     void poison() { if (status_ != Status::idle) status_ = Status::poisoned; }
     bool idle() const { return status_ == Status::idle; }
+    bool ready() const { return status_ == Status::ready; }
     bool running() const { return status_ == Status::running; }
     bool copying() const { return running() && count_ != 0; }
     bool owns_tap(int tap) const { return tap >= 0 && tap < int(tap_layers.size()) && (mask_ & (1u << tap)); }
@@ -176,10 +237,10 @@ private:
 // Mapped raw staging is NOT the BF16 feature bound. Quote each owning layer range
 // once; CUDA host allocations are charged at page granularity, including flags.
 struct CaptureAllocation {
-    size_t prefill = 0, verify = 0, flags = 0;
+    size_t prefill = 0, verify = 0, flags = 0, verify_device = 0;
     size_t mapped_bytes() const { return prefill + verify + flags; }
     static bool stage(int64_t lb, int64_t le, CaptureAllocation& out, std::string& err,
-                       int verify_rows = block_size) {
+                       int verify_rows = block_size, bool device_features = false) {
         if (verify_rows < block_size || verify_rows > max_verify_rows) {
             err = "dflash2 capture: physical verifier rows must be in [4,8]"; return false;
         }
@@ -190,7 +251,11 @@ struct CaptureAllocation {
         out = {};
         for (size_t i = 0; i < tap_layers.size(); ++i) {
             if (pf.owns_tap(int(i))) out.prefill += pages(size_t(context_rows) * residual_row_bytes);
-            if (vr.owns_tap(int(i))) out.verify += pages(size_t(verify_rows) * residual_row_bytes);
+            if (vr.owns_tap(int(i))) {
+                const size_t compact = size_t(verify_rows) * reduced_tap_row_bytes;
+                out.verify += pages(device_features ? compact : size_t(verify_rows) * residual_row_bytes);
+                if (device_features) out.verify_device += compact;
+            }
         }
         out.flags = 2 * pages(sizeof(uint32_t));
         return true;
@@ -199,8 +264,8 @@ struct CaptureAllocation {
 
 // One serial committed-input frontier, not prompt length or emitted-token count.
 // begin() fences the target operation; consume() copies/reduces only host-complete
-// committed prefixes and NEVER retains a TapView/pointer. publish() has no caller
-// keep argument: the target's completed views are the authoritative commit count.
+// committed prefixes. Device capabilities remain borrowed until the same common
+// operation drains; publication never certifies them as a reusable feature ring.
 class CaptureProducer {
 public:
     CaptureProducer();
@@ -219,8 +284,19 @@ public:
     int64_t committed_rows() const { return committed_rows_; }
     int64_t rejected_rows() const { return rejected_rows_; }
     bool cancellable() const { return !poisoned_ && active_ && !seen_ && !store_.capturing(); }
-    void abort() noexcept { poisoned_ = true; active_ = false; lease_ = nullptr; store_.abort(); }
+    void abort() noexcept {
+        poisoned_ = true; active_ = false; lease_ = device_lease_ = nullptr;
+        device_seen_ = 0; device_taps_ = {}; store_.abort();
+    }
 private:
+    friend class DeviceForward;
+    friend class DflashNativeDrafter;
+    friend struct strata::program::ResidentExecutorFixture;
+    bool device_preflight(const FeatureView&, const OperationLease::Guard&, std::string&) const;
+    std::array<DeviceTapView, tap_layers.size()> device_taps_{};
+    unsigned device_seen_ = 0;
+    OperationLease* common_lease_ = nullptr;
+    const OperationLease::Guard* device_lease_ = nullptr;
     CaptureStore store_;
     CaptureOwner owner_;
     Operation operation_;

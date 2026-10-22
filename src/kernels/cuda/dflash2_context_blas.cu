@@ -12,10 +12,10 @@ const char* context_projection_identity() noexcept {
     return context_blas_enabled() ? "context-cublas-fp16-exact-fp32-n1024-m128-v1" : "legacy-bf16-v1";
 }
 struct ContextBlas::Impl {};
-ContextBlas::ContextBlas(int) { throw std::runtime_error("dflash2 context cuBLAS requires Linux CUDA SM70; this platform is unsupported"); }
+ContextBlas::ContextBlas(int) { throw std::runtime_error("dflash2 context cuBLAS requires Linux CUDA SM70 or SM86; this platform is unsupported"); }
 ContextBlas::~ContextBlas() = default;
 bool ContextBlas::project(const uint16_t*, const uint16_t*, uint16_t*, int, int, int, uint32_t*, void*, std::string& error) {
-    error = "dflash2 context cuBLAS requires Linux CUDA SM70"; return false;
+    error = "dflash2 context cuBLAS requires Linux CUDA SM70 or SM86"; return false;
 }
 ContextBlas::Statistics ContextBlas::statistics() const { return {}; }
 void ContextBlas::report_completed() {}
@@ -189,8 +189,8 @@ struct ContextBlas::Impl {
     void initialize() {
         DeviceScope on(device);
         cudaDeviceProp properties{}; checked(cudaGetDeviceProperties(&properties, device), "device capability");
-        if (properties.major != 7 || properties.minor != 0)
-            throw std::runtime_error("dflash2 context cuBLAS: only SM70 is qualified for this opt-in mode");
+        if (!((properties.major == 7 && properties.minor == 0) || (properties.major == 8 && properties.minor == 6)))
+            throw std::runtime_error("dflash2 context cuBLAS: only SM70 or SM86 are eligible for this opt-in mode");
         const size_t rss_before = resident_bytes(); size_t free_before, total;
         checked(cudaMemGetInfo(&free_before, &total), "initial free memory");
         if (layout(nullptr).bytes != explicit_device_bytes) throw std::runtime_error("dflash2 context cuBLAS: workspace accounting mismatch");

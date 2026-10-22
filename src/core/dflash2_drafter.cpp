@@ -144,6 +144,8 @@ struct DflashNativeDrafter::Impl {
 
 DflashNativeDrafter::DflashNativeDrafter(const RuntimeWeights& weights, VerifiedDailyTarget verified,
         const NativeEmbed& embedding, const NativeHead& head, int device) {
+    std::string flags_error;
+    if (!validate_feature_flags(flags_error)) throw Refusal(flags_error);
     require(device >= 0 && verified.binding().identity == weights.target_identity() && embedding.loaded() &&
             head.loaded() && embedding.identity() == verified.embedding() && head.identity() == verified.head() &&
             head.projection_scratch_bytes() == size_t(hidden_size / 32 * 36),
@@ -418,7 +420,8 @@ bool DflashNativeDrafter::ingest_committed(Operation& operation, const FeatureVi
             features.generations[part].size() != actual.generations[part].size())
             return refuse(error, "foreign borrowed feature ring or generation tags");
     if (replaces_context && !impl_->forward->reset(*request->context, context.origin(), error)) return false;
-    if (!impl_->forward->ingest(*request->context, actual, frontier, cs_, error)) return false;
+    if (!impl_->forward->ingest_producer(*request->context, actual, request->producer,
+            operation.guard(), frontier, cs_, error)) return false;
     request->last_capture = generation; request->uniforms_valid = false;
     operation.writes(request->context->begin(), frontier, -1);
     return true;

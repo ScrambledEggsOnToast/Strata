@@ -4,6 +4,7 @@
 #include "strata/program/resident_slots.hpp"
 #include "strata/program/session_fingerprint.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/graph.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/resident_memory.hpp"
@@ -933,6 +934,152 @@ int resident_model_checks(strata::program::ResidentSlots& owner, strata::core::E
     } catch (const std::exception& exception) {
         fail_destination = nullptr;
         std::fprintf(stderr, "RESIDENT_MODEL_CHECKS checks=%d failures=1 error=%s\n", checks, exception.what());
+        return 1;
+    }
+}
+
+// Capture-only behavior checks at the real Verifier seam. The loaded empty
+// logical sessions are observed, not reset or advanced by fake inference.
+int verifier_startup_model_checks(const strata::core::ModelGeometry& geometry,
+        const std::vector<strata::program::ResidentStage>& stages, int owner_rows, int peer_base) {
+    using namespace strata;
+    std::string error;
+    int checks = 0;
+    auto require = [&](bool ok, const char* message) {
+        ++checks;
+        if (!ok) throw std::runtime_error(std::string(message) + ": " + error);
+    };
+    struct Observation {
+        core::GraphCapturePhase deny = core::GraphCapturePhase::BeforeCapture;
+        bool rejecting = false;
+        size_t attempts = 0, retained = 0;
+    } observation;
+    auto observe = +[](void* opaque, const core::GraphCaptureKey&, core::GraphCapturePhase phase,
+                      const core::GraphCaptureSample&, std::string& why) -> bool {
+        auto& seen = *static_cast<Observation*>(opaque);
+        seen.attempts += phase == core::GraphCapturePhase::BeforeCapture;
+        seen.retained += phase == core::GraphCapturePhase::Retained;
+        if (seen.rejecting && phase == seen.deny) {
+            why = "startup fixture: deliberate capture observer refusal"; return false;
+        }
+        return true;
+    };
+    auto fingerprint = [&] {
+        uint64_t result = program::SessionFingerprint::basis;
+        const core::QsaState no_draft{};
+        for (const auto& stage : stages)
+            for (int slot = -1; slot < int(stage.slots.size()); ++slot) {
+                const auto& state = *(slot < 0 ? stage.main : stage.slots[size_t(slot)]);
+                program::SessionFingerprint h;
+                require(program::session_fingerprint(state, no_draft, geometry, 0, h, error),
+                        "read actual loaded empty logical state on every owning device");
+                for (const uint64_t word : {h.gdn, program::fingerprint_ple(h, state), program::fingerprint_kv(h),
+                                           state.allocation_id})
+                    result = program::fingerprint_word(result, word);
+            }
+        return result;
+    };
+    auto idle = [&] {
+        for (const auto& stage : stages)
+            for (auto* verifier : {stage.verifier, stage.batch_peer})
+                require(verifier && verifier->context_idle(error) && !verifier->batch_busy() &&
+                        !verifier->in_flight() && verifier->windows == 0 && verifier->spec_windows == 0,
+                        "all physical owners retain idle unlaunched scratch and zero inference counters");
+    };
+    try {
+        require(stages.size() == 3 && owner_rows >= 1 && owner_rows <= 4 && peer_base >= owner_rows &&
+                (peer_base == 4 || peer_base == 8) &&
+                stages[0].verifier && stages[0].batch_peer,
+                "use actual bounded three-stage replay chains");
+        for (const auto& stage : stages)
+            require(stage.main && stage.slots.size() == 4 && stage.verifier && stage.batch_peer,
+                    "all stationary stage and resident owners are initialized");
+        idle();
+        const uint64_t opening = fingerprint();
+        auto& first = *stages[0].verifier;
+        observation.rejecting = true;
+        observation.deny = core::GraphCapturePhase::AfterInstantiate;
+        {
+            const core::GraphCaptureObservationScope scope(observe, &observation);
+            require(!first.prepare_startup_graphs(0, owner_rows, error) && observation.attempts == 1 &&
+                    observation.retained == 0, "post-instantiate refusal destroys an unretained ordinary executable");
+        }
+        error.clear();
+        idle();
+        observation = {};
+        {
+            const core::GraphCaptureObservationScope scope(observe, &observation);
+            require(first.prepare_startup_graphs(0, owner_rows, error) && observation.retained > 0,
+                    "retry capture-only preparation after an unlaunched failure");
+        }
+        auto& peer = *stages[0].batch_peer;
+        observation = {};
+        {
+            const core::GraphCaptureObservationScope scope(observe, &observation);
+            require(peer.prepare_startup_graphs(peer_base, owner_rows, error) && observation.retained > 0,
+                    "prepare the distinct physical peer chain at its resolved handoff base");
+        }
+        const size_t expected = size_t(owner_rows);
+        for (const auto& stage : stages)
+            require(stage.verifier->batch_resources().graph_keys == expected &&
+                    stage.batch_peer->batch_resources().graph_keys == expected,
+                    "each physical chain retains only slot zero's hot singleton depths under its own full keys");
+        require(opening == fingerprint(), "capture/upload changes no logical session payload or PLE frontier");
+        observation = {};
+        observation.rejecting = true;
+        {
+            const core::GraphCaptureObservationScope scope(observe, &observation);
+            require(first.prepare_startup_graphs(0, owner_rows, error) &&
+                    peer.prepare_startup_graphs(peer_base, owner_rows, error) && observation.attempts == 0,
+                    "both physical chains reuse keys when every new capture is denied");
+        }
+        const int other_base = peer_base;
+        const auto before = first.batch_resources();
+        first.set_batch_graph_limit(before.graph_keys);
+        require(!first.prepare_startup_graphs(other_base, owner_rows, error) &&
+                error.find("bounded batch graph cache exhausted") != std::string::npos &&
+                first.batch_resources().graph_keys == before.graph_keys,
+                "unseen valid base reaches the selected key cap, without preflight refusal or eviction");
+        first.set_batch_graph_limit(0);
+        error.clear();
+        idle();
+        observation = {};
+        observation.rejecting = true;
+        observation.deny = core::GraphCapturePhase::AfterInstantiate;
+        {
+            const core::GraphCaptureObservationScope scope(observe, &observation);
+            require(!first.prepare_startup_graphs(other_base, owner_rows, error) &&
+                    observation.attempts == 1 && first.batch_resources().graph_execs == before.graph_execs &&
+                    first.batch_resources().graph_keys == before.graph_keys + 1,
+                    "unseen full key is not aliased; refusal retains only its bounded null reservation");
+        }
+        error.clear();
+        idle();
+        observation = {};
+        {
+            const core::GraphCaptureObservationScope scope(observe, &observation);
+            require(first.prepare_startup_graphs(other_base, owner_rows, error) && observation.retained > 0,
+                    "unseen valid keys still capture after explicit refusal is removed");
+        }
+        observation = {};
+        observation.rejecting = true;
+        {
+            const core::GraphCaptureObservationScope scope(observe, &observation);
+            require(first.prepare_startup_graphs(other_base, owner_rows, error) && observation.attempts == 0,
+                    "retried alternative-base keys are reusable, not recaptured");
+        }
+        require(!first.prepare_startup_graphs(0, 5, error), "unsupported preparation extent refuses before mutation");
+        error.clear();
+        idle();
+        require(opening == fingerprint(), "all success/refusal paths preserve every loaded logical owner");
+        std::printf("VERIFY_GRAPH_STARTUP_CHECKS checks=%d failures=0 stages=%zu slots=4 owner_rows=%d "
+            "logical_cells=0 capture_only=1 key_reuse=1 unseen_base=1 cap_refusal=1 "
+            "post_instantiate_refusal=1 ownership_idle=1 peer_chain=1 peer_base=%d\n",
+            checks, stages.size(), owner_rows, peer_base);
+        return 0;
+    } catch (const std::exception& exception) {
+        std::fprintf(stderr, "VERIFY_GRAPH_STARTUP_CHECKS checks=%d failures=1 error=%s\n",
+                     checks, exception.what());
         return 1;
     }
 }

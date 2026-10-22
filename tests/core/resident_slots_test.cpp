@@ -40,6 +40,31 @@ struct ResidentDraftReadinessFixture {
         peer.ids = {21, 22, 23}; peer.p = 3; peer.produced = 2; peer.sampling.seed = 99;
         peer.prompt_cursor.operation = 51;
         dispatch.slot_requests[0] = 17; dispatch.slot_requests[1] = 23;
+        // Admission count validation is before idle/copy/owner mutation. The live
+        // peer deliberately blocks the next production seam, so these CPU checks
+        // cannot enter a device operation or pretend to exercise a real transfer.
+        slots.destination_ = 0;
+        slots.input_.max_new = 8;
+        ResidentAdmission admission;
+        admission.next_token = 116;
+        std::string admission_error;
+        for (int64_t count : {int64_t(0), int64_t(-1), int64_t(8), int64_t(9)}) {
+            admission.initial_generated = count;
+            check(!slots.admit(0, source.ids, admission, admission_error) &&
+                  admission_error == "resident admission: invalid or unavailable slot/request" &&
+                  source.request == 17 && source.incarnation == 3 && peer.request == 23 &&
+                  peer.produced == 2 && dispatch.slot_requests[0] == 17,
+                  "invalid admission output count refuses before touching either owner");
+        }
+        for (int64_t count : {int64_t(1), int64_t(3)}) {
+            admission.initial_generated = count;
+            check(!slots.admit(0, source.ids, admission, admission_error) &&
+                  admission_error == "resident transition: expert consumers still own an operation" &&
+                  source.request == 17 && source.incarnation == 3 && peer.produced == 2,
+                  "legacy and multi-output counts reach the real consumer fence without mutation");
+        }
+        check(ResidentAdmission{}.initial_generated == 1,
+              "existing aggregate callers retain the one-output admission default");
         draft.st_.max_cells = 64; draft.window_ = 40;
         draft.slots_.resize(2);
         draft.owners_[0] = {0, 17, 3, 0};
