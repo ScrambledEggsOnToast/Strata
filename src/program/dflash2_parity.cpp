@@ -291,7 +291,8 @@ int run(const Options& o) {
     df::DeviceSelector selector(o.device, forward.weight("candidate_selector.hidden_projection.weight"),
         forward.weight("candidate_selector.predecessor_codebook"), forward.weight("candidate_selector.successor_codebook"));
     Buffer raw(4 * df::hidden_size * sizeof(uint16_t), stream), hidden(4 * df::hidden_size * sizeof(uint16_t), stream);
-    Buffer widened(df::hidden_size * sizeof(float), stream), logits(df::logits_bytes, stream);
+    constexpr size_t replay_logits_bytes = 3 * df::vocabulary_size * sizeof(float);
+    Buffer widened(df::hidden_size * sizeof(float), stream), logits(replay_logits_bytes, stream);
     Buffer head_scratch(head.projection_scratch_bytes(), stream);
     raw.upload(embeddings);
     df::FeatureView view;
@@ -304,7 +305,7 @@ int run(const Options& o) {
     outputs["replay_hidden"] = trace.download("replay-hidden.bf16", "bf16", {4, df::hidden_size}, hidden.as<void>(),
         4 * df::hidden_size * sizeof(uint16_t), stream);
     project(head, hidden, widened, logits, head_scratch, stream, error);
-    outputs["replay_logits"] = trace.download("replay-logits.f32", "f32", {3, df::vocabulary_size}, logits.as<void>(), df::logits_bytes, stream);
+    outputs["replay_logits"] = trace.download("replay-logits.f32", "f32", {3, df::vocabulary_size}, logits.as<void>(), replay_logits_bytes, stream);
     df::Selection selected;
     io::require(selector.select(3, hidden.as<uint16_t>() + df::hidden_size, logits.as<float>(), anchor, temperature, uniforms,
         selected, stream.get(), error), error);
@@ -321,7 +322,7 @@ int run(const Options& o) {
         outputs["reference_hidden_input"] = io::write_tensor(output, "reference-hidden-input.bf16", "bf16", {4, df::hidden_size}, reference_hidden, written);
         project(head, hidden, widened, logits, head_scratch, stream, error);
         outputs["reference_head_logits"] = trace.download("reference-head-logits.f32", "f32", {3, df::vocabulary_size},
-            logits.as<void>(), df::logits_bytes, stream);
+            logits.as<void>(), replay_logits_bytes, stream);
         df::Selection reference_selection;
         io::require(selector.select(3, hidden.as<uint16_t>() + df::hidden_size, logits.as<float>(), anchor, temperature, uniforms,
             reference_selection, stream.get(), error), error);

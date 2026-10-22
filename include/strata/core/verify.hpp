@@ -133,6 +133,8 @@ public:
     static uint64_t planned_device_bytes(const ModelGeometry& g, int64_t context, int64_t vocab, int max_t);
     /// Diagnostic histogram: zero when disabled, one pinned page per owner when enabled.
     static uint64_t planned_expert_reuse_trace_host_bytes();
+    /// Independent batch-window routing-plan census; one pinned page per initialized owner.
+    static uint64_t planned_expert_group_census_host_bytes();
     /// One optional timestamp array's payload, on device and independently on host.
     /// Serial capture uses one pair per stage; pipelined copies are priced separately.
     static uint64_t planned_profile_bytes(const ModelGeometry& g) {
@@ -576,6 +578,16 @@ private:
     bool begin_expert_reuse_trace(const int* rows, int count, int base, std::string& err);
     bool copy_expert_reuse_trace(std::string& err);
     bool complete_expert_reuse_trace(const char* route, std::string& err);
+    // Separate from the legacy reuse tracer: each Verifier, including peers, owns its window.
+    uint32_t* expert_group_census_counts_ = nullptr;
+    uint32_t* expert_group_census_counts_h_ = nullptr;
+    bool expert_group_census_pending_ = false;
+    uint64_t expert_group_census_sequence_ = 0;
+    int expert_group_census_rows_ = 0, expert_group_census_base_ = 0;
+    std::array<int, strata::kernels::kVerifyMaxT> expert_group_census_slots_{};
+    bool begin_expert_group_census(const int* rows, int count, int base, std::string& err);
+    bool copy_expert_group_census(std::string& err);
+    bool complete_expert_group_census(const char* route, std::string& err);
     // External serving publishes layer completion; the submitter retains the scratch lease and CUDA drain.
     std::atomic<bool> b_running_{false};
     bool b_deferred_ = false;

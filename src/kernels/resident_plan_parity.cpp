@@ -32,7 +32,23 @@ void ck(cudaError_t e, const char* w) {
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 2) { std::fprintf(stderr, "usage: resident_plan_parity [device ordinal]\n"); return 2; }
+    int device = 0;
+    if (argc == 2) {
+        int count = 0;
+        ck(cudaGetDeviceCount(&count), "device count");
+        char* end = nullptr;
+        const long selected = std::strtol(argv[1], &end, 10);
+        if (end == argv[1] || *end || selected < 0 || selected >= count) {
+            std::fprintf(stderr, "invalid device ordinal\n"); return 2;
+        }
+        device = int(selected);
+    }
+    ck(cudaSetDevice(device), "select device");
+    cudaDeviceProp properties{};
+    ck(cudaGetDeviceProperties(&properties, device), "device properties");
+    std::printf("DEVICE ordinal=%d sm=%d name=%s\n", device, properties.major * 10 + properties.minor, properties.name);
     if (!strata::platform::acknowledge_protected_test()) return 2;
     const int K = 10, NE = 512;
     const long long capx = (long long) k::kVerifyMaxT * K;
@@ -145,6 +161,47 @@ int main() {
             ++bad;
         }
     }
+
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_METAL)
+    // Real device-plan census boundaries: wide overlap, independent reset, and malformed plans.
+    uint32_t* d_census = nullptr;
+    ck(cudaMalloc(&d_census, 12 * sizeof(uint32_t)), "census");
+    ck(cudaMemcpy(d_res, res.data(), NE * sizeof(int32_t), cudaMemcpyHostToDevice), "restore resident table");
+    for (int variant = 0; variant < 4; ++variant) {
+        const int rows = variant == 1 ? 2 : 8;
+        const int entries = rows * K;
+        std::vector<int32_t> ids(size_t(entries), 0);
+        for (int i = 0; i < entries; ++i) ids[size_t(i)] = variant == 1 ? i : i % K;
+        ck(cudaMemcpy(d_ids, ids.data(), ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "census ids");
+        ck(cudaMemset(d_err, 0, sizeof(uint32_t)), "census plan error reset");
+        k::resident_plan(d_ids, entries, K, d_res, NE, cache_base, d_off, blob, d_plan, capx,
+                         nullptr, 0, nullptr, d_err);
+        if (variant == 2) {
+            const int32_t invalid_groups = int32_t(capx + 1);
+            ck(cudaMemcpy(d_plan, &invalid_groups, sizeof(int32_t), cudaMemcpyHostToDevice), "invalid census header");
+        } else if (variant == 3) {
+            const int32_t oversized_group_end = 9;
+            ck(cudaMemcpy(d_plan + 5, &oversized_group_end, sizeof(int32_t), cudaMemcpyHostToDevice), "invalid census interval");
+        }
+        ck(cudaMemset(d_census, 0, 12 * sizeof(uint32_t)), "census reset");
+        const bool launched = k::resident_plan_group_census(d_plan, int(capx), entries, rows, d_census, nullptr);
+        ck(cudaDeviceSynchronize(), "census complete");
+        uint32_t counts[12]{};
+        ck(cudaMemcpy(counts, d_census, sizeof counts, cudaMemcpyDeviceToHost), "census counts");
+        bool ok = launched && counts[10] == 1;
+        if (variant < 2) {
+            for (int i = 0; i < 8; ++i)
+                ok = ok && counts[i] == (variant == 0 ? (i == 7 ? 10u : 0u) : (i == 0 ? 20u : 0u));
+            ok = ok && counts[8] == 0 && counts[9] == (variant == 0 ? 10u : 20u) &&
+                 counts[11] == uint32_t(entries);
+        } else {
+            ok = ok && counts[8] != 0;
+        }
+        ++cases;
+        if (!ok) { std::printf("    *** resident group census boundary %d failed ***\n", variant); ++bad; }
+    }
+    ck(cudaFree(d_census), "free census");
+#endif
 
     std::printf("resident_plan: %d cases, %d failures\n", cases, bad);
     if (bad) return 1;

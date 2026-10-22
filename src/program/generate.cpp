@@ -5524,6 +5524,13 @@ int main(int argc, char** argv) {
         if (expert_reuse_trace_host && (o.batch != 1 || o.batch_groups != 1 || o.pipeline_windows != 0 ||
                                        o.batch_mtp_pipeline || o.batch_mtp_third))
             v0.add_unknown("expert_reuse_trace_scope", "diagnostic supports only one slot/group without pipeline copies");
+        const uint64_t expert_group_census_host = strata::core::Verifier::planned_expert_group_census_host_bytes();
+        if (const char* census = std::getenv("STRATA_EXPERT_GROUP_CENSUS");
+            census && std::atoi(census) && !expert_group_census_host)
+            v0.add_unknown("expert_group_census_backend", "routing-plan census requires the CUDA backend");
+        if (expert_group_census_host && (o.batch < 1 || o.pipeline_windows != 0 || expert_reuse_trace_host))
+            v0.add_unknown("expert_group_census_scope",
+                           "routing-plan census requires resident batch owners, no pipeline-window copies and no legacy trace");
         const bool profile_requested = std::getenv("STRATA_VERIFY_PROFILE") != nullptr || causal_requested;
         const uint64_t profile_bytes = profile_requested ? strata::core::Verifier::planned_profile_bytes(g) : 0;
         const uint64_t causal_host_bytes = causal_requested
@@ -6206,6 +6213,11 @@ int main(int argc, char** argv) {
         if (expert_reuse_trace_host)
             ram("expert_reuse_trace_host", byte_mul(stage_count, expert_reuse_trace_host),
                 "one optional pinned histogram page per Verifier; device histogram is counted in its arena");
+        if (expert_group_census_host)
+            ram("expert_group_census_host",
+                byte_mul(byte_mul(stage_count, uint64_t(1) + uint64_t(o.batch_mtp_pipeline) + uint64_t(o.batch_mtp_third)),
+                         expert_group_census_host),
+                "one independent pinned census page per base/peer/third Verifier owner; device fields are in each priced arena");
         if (profile_requested && profile_bytes != UINT64_MAX && o.pipeline_windows == 0 && o.batch == 0)
             ram("verify_profile_host", byte_mul(split_devs.size() + 1, profile_bytes),
                 "one independently allocated Verifier host timestamp array per serial stage; object metadata already counted");
@@ -17852,6 +17864,16 @@ int main(int argc, char** argv) {
                          (int) strata::kernels::kVerifyMaxT);
             return 1;
         }
+#if defined(STRATA_DFLASH2_CAPTURE)
+        const bool dflash_window_phases = use_dflash && strata::core::dflash2::feature_phases_enabled();
+#else
+        const bool dflash_window_phases = false;
+#endif
+        const auto dflash_phase_now_ns = [] {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                Clock::now().time_since_epoch()).count();
+        };
+        uint64_t dflash_window_sequence = 0;
         struct PGroup {
             bool inflight = false;
             int stage = 0;                  ///< the stage it runs on or waits for
@@ -17861,6 +17883,8 @@ int main(int argc, char** argv) {
             int32_t tok[strata::kernels::kVerifyMaxT] = {};
             int64_t pos[strata::kernels::kVerifyMaxT] = {};
             int64_t since = 0;              ///< tick it started waiting (fairness)
+            int64_t phase_started_ns = 0;
+            uint64_t phase_active_mask = 0, phase_selected_mask = 0;
             std::array<int32_t, strata::kernels::kVerifyMaxT * strata::core::kSpecQStride> q{};
             std::array<int32_t, strata::kernels::kVerifyMaxT> proposed{};
 #if defined(STRATA_DFLASH2_CAPTURE)
@@ -18147,6 +18171,20 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 ++bt_windows;
                 bt_rows += G.count;
+                if (dflash_window_phases && G.phase_started_ns != 0) {
+                    const int64_t ended = dflash_phase_now_ns();
+                    // Selected owners had armed rows; active owners need not all be ready.
+                    // Groups may overlap: this host envelope is not additive service time.
+                    std::fprintf(stderr, "DFLASH2_PHASE batch_window completed=1 clock=steady "
+                        "sequence=%llu group=%d rows=%d active_mask=%llu selected_mask=%llu "
+                        "started_ns=%lld ended_ns=%lld launch_to_final_host_ms=%.6f\n",
+                        (unsigned long long)++dflash_window_sequence, gi, G.count,
+                        (unsigned long long)G.phase_active_mask,
+                        (unsigned long long)G.phase_selected_mask,
+                        (long long)G.phase_started_ns, (long long)ended,
+                        double(ended - G.phase_started_ns) / 1e6);
+                    G.phase_started_ns = 0;
+                }
                 if (o.batch_mtp_floating && batch_mtp_trace)
                     std::fprintf(stderr, "STATE_FLOAT_RELEASE tick=%lld owner=%d rows=%d\n",
                                  (long long)pipe_tick, gi, G.count);
@@ -18293,6 +18331,14 @@ int main(int argc, char** argv) {
                 strata::core::progress().busy.store(true);
                 const int handoff_base = use_dflash ? pick * 8 :
                     o.batch_mtp_third ? (pick == 0 ? 0 : pick == 1 ? 4 : 6) : pick * std::min(2 * GS, 4);
+                if (dflash_window_phases && k == 0) {
+                    G.phase_active_mask = G.phase_selected_mask = 0;
+                    for (size_t b = 0; b < bs.size(); ++b)
+                        if (bs[b].active) G.phase_active_mask |= uint64_t(1) << b;
+                    for (int row = 0; row < G.count; ++row)
+                        G.phase_selected_mask |= uint64_t(1) << G.rows[row];
+                    G.phase_started_ns = dflash_phase_now_ns();
+                }
                 if (!owner.batch_launch(handoff_base, G.rows, G.count, G.tok, G.pos, err,
                                         strata::core::Verifier::BatchCommit::deferred)) {
                     phase_error("ERR %s\n", err.c_str()); return false;
@@ -22640,6 +22686,8 @@ int main(int argc, char** argv) {
                         // Published only by the reader; the owner loop reads these after join.
                         bool read_fatal = false;
                         int64_t read_reached = q0;
+                        const bool time_reader = phase::enabled();
+                        double reader_prefill_ms = 0;
                         // Declared before the reader so ReadEnd joins before deferral
                         // unwinds. Failure keeps the RAM view absent and dirty.
                         struct ReaderViewDeferral {
@@ -22660,6 +22708,7 @@ int main(int argc, char** argv) {
                         };
                         std::thread reader([&] {
                             strata::aux_cpus::place_off_host();
+                            const auto reader_started = time_reader ? Clock::now() : Clock::time_point{};
                             try {
 #if defined(STRATA_DFLASH2_CAPTURE)
                                 if (dflash) {
@@ -22705,6 +22754,8 @@ int main(int argc, char** argv) {
                                 read_fatal = use_dflash;
                                 read_err = "the prompt read failed";
                             }
+                            if (time_reader)
+                                reader_prefill_ms = std::chrono::duration<double, std::milli>(Clock::now() - reader_started).count();
                             done.store(true, std::memory_order_release);
                             { std::lock_guard<std::mutex> lk(in_mu); }   // the wait below can hold in_mu
                             in_cv.notify_all();
@@ -22779,6 +22830,9 @@ int main(int argc, char** argv) {
                         }
                         if (!pump_ok) abort_read.store(true, std::memory_order_release);
                         reader.join();
+                        // Leg totals have one writer: transfer the reader's inclusive span only after join.
+                        if (time_reader && phase_current)
+                            phase_current->add(phase::Stage::prefill_run, reader_prefill_ms);
                         sp.stop_at_chunk = nullptr;
                         in_prompt_read = false;
                         account_read();

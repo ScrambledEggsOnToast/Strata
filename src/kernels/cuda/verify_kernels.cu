@@ -1445,6 +1445,36 @@ __global__ void __launch_bounds__(kResidentPlanMax) resident_plan_kernel(const i
         }
     }
 }
+// Independent diagnostic kernel: the resident plan is stream-complete before this node.
+// Header bounds are checked before any variable-index access to its interval table.
+__global__ void resident_plan_group_census_kernel(const int32_t* plan, int capx, int expected_entries,
+                                                  int max_group, uint32_t* counts) {
+    __shared__ int groups;
+    if (threadIdx.x == 0) {
+        atomicAdd(counts + 10, 1u);
+        const int n = plan[0];
+        const int entries = plan[1];
+        const int32_t* start = plan + 4;
+        groups = 0;
+        if (n > 0 && n <= capx && n <= expected_entries && entries == expected_entries &&
+            start[0] == 0 && start[n] == expected_entries) {
+            groups = n;
+            atomicAdd(counts + 9, uint32_t(n));
+            atomicAdd(counts + 11, uint32_t(entries));
+        } else {
+            atomicAdd(counts + 8, 1u);
+        }
+    }
+    __syncthreads();
+    const int32_t* start = plan + 4;
+    for (int group = int(threadIdx.x); group < groups; group += int(blockDim.x)) {
+        const int begin = start[group], end = start[group + 1];
+        if (begin < 0 || end <= begin || end > expected_entries || end - begin > max_group)
+            atomicAdd(counts + 8, 1u);
+        else
+            atomicAdd(counts + (end - begin - 1), 1u);
+    }
+}
 // The same plan in one block of 128 threads (n <= 128): thread i owns entry i. Groups are the distinct experts in
 // order of first occurrence; group g's entries are its occurrences in increasing i - exactly the loop above
 // (S26: the one-thread loop took ~44 us per call on gfx1151, 48 per window).
@@ -1534,6 +1564,14 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     resident_plan_kernel<<<1, kResidentPlanMax, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
                                                               blob, plan, capx, skip, ring, plan_err);
     check("resident_plan");
+}
+bool resident_plan_group_census(const int32_t* plan, int capx, int expected_entries, int max_group,
+                                uint32_t* counts, void* stream) {
+    if (!plan || !counts || capx < 1 || capx > kResidentPlanMax || expected_entries < 1 ||
+        expected_entries > capx || max_group < 1 || max_group > 8) return false;
+    resident_plan_group_census_kernel<<<1, kResidentPlanMax, 0, (cudaStream_t) stream>>>(
+        plan, capx, expected_entries, max_group, counts);
+    return cudaPeekAtLastError() == cudaSuccess;
 }
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     wait_flag_ge_or_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, skip);

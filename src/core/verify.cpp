@@ -1207,6 +1207,7 @@ Verifier::~Verifier() {
         delete residency_;
     }
     if (expert_reuse_counts_h_) cudaFreeHost(expert_reuse_counts_h_);
+    if (expert_group_census_counts_h_) cudaFreeHost(expert_group_census_counts_h_);
     if (prof_) cudaFree(prof_);
     delete causal_;
     for (auto& e : exec_)
@@ -1315,12 +1316,23 @@ uint64_t Verifier::layout_arena(const ModelGeometry& g, int64_t context, int64_t
         take(&Verifier::ple_key_, sizeof(float), T * (uint64_t) strata::kernels::NG_HC_DIM); take(&Verifier::ple_val_, sizeof(float), T * N);
     if (planned_expert_reuse_trace_host_bytes())
         take(&Verifier::expert_reuse_counts_, sizeof(uint32_t), 8);
+    if (planned_expert_group_census_host_bytes())
+        take(&Verifier::expert_group_census_counts_, sizeof(uint32_t), 12);
     return b.used;
 }
 
 uint64_t Verifier::planned_expert_reuse_trace_host_bytes() {
     static const bool enabled = env_on("STRATA_EXPERT_REUSE_TRACE");
     return enabled ? 4096 : 0; // cudaHostAlloc's pinned page, not merely the 32-byte payload
+}
+
+uint64_t Verifier::planned_expert_group_census_host_bytes() {
+#if defined(STRATA_USE_HIP) || defined(STRATA_USE_SYCL) || defined(STRATA_GPU_METAL)
+    return 0;
+#else
+    static const bool enabled = env_on("STRATA_EXPERT_GROUP_CENSUS");
+    return enabled ? 4096 : 0;
+#endif
 }
 
 uint64_t Verifier::planned_device_bytes(const ModelGeometry& g, int64_t context, int64_t vocab, int max_t) {
@@ -1754,10 +1766,18 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    if (planned_expert_group_census_host_bytes() && planned_expert_reuse_trace_host_bytes()) {
+        err = "verify: expert group census and legacy reuse trace are separate diagnostic modes"; return false;
+    }
     if (planned_expert_reuse_trace_host_bytes() &&
         cudaHostAlloc((void**) &expert_reuse_counts_h_, planned_expert_reuse_trace_host_bytes(),
                       cudaHostAllocDefault) != cudaSuccess) {
         err = "verify: expert reuse trace host allocation failed"; return false;
+    }
+    if (planned_expert_group_census_host_bytes() &&
+        cudaHostAlloc((void**) &expert_group_census_counts_h_, planned_expert_group_census_host_bytes(),
+                      cudaHostAllocDefault) != cudaSuccess) {
+        err = "verify: expert group census host allocation failed"; return false;
     }
 
     if (bal_ != nullptr) {   // set_pcie_balance: four stamp words per (layer, group)
@@ -3121,6 +3141,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, nullptr, 0, cs, m_plan_err_);
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_METAL)
+            if (batch_rec_ && expert_group_census_counts_ &&
+                !resident_plan_group_census(plan_ + (size_t) grp * (size_t) (plan_i32_ + 16),
+                    int(max_t_ * K), int(n * K), n, expert_group_census_counts_, cs)) {
+                err = "verify: recording expert group census failed"; return false;
+            }
+#endif
         } else {
             if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
                 resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
@@ -5664,6 +5691,63 @@ bool Verifier::complete_expert_reuse_trace(const char* route, std::string& err) 
     return true;
 }
 
+bool Verifier::begin_expert_group_census(const int* rows, int count, int base, std::string& err) {
+    if (!expert_group_census_counts_) return true;
+    if (expert_group_census_pending_) {
+        err = "verify: previous expert group census window did not complete"; return false;
+    }
+    if (!rows || count < 1 || count > 8 || !ar_on() || expert_group_census_sequence_ == UINT64_MAX) {
+        err = "verify: expert group census requires a bounded all-resident batch window"; return false;
+    }
+    expert_group_census_slots_.fill(-1);
+    for (int i = 0; i < count; ++i) expert_group_census_slots_[size_t(i)] = rows[i];
+    expert_group_census_rows_ = count;
+    expert_group_census_base_ = base;
+    ++expert_group_census_sequence_;
+    expert_group_census_pending_ = true; // never reuse a failed launch/copy as a later window
+    if (cudaMemsetAsync(expert_group_census_counts_, 0, 12 * sizeof(uint32_t), cs_) != cudaSuccess) {
+        err = "verify: expert group census reset failed"; return false;
+    }
+    return true;
+}
+
+bool Verifier::copy_expert_group_census(std::string& err) {
+    if (!expert_group_census_pending_) return true;
+    if (cudaMemcpyAsync(expert_group_census_counts_h_, expert_group_census_counts_, 12 * sizeof(uint32_t),
+                        cudaMemcpyDeviceToHost, cs_) != cudaSuccess) {
+        err = "verify: expert group census copy failed"; return false;
+    }
+    return true;
+}
+
+bool Verifier::complete_expert_group_census(const char* route, std::string& err) {
+    if (!expert_group_census_pending_) return true;
+    if (!h_plan_err_ || *(volatile uint32_t*) h_plan_err_) {
+        err = "verify: expert group census has missing or stale resident plan status"; return false;
+    }
+    const uint32_t* c = expert_group_census_counts_h_;
+    uint64_t groups = 0, entries = 0;
+    for (int i = 0; i < 8; ++i) {
+        groups += c[i];
+        entries += uint64_t(i + 1) * c[i];
+    }
+    if (c[8] || uint64_t(c[10]) != uint64_t(le_ - lb_) || groups != c[9] || entries != c[11] ||
+        entries != uint64_t(c[10]) * uint64_t(expert_group_census_rows_) * uint64_t(ss_->k)) {
+        err = "verify: expert group census population or call-count conservation failed"; return false;
+    }
+    const auto& slots = expert_group_census_slots_;
+    std::fprintf(stderr, "EXPERT_GROUP_CENSUS completed=1 scope=batch_window_resident_plan "
+        "owner=%p window=%llu device=%d layers=%lld:%lld rows=%d base=%d "
+        "slots=%d,%d,%d,%d,%d,%d,%d,%d topk=%lld groups_1_8=%u,%u,%u,%u,%u,%u,%u,%u "
+        "invalid=%u groups=%u calls=%u entries=%u route=%s device_payload_bytes=48 host_allocation_bytes=4096\n",
+        static_cast<void*>(this), (unsigned long long)expert_group_census_sequence_,
+        device_, (long long)lb_, (long long)le_, expert_group_census_rows_, expert_group_census_base_,
+        slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7], (long long)ss_->k,
+        c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], route);
+    expert_group_census_pending_ = false;
+    return true;
+}
+
 bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool,
                              void* user, int32_t* out, std::string& err) {
     using namespace strata::kernels;
@@ -5673,9 +5757,11 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     ScratchGuard guard{*this, true};
     if (released_.load()) { err = "verify: watchdog released batch before launch"; return false; }
     if (!begin_expert_reuse_trace(rows, S, 0, err)) return false;
+    if (!begin_expert_group_census(rows, S, 0, err)) return false;
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     if (!copy_expert_reuse_trace(err)) return false;
+    if (!copy_expert_group_census(err)) return false;
     (void) cudaStreamQuery(cs_);
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
@@ -5709,6 +5795,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
                 trace_qsa_same_slot_completed(rows, S, 0, "run_slot_rows");
                 trace_head_split_completed(rows, S, 0, "run_slot_rows");
                 if (!complete_expert_reuse_trace("run_slot_rows", err)) return false;
+                if (!complete_expert_group_census("run_slot_rows", err)) return false;
             }
             guard.keep = true;                                                                          // FORK
             return true;
@@ -5724,6 +5811,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             trace_qsa_same_slot_completed(rows, S, 0, "run_slot_rows");
             trace_head_split_completed(rows, S, 0, "run_slot_rows");
             if (!complete_expert_reuse_trace("run_slot_rows", err)) return false;
+            if (!complete_expert_group_census("run_slot_rows", err)) return false;
         }
         guard.keep = true;                                                                              // FORK
         return true;
@@ -5980,11 +6068,13 @@ bool Verifier::batch_launch(int base, const int* rows, int S, const int32_t* tok
     ScratchGuard guard{*this, true};
     if (released_.load()) { err = "verify: watchdog released batch before launch"; return false; }
     if (!begin_expert_reuse_trace(rows, S, base, err)) return false;
+    if (!begin_expert_group_census(rows, S, base, err)) return false;
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
     if (le == cudaSuccess && commit == BatchCommit::eager && !batch_self_commits(rows, S))
         le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     if (!copy_expert_reuse_trace(err)) return false;
+    if (!copy_expert_group_census(err)) return false;
     (void) cudaStreamQuery(cs_);
     b_deferred_ = commit == BatchCommit::deferred;
     b_worker_failed_.store(false, std::memory_order_relaxed);
@@ -6149,6 +6239,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     trace_qsa_same_slot_completed(last_rows_, S, row_base_, "batch_poll");
     trace_head_split_completed(last_rows_, S, row_base_, "batch_poll");
     if (!complete_expert_reuse_trace("batch_poll", err)) return -1;
+    if (!complete_expert_group_census("batch_poll", err)) return -1;
     guard.keep = true;
     progress_beat();
     return 1;

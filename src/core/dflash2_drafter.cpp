@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -497,6 +498,13 @@ bool DflashNativeDrafter::propose_impl(Operation& operation, const float*, int32
     ids[0] = anchor;
     for (int row = 1; row < rows + 1; ++row) ids[size_t(row)] = mask_token;
     request->uniforms_valid = false;
+    const bool phases = feature_phases_enabled();
+    std::array<int64_t, 6> phase_ns;
+    const auto stamp = [&](size_t index) {
+        if (phases) phase_ns[index] = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    stamp(0);
     try {
         impl_->check_target();
         {
@@ -516,8 +524,10 @@ bool DflashNativeDrafter::propose_impl(Operation& operation, const float*, int32
         std::array<char, 21> id{};
         const auto end = std::to_chars(id.data(), id.data() + id.size(), expected.request);
         empty.request_id = {id.data(), size_t(end.ptr - id.data())};
+        stamp(1);
         if (!impl_->forward->forward(*request->context, empty, impl_->embedding_bf16, rows + 1,
                                      frontier, impl_->hidden, cs_, error)) return false;
+        stamp(2);
         if (impl_->head.device() != device_) {
             const OnDevice head_device(impl_->head.device());
             cuda_require(cudaMemcpyPeerAsync(impl_->head_hidden, impl_->head.device(), impl_->hidden + hidden_size,
@@ -543,9 +553,11 @@ bool DflashNativeDrafter::propose_impl(Operation& operation, const float*, int32
                 size_t(rows) * vocabulary_row_bytes, cs_), "native logit device transfer");
             cuda_require(cudaStreamSynchronize(cs_), "native logit transfer completion");
         }
+        stamp(3);
         auto& selected = impl_->selection;
         if (!impl_->selector->select(rows, impl_->hidden + hidden_size, impl_->logits, anchor,
                 sampled ? sampling.temperature : 0.f, uniforms, selected, cs_, error)) return false;
+        stamp(4);
         impl_->check_target();
         result.count = rows;
         for (int row = 0; row < rows; ++row) {
@@ -556,6 +568,24 @@ bool DflashNativeDrafter::propose_impl(Operation& operation, const float*, int32
                                                 DraftProposal::Distribution::point_mass;
         if (selected.sampled) selected.fill_probability_rows(result.q.data());
         impl_->proposal_anchor = anchor;
+        stamp(5);
+        if (phases) {
+            const auto elapsed = [&](size_t first, size_t last) {
+                return double(phase_ns[last] - phase_ns[first]) / 1e6;
+            };
+            // Completed compute only: common owner validation/drain/publication follows.
+            // Disjoint inclusive host spans, not kernel timings or additive service costs.
+            std::fprintf(stderr, "DFLASH2_PHASE proposal_compute completed=1 published=0 clock=steady "
+                "slot=%d draft_request=%llu draft_incarnation=%llu frontier=%d proposal_rows=%d forward_rows=%d device=%d "
+                "embedding_device=%d head_device=%d started_ns=%lld ended_ns=%lld "
+                "total_host_ms=%.6f embedding_host_ms=%.6f forward_host_ms=%.6f "
+                "head_host_ms=%.6f selector_host_ms=%.6f result_host_ms=%.6f\n",
+                expected.seat, (unsigned long long)expected.request,
+                (unsigned long long)expected.incarnation, frontier, rows, rows + 1, device_,
+                impl_->embedding.device(), impl_->head.device(),
+                (long long)phase_ns[0], (long long)phase_ns[5], elapsed(0, 5),
+                elapsed(0, 1), elapsed(1, 2), elapsed(2, 3), elapsed(3, 4), elapsed(4, 5));
+        }
         return true; // common owner validates, inspects, drains, then publishes
     } catch (const std::exception& failure) {
         impl_->drain_or_terminate(); // before formatting, unwinding host input ids, or releasing borrowed buffers

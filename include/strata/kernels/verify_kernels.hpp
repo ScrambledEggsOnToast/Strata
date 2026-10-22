@@ -138,6 +138,13 @@ void copy_rows_strided(float* dst, const float* src, int64_t rows, int64_t w, in
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr);
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_USE_SYCL) && !defined(STRATA_GPU_METAL)
+/// Diagnostic-only completed resident-plan population. Twelve counters: exact sizes 1..8,
+/// invalid, independent group total, call count, independent routed-entry total.
+/// No expert arithmetic or legacy reuse-trace state is changed.
+bool resident_plan_group_census(const int32_t* plan, int capx, int expected_entries, int max_group,
+                                uint32_t* counts, void* stream);
+#endif
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
 /// copy_i32_from_mapped unless *skip == value.

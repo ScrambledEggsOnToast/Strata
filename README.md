@@ -296,6 +296,38 @@ change is not a full-model, HIP or daily qualification; the protected resident
 fixture must establish the new host-scratch bound before full-model use. See
 [the allocation audit and fixture limits](docs/experiments/direct-slot-discriminator.md#mode-specific-host-transient-accounting-source-only).
 
+## Experimental DFlash2 diagnostics
+
+`STRATA_DFLASH2_PHASES=1` reports inclusive host proposal subspans and completed
+batch-window envelopes. Proposal records precede common owner validation/publication;
+window envelopes can overlap. Neither is isolated kernel time or an additive critical path.
+`STRATA_PHASE_TIMING=1` includes the piped reader's joined host span in `prefill_run`;
+only the owner thread updates leg totals. Native request-leg terminals still end at
+resident handoff, so they do not mean the same whole-request interval as serial terminals.
+
+`STRATA_EXPERT_GROUP_CENSUS=1` adds an independent routing-plan diagnostic node to
+eligible all-resident batch graphs. Each initialized Verifier, including finite peers,
+owns its reset, twelve-word device counter and one pinned host page. Only drained,
+validated windows publish exact group sizes 1–8 with plan/call/entry conservation.
+Pipeline-window copies and simultaneous legacy reuse tracing are refused; existing
+batch-MTP pipeline/floating owners remain supported and priced. This measures routing
+population, not reuse-kernel engagement, time or speed. The old tracer is unchanged.
+
+`DFLASH2_CAPTURE_DIR` remains restricted to one serial eight-output-budget request
+without batching. Its proposal files contain only live embedding/hidden/logit rows,
+not the larger allocated buffers or their unwritten tails. The standalone parity
+replayer likewise allocates and exports only its three projected logit rows, including
+the optional reference-head output. Capture and all timing/census modes are diagnostics,
+not flags to enable in a speed comparison.
+
+`tools/dflash2_actual_gate_micro.cu` is a standalone, fixed-shape experimental screen,
+not a production kernel or a default build target. It consumes an actual layer-0 gate
+input and checks the retained kernel against the corresponding replay output before
+comparing native BF16 cuBLAS with FP32 accumulation and explicit BF16 conversion.
+The 2026-10-22 SM86 screen missed its predeclared repeatability/10-microsecond saving
+criterion; retain the original kernel. This result does not establish a service gain.
+
+
 
 ## Credits and license
 

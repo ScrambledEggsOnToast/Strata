@@ -270,6 +270,10 @@ private:
             if (windows_) io::require(c.owner.request == owner_.request && c.owner.incarnation == owner_.incarnation &&
                         c.owner.seat == owner_.seat && c.owner.generation > owner_.generation && c.frontier > frontier_,
                         "capture changed owner or repeated/stale proposal");
+            const int proposal_rows = c.proposal.count;
+            const int forward_rows = proposal_rows + 1;
+            const size_t forward_bytes = size_t(forward_rows) * hidden_size * sizeof(uint16_t);
+            const size_t live_logits_bytes = size_t(proposal_rows) * vocabulary_size * sizeof(float);
             auto* features = host_.data();
             auto* tags = features + max_feature_bytes;
             auto* embeddings = tags + context_rows * sizeof(int64_t);
@@ -295,11 +299,11 @@ private:
                 io::DeviceScope device(c.device);
                 const auto stream = static_cast<cudaStream_t>(c.stream);
                 try {
-                    io::cuda(cudaMemcpyAsync(embeddings, c.raw_embeddings_device, block_size * hidden_size * sizeof(uint16_t),
+                    io::cuda(cudaMemcpyAsync(embeddings, c.raw_embeddings_device, forward_bytes,
                                              cudaMemcpyDeviceToHost, stream), "read actual raw embeddings");
-                    io::cuda(cudaMemcpyAsync(hidden, c.hidden_device, block_size * hidden_size * sizeof(uint16_t),
+                    io::cuda(cudaMemcpyAsync(hidden, c.hidden_device, forward_bytes,
                                              cudaMemcpyDeviceToHost, stream), "read actual engine hidden");
-                    io::cuda(cudaMemcpyAsync(logits, c.logits_device, logits_bytes, cudaMemcpyDeviceToHost, stream),
+                    io::cuda(cudaMemcpyAsync(logits, c.logits_device, live_logits_bytes, cudaMemcpyDeviceToHost, stream),
                              "read actual engine logits");
                     io::cuda(cudaStreamSynchronize(stream), "complete real proposal readback");
                 } catch (...) {
@@ -310,9 +314,9 @@ private:
             }
             const auto floats = [&](const std::byte* data, size_t bytes, bool bf16) { io::require_finite({data, bytes}, bf16); };
             floats(features, feature_bytes, true);
-            floats(embeddings, block_size * hidden_size * sizeof(uint16_t), true);
-            floats(hidden, block_size * hidden_size * sizeof(uint16_t), true);
-            floats(logits, logits_bytes, false);
+            floats(embeddings, forward_bytes, true);
+            floats(hidden, forward_bytes, true);
+            floats(logits, live_logits_bytes, false);
             io::Json candidates = io::Json::array(), probabilities = io::Json::array(), q = io::Json::array();
             for (size_t row = 0; row < 3; ++row) {
                 float sum = 0; bool chosen = false;
@@ -340,11 +344,12 @@ private:
             io::Json files = io::Json::object();
             files["context"] = io::write_tensor(directory, "context.bf16", "bf16", {c.context.count, feature_width}, {features, feature_bytes}, written_);
             files["generations"] = io::write_tensor(directory, "generations.i64", "i64", {c.context.count}, {tags, tag_bytes}, written_);
-            files["raw_embeddings"] = io::write_tensor(directory, "embeddings.bf16", "bf16", {block_size, hidden_size},
-                {embeddings, block_size * hidden_size * sizeof(uint16_t)}, written_);
-            files["engine_hidden"] = io::write_tensor(directory, "engine-hidden.bf16", "bf16", {block_size, hidden_size},
-                {hidden, block_size * hidden_size * sizeof(uint16_t)}, written_);
-            files["engine_logits"] = io::write_tensor(directory, "engine-logits.f32", "f32", {3, vocabulary_size}, {logits, logits_bytes}, written_);
+            files["raw_embeddings"] = io::write_tensor(directory, "embeddings.bf16", "bf16", {forward_rows, hidden_size},
+                {embeddings, forward_bytes}, written_);
+            files["engine_hidden"] = io::write_tensor(directory, "engine-hidden.bf16", "bf16", {forward_rows, hidden_size},
+                {hidden, forward_bytes}, written_);
+            files["engine_logits"] = io::write_tensor(directory, "engine-logits.f32", "f32", {proposal_rows, vocabulary_size},
+                {logits, live_logits_bytes}, written_);
             io::Json bundle = {{"schema", 1}, {"kind", "strata-dflash2-real-proposal"}, {"runtime_manifest_sha256", manifest_},
                 {"target", io::target_document(target_)}, {"owner", {{"seat", c.owner.seat}, {"request", c.owner.request},
                     {"incarnation", c.owner.incarnation}, {"generation", c.owner.generation}}},
