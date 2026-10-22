@@ -87,6 +87,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/program/batch_read.hpp"
+#include "strata/program/batch_ready_trace.hpp"
 #include "strata/program/serve_controls.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "logits_dump.hpp"
@@ -3436,13 +3437,25 @@ int main(int argc, char** argv) {
     const bool packed_prefill = strata::prefill::packed_prefill_enabled();
     const bool retained_prompt = strata::prefill::retained_prompt_enabled();
     const bool private_preparation = packed_prefill || retained_prompt;
+    const char* batch_ready_value = std::getenv("STRATA_BATCH_READY_TRACE");
+    const bool batch_ready_trace_enabled = batch_ready_value && std::strcmp(batch_ready_value, "1") == 0;
     const char* graph_startup_value = std::getenv("STRATA_VERIFY_GRAPH_STARTUP");
     const bool graph_startup = graph_startup_value && std::strcmp(graph_startup_value, "1") == 0;
-    for (const char* name : {"STRATA_VERIFY_GRAPH_STARTUP", "STRATA_VERIFY_GRAPH_CAPTURE_WALL"}) {
+    for (const char* name : {"STRATA_VERIFY_GRAPH_STARTUP", "STRATA_VERIFY_GRAPH_CAPTURE_WALL",
+                             "STRATA_BATCH_READY_TRACE"}) {
         const char* value = std::getenv(name);
         if (value && std::strcmp(value, "0") != 0 && std::strcmp(value, "1") != 0) {
             std::fprintf(stderr, "strata verify: %s must be unset, 0 or exactly 1\n", name); return 2;
         }
+    }
+    if (batch_ready_trace_enabled &&
+        (!o.serve || !o.host_native || o.batch != 4 || o.batch_groups != 2 ||
+         !o.batch_mtp_pipeline || !o.batch_mtp_floating || o.batch_mtp_third ||
+         o.pipeline_windows != 0 || o.adapt_async || o.adapt_swaps != 0 ||
+         o.kv_grow || o.vram_elastic || private_preparation || o.layer_split == "auto")) {
+        std::fprintf(stderr, "strata batch: ready trace requires the fixed host B4/G2 floating "
+            "batch-MTP pipeline and stable resident resources\n");
+        return 2;
     }
     if (graph_startup) {
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_USE_SYCL) || defined(STRATA_GPU_METAL)
@@ -6210,6 +6223,9 @@ int main(int argc, char** argv) {
             ram("resident_slot_draft_pinned", resident.slot_draft.pinned, "requested draft QSA staging and full logical ring backing");
             ram("resident_slot_draft_owner", resident.slot_draft_owner, "draft slot owner envelope, weights and scratch shared");
         }
+        if (batch_ready_trace_enabled)
+            ram("batch_ready_trace_host", sizeof(strata::program::BatchReadyTrace),
+                "one fixed 1024-window host-only readiness buffer; allocator metadata remains in the opaque allowance");
         if (expert_reuse_trace_host)
             ram("expert_reuse_trace_host", byte_mul(stage_count, expert_reuse_trace_host),
                 "one optional pinned histogram page per Verifier; device histogram is counted in its arena");
@@ -17874,6 +17890,12 @@ int main(int argc, char** argv) {
                 Clock::now().time_since_epoch()).count();
         };
         uint64_t dflash_window_sequence = 0;
+        if (batch_ready_trace_enabled && n_pipe > int(strata::program::BatchReadyTrace::max_stages)) {
+            std::fprintf(stderr, "strata batch: ready trace stage bound exceeded\n"); return 2;
+        }
+        std::unique_ptr<strata::program::BatchReadyTrace> batch_ready_trace;
+        if (batch_ready_trace_enabled)
+            batch_ready_trace = std::make_unique<strata::program::BatchReadyTrace>(n_pipe);
         struct PGroup {
             bool inflight = false;
             int stage = 0;                  ///< the stage it runs on or waits for
@@ -17885,6 +17907,7 @@ int main(int argc, char** argv) {
             int64_t since = 0;              ///< tick it started waiting (fairness)
             int64_t phase_started_ns = 0;
             uint64_t phase_active_mask = 0, phase_selected_mask = 0;
+            strata::program::BatchReadyTrace::Window* ready_trace = nullptr;
             std::array<int32_t, strata::kernels::kVerifyMaxT * strata::core::kSpecQStride> q{};
             std::array<int32_t, strata::kernels::kVerifyMaxT> proposed{};
 #if defined(STRATA_DFLASH2_CAPTURE)
@@ -18064,6 +18087,13 @@ int main(int argc, char** argv) {
         auto group_pool_user = [&](int group) -> void* {
             return group == 0 ? win_pool_user : group == 1 ? (void*)&split_drive_b : (void*)third_drive.get();
         };
+        auto ready_continuation = [&](int k) {
+            int pick = -1;
+            for (int gi = 0; gi < (int)pg.size(); ++gi)
+                if (pg[(size_t)gi].inflight && pg[(size_t)gi].stage == k &&
+                    (pick < 0 || pg[(size_t)gi].since < pg[(size_t)pick].since)) pick = gi;
+            return pick;
+        };
         auto pump_mtp = [&](bool may_start) -> bool {
             ++pipe_tick;
             if (bt_windows == 0 && !pipe_inflight()) bt_start = Clock::now();
@@ -18073,6 +18103,8 @@ int main(int argc, char** argv) {
                 const int r = group_verifier(k, gi).batch_poll(win_pool_fn, group_pool_user(gi), err);
                 if (r < 0) { phase_error("ERR %s\n", err.c_str()); return false; }
                 if (!r) continue;
+                if (auto* trace = pg[(size_t)gi].ready_trace)
+                    trace->stages[(size_t)k].polled_done_ns = dflash_phase_now_ns();
                 if (o.batch_mtp_third && batch_mtp_trace)
                     std::fprintf(stderr, "STATE_THIRD_STAGE_DONE tick=%lld stage=%d owner=%d\n",
                                  (long long)pipe_tick, k, gi);
@@ -18091,6 +18123,28 @@ int main(int argc, char** argv) {
             if (!host_experts_running) for (int gi = 0; gi < (int) pg.size(); ++gi) {
                 PGroup& G = pg[(size_t) gi];
                 if (!G.inflight || G.stage != n_pipe) continue;
+                if (auto* trace = G.ready_trace) {
+                    trace->retirement_begin_ns = dflash_phase_now_ns();
+                    trace->retirement_reader = in_prompt_read;
+                    trace->retirement_blocked_stage = retained_blocked_stage;
+                    for (size_t other = 0; other < pg.size(); ++other)
+                        if (pg[other].inflight) trace->retirement_inflight_mask |= uint64_t(1) << other;
+                    for (size_t b = 0; b < bs.size(); ++b) {
+                        if (bs[b].active) trace->retirement_active_mask |= uint64_t(1) << b;
+                        if (seat_leased((int)b)) trace->retirement_leased_mask |= uint64_t(1) << b;
+                    }
+                    for (int k = 1; k < n_pipe; ++k) {
+                        if (k == retained_blocked_stage || stage_group[(size_t)k] >= 0) continue;
+                        const int ready = ready_continuation(k);
+                        if (ready < 0 || ready == gi || !pg[(size_t)ready].ready_trace) continue;
+                        auto& waiting = pg[(size_t)ready].ready_trace->stages[(size_t)k];
+                        if (waiting.retirement_witness) batch_ready_trace->invalid = true;
+                        else {
+                            waiting.retirement_witness = trace->sequence;
+                            waiting.eligible_ns = trace->retirement_begin_ns;
+                        }
+                    }
+                }
                 strata::core::Verifier& head = group_verifier(n_pipe - 1, gi);
                 const int32_t* out = head.batch_out();
                 int keep[strata::kernels::kVerifyMaxT] = {};
@@ -18189,15 +18243,14 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "STATE_FLOAT_RELEASE tick=%lld owner=%d rows=%d\n",
                                  (long long)pipe_tick, gi, G.count);
                 G.inflight = false;
+                if (G.ready_trace) G.ready_trace->retirement_end_ns = dflash_phase_now_ns();
             }
             for (int k = n_pipe - 1; k >= 0; --k) {
                 if (k == retained_blocked_stage) continue;
                 if (stage_group[(size_t) k] >= 0) continue;
                 int pick = -1;
                 if (k > 0) {
-                    for (int gi = 0; gi < (int) pg.size(); ++gi)
-                        if (pg[(size_t) gi].inflight && pg[(size_t) gi].stage == k &&
-                            (pick < 0 || pg[(size_t) gi].since < pg[(size_t) pick].since)) pick = gi;
+                    pick = ready_continuation(k);
                     if (pick < 0) continue;
                 } else {
                     if (!may_start) continue;
@@ -18323,6 +18376,19 @@ int main(int argc, char** argv) {
 #endif
                     G.inflight = true;
                     G.stage = 0;
+                    G.ready_trace = batch_ready_trace ? batch_ready_trace->begin(pick, G.count) : nullptr;
+                    if (auto* trace = G.ready_trace) {
+                        for (size_t b = 0; b < bs.size(); ++b)
+                            if (bs[b].active) trace->active_mask |= uint64_t(1) << b;
+                        for (int t = 0; t < G.count; ++t) {
+                            const int b = G.rows[t];
+                            trace->rows[(size_t)t] = b;
+                            trace->positions[(size_t)t] = G.pos[t];
+                            trace->requests[(size_t)t] = bs[(size_t)b].request;
+                            trace->incarnations[(size_t)t] = bs[(size_t)b].incarnation;
+                            trace->selected_mask |= uint64_t(1) << b;
+                        }
+                    }
                     drive.d.failed = false;
                     apply_pending(false);
                 }
@@ -18339,10 +18405,18 @@ int main(int argc, char** argv) {
                         G.phase_selected_mask |= uint64_t(1) << G.rows[row];
                     G.phase_started_ns = dflash_phase_now_ns();
                 }
+                if (G.ready_trace) {
+                    auto& trace = G.ready_trace->stages[(size_t)k];
+                    if (trace.launch_begin_ns) batch_ready_trace->invalid = true;
+                    trace.owner = reinterpret_cast<uintptr_t>(&owner);
+                    trace.launch_begin_ns = dflash_phase_now_ns();
+                }
                 if (!owner.batch_launch(handoff_base, G.rows, G.count, G.tok, G.pos, err,
                                         strata::core::Verifier::BatchCommit::deferred)) {
                     phase_error("ERR %s\n", err.c_str()); return false;
                 }
+                if (G.ready_trace)
+                    G.ready_trace->stages[(size_t)k].launch_end_ns = dflash_phase_now_ns();
                 if (o.batch_mtp_third && batch_mtp_trace)
                     std::fprintf(stderr, "STATE_THIRD_LAUNCH tick=%lld stage=%d owner=%d base=%d rows=%d verifier=%p\n",
                                  (long long)pipe_tick, k, pick, handoff_base, G.count, (void*)&owner);

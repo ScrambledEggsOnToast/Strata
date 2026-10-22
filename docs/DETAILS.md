@@ -388,6 +388,17 @@ per-request samples; do not sum repeated reports. `STRATA_PREFILL_TIMING=1` prin
 GPU phase and host staging/setup/wait summaries for prefill. It enables GPU event timing and host accounting,
 not a cache-read or whole-response timer. Unset all these switches for uninstrumented comparisons.
 
+**Bounded batch-readiness observation:** `STRATA_BATCH_READY_TRACE=1` records host scheduling
+boundaries for the host-native four-slot/two-group floating batch-MTP pipeline with prompt
+pipeline windows disabled. Unset or `0` leaves it off; other values and unsupported configurations
+refuse before loading. Admission prices one fixed 1,024-window buffer. Normal serving shutdown emits
+`BATCH_READY_TRACE` JSON records and a completeness summary, bounded to 4 MiB; abnormal termination,
+overflow or a missing summary does not establish a negative result. Records retain request/incarnation
+leases, physical stage owners, launch calls, observed completion and retirement witnesses.
+Use `STRATA_VERIFY_GRAPH_CAPTURE_WALL=1` to distinguish a previously captured owner/layout from first
+use. These are host observations, not GPU execution times or predicted recoverable service time.
+Neither observer changes scheduling or enables the path-changing `STRATA_VERIFY_PROFILE` mode.
+
 **Conversation-cache mutation receipts (opt-in diagnostics):** set
 `STRATA_CACHE_MUTATION_TRACE=/absolute/new-file.jsonl` in the engine environment.
 The file is create-only; an unavailable destination disables this observer, not
