@@ -51,9 +51,11 @@ ConversationBuffer pattern(size_t n, uint8_t seed) {
     return b;
 }
 
-std::vector<uint8_t> bytes_of(size_t n, uint8_t seed) {
-    std::vector<uint8_t> v(n);
-    for (size_t i = 0; i < n; ++i) v[i] = uint8_t(i * 7u + seed);
+CheckpointBytes bytes_of(size_t n, uint8_t seed) {
+    CheckpointBytes v;
+    v.resize_for_overwrite(n);
+    auto* data = v.write().data();
+    for (size_t i = 0; i < n; ++i) data[i] = uint8_t(i * 7u + seed);
     return v;
 }
 
