@@ -252,6 +252,18 @@ The Linux `logits_dump_test` exercises the same production writer with write/flu
 and interruption. A structurally valid dump is a regression artifact, not independent numerical
 qualification of the model, arithmetic, or sampled speculation.
 
+## Same-slot QSA correctness fixture
+
+`qsa_same_slot_test [CUDA_DEVICE_ORDINAL]` selects a CUDA device (default `0`);
+the fixture supports SM70 and SM86. It checks grouped versus per-row scores,
+selected IDs and attention bit-for-bit, including owner-layout cache separation,
+mixed-owner fallback, changed-input replay and poisoned storage guards.
+The four-row case at capacity 262144 and live context 262136 asserts execution
+of the wide top-k kernel and the device's actual attention route: pre75 on SM70,
+default on SM86. Ambient dispatch overrides are refused. These synthetic
+functional checks and their component timings do not qualify model quality,
+full-model throughput or a daily release.
+
 ## Protected GPU tests
 
 On Linux, the fork's short-lived GPU parity/canary tests honor `STRATA_SUPERVISED=1`:

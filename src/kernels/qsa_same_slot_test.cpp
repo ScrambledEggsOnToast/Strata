@@ -1,5 +1,5 @@
 // Bounded synthetic probe for verify.cpp's same-owner QSA branch. No model files.
-// This probe requires the actual V100/pre75 K8V4 route; a fallback is not a pass.
+// Exercise the actual SM70/pre75 and SM86/default K8V4 routes; a fallback is not a pass.
 #include "strata/core/batch_rows.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
@@ -27,6 +27,7 @@ namespace c = strata::core;
 namespace {
 constexpr int kRows = 8, kCells = 4096;
 constexpr size_t kGuard = 16;
+bool expect_pre75 = true;
 void require(bool value, const char* message) {
     if (!value) { std::fprintf(stderr, "FAIL: %s\n", message); std::exit(1); }
 }
@@ -75,12 +76,12 @@ struct Pool {
     Buffer<uint16_t> scales;
     Buffer<uint8_t> values;
     k::QsaAttnPools view{};
-    void init(const k::QsaShapes& s, int blocks, unsigned seed, cudaStream_t stream) {
+    void init(const k::QsaShapes& s, int capacity, int blocks, unsigned seed, cudaStream_t stream) {
         std::mt19937 rng(seed);
         std::uniform_real_distribution<float> nd(-0.5f, 0.5f);
         pooled.init(size_t(blocks * s.idx_dim)); dead.init(size_t(s.idx_dim));
-        pages.init(size_t(kCells / s.page_size));
-        const size_t cells = size_t(kCells * s.n_head_kv), hd = size_t(s.head_dim);
+        pages.init(size_t(capacity / s.page_size));
+        const size_t cells = size_t(capacity * s.n_head_kv), hd = size_t(s.head_dim);
         keys.init(cells * hd); scales.init(cells * hd / k::KV_Q8_GROUP);
         values.init(cells * size_t(k::kv_q4_bytes_per_head(int(hd))));
         std::vector<float> hp(pooled.size), hdv(dead.size);
@@ -111,13 +112,13 @@ struct Graph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
     int pre75_nodes = 0;
+    int default_nodes = 0, wide_topk_nodes = 0;
     ~Graph() { if (exec) cudaGraphExecDestroy(exec); if (graph) cudaGraphDestroy(graph); }
 };
 
 struct Probe {
     k::QsaShapes shapes = k::qsa_real_shapes();
-    const int blocks = kCells / int(shapes.idx_block) + 2;
-    const int cap = int(k::qsa_selection_width(kCells, shapes));
+    const int cells, blocks, cap;
     const int qi = int(shapes.idx_n_head * shapes.idx_dim), qo = int(shapes.n_head * shapes.head_dim);
     const size_t scratch_stride = k::qsa_decode_attn_scratch_floats(cap, shapes);
     cudaStream_t stream = nullptr;
@@ -127,9 +128,11 @@ struct Probe {
     std::vector<int32_t> host_steps;
     int count, context;
     std::map<c::VerifyBatchKey, std::unique_ptr<Graph>> cache;
-    explicit Probe(int n, int ctx) : count(n), context(ctx) {
+    explicit Probe(int n, int ctx, int capacity = kCells)
+        : cells(capacity), blocks(capacity / int(shapes.idx_block) + 2),
+          cap(int(k::qsa_selection_width(capacity, shapes))), count(n), context(ctx) {
         ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        for (int i = 0; i < 2; ++i) pools[i].init(shapes, blocks, 912 + i, stream);
+        for (int i = 0; i < 2; ++i) pools[i].init(shapes, cells, blocks, 912 + i, stream);
         query_index.init(size_t(kRows * qi)); query.init(size_t(kRows * qo)); steps.init(size_t(kRows * k::kStepCount));
         for (int arm = 0; arm < 2; ++arm) {
             scores[arm].init(size_t(kRows * blocks)); selection[arm].init(size_t(kRows * cap));
@@ -195,16 +198,26 @@ struct Probe {
 #if CUDART_VERSION >= 12030
             const char* name = nullptr;
             ck(cudaFuncGetName(&name, params.func));
-            if (name && std::strstr(name, "attn_chunk_kernel_pre75")) {
-                ++graph->pre75_nodes;
-                require(params.gridDim.z == unsigned(grouped ? count : 1), "pre75 live query grid");
+            if (name && std::strstr(name, "attn_chunk_kernel")) {
+                if (std::strstr(name, "attn_chunk_kernel_pre75")) ++graph->pre75_nodes;
+                else ++graph->default_nodes;
+                require(params.gridDim.z == unsigned(grouped ? count : 1), "attention live query grid");
+            }
+            if (name && std::strstr(name, "block_topk_wide_kernel")) {
+                ++graph->wide_topk_nodes;
+                require(params.gridDim.x == unsigned(grouped ? count : 1), "wide top-k live query grid");
             }
 #else
             require(false, "CUDA >=12.3 required to establish actual kernel exposure");
 #endif
         }
-        require(graph->pre75_nodes == ((part == 0 || part == 3) ? (grouped ? 1 : count) : 0),
-                "actual pre75 route must execute; fallback is not acceptance");
+        const int attention_nodes = (part == 0 || part == 3) ? (grouped ? 1 : count) : 0;
+        require(graph->pre75_nodes == (expect_pre75 ? attention_nodes : 0) &&
+                graph->default_nodes == (expect_pre75 ? 0 : attention_nodes),
+                "actual device-specific attention route must execute; fallback is not acceptance");
+        if (cells == 262144)
+            require(graph->wide_topk_nodes == ((part == 0 || part == 2) ? (grouped ? 1 : count) : 0),
+                    "actual production-capacity wide top-k must execute");
         ck(cudaGraphInstantiate(&graph->exec, graph->graph, nullptr, nullptr, 0));
         return graph;
     }
@@ -296,15 +309,29 @@ void policy_checks() {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     policy_checks();
+    require(argc <= 2, "usage: qsa_same_slot_test [CUDA-device-ordinal]");
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
-    cudaDeviceProp properties{}; ck(cudaGetDeviceProperties(&properties, 0));
-    require(properties.major == 7 && properties.minor == 0, "this bounded probe requires V100 SM70");
-    // The actual daily pre75/K8V4 path must be selected; conflicting ambient selectors refuse.
-    for (const char* name : {"STRATA_ATTN_PRE75", "STRATA_ATTN_LANECELL", "STRATA_ATTN_V3",
-                             "STRATA_QSA_ROWS", "STRATA_SCORES_MULTI", "STRATA_SCORES_HALVE"})
+    int device = 0;
+    if (argc == 2) {
+        char* end = nullptr;
+        const long parsed = std::strtol(argv[1], &end, 10);
+        require(end != argv[1] && *end == '\0' && parsed >= 0 && parsed < devices, "CUDA device ordinal");
+        device = int(parsed);
+    }
+    ck(cudaSetDevice(device));
+    cudaDeviceProp properties{}; ck(cudaGetDeviceProperties(&properties, device));
+    const int sm = properties.major * 10 + properties.minor;
+    require(sm == 70 || sm == 86, "this bounded probe supports only qualified SM70/SM86");
+    expect_pre75 = sm == 70;
+    std::printf("DEVICE ordinal=%d sm=%d attention=%s\n", device, sm, expect_pre75 ? "pre75" : "default");
+    // The actual device-specific K8V4 path must be selected; conflicting ambient selectors refuse.
+    for (const char* name : {"STRATA_ATTN_PRE75", "STRATA_ATTN_DAILY", "STRATA_ATTN_LANECELL",
+                             "STRATA_ATTN_V3", "STRATA_QSA_ROWS", "STRATA_SCORES_MULTI",
+                             "STRATA_SCORES_HALVE", "STRATA_TOPK_OLD", "STRATA_TOPK_SPLIT",
+                             "STRATA_EMULATE_CC"})
         require(std::getenv(name) == nullptr, "clear independent attention overrides before probe");
     for (int rows : {2, 3, 4}) for (int context : {244, 2047}) {
         Probe p(rows, context);
@@ -319,6 +346,21 @@ int main() {
         require(&p.cached(owners) == &candidate, "replay must reuse original cached executable");
         p.input(0); p.replay(owners, *reference, candidate);
         p.micro(owners);
+    }
+    // A single full-capacity case reaches the wide top-k kernel, not just its register counterpart.
+    // Leave room for all four positions and the changed-input replay inside the allocated pool.
+    {
+        Probe wide(4, 262136, 262144);
+        const std::vector<int> owners(4, 0);
+        wide.input(0); wide.poison();
+        auto reference = wide.capture(owners, false);
+        Graph& candidate = wide.cached(owners);
+        const auto first = wide.replay(owners, *reference, candidate);
+        wide.input(1);
+        require(first != wide.replay(owners, *reference, candidate),
+                "wide top-k cached graph must observe changed input");
+        wide.input(0); wide.replay(owners, *reference, candidate);
+        std::puts("PASS capacity=262144 rows=4 wide_topk=executed exact_scores_ids_attention=1");
     }
     // Same width, three distinct owner layouts; different pools must never share an executable.
     Probe p(4, 2050); // crosses the 2051-cell selection-width boundary and 4-cell block/page boundary
@@ -341,6 +383,6 @@ int main() {
     // claim real streamed-KV resolution coverage, whose production path is left untouched.
     auto fallback = p.capture(layouts[0], true, false);
     p.replay(layouts[0], *references[0], *fallback);
-    std::puts("PASS same-slot QSA: exact scores/IDs/attention, actual pre75 route, cache-layout isolation, guards and changed-input replay");
+    std::puts("PASS same-slot QSA: exact scores/IDs/attention, device-specific attention and wide top-k, cache-layout isolation, guards and changed-input replay");
     return 0;
 }
