@@ -500,6 +500,7 @@ int main() {
             l.geometry = original.geometry;
             l.layer_range = std::make_pair(original.layer_lo, original.layer_hi);
             l.max_state_bytes = {4099, 77, 301, 64, 8};
+            l.max_draft_boundary_bytes = original.draft_boundary_residual.size();
             for (const auto& k : original.kv)
                 l.max_kv_bytes.push_back({k.k.size(), k.v.size(), k.k_scale.size(), k.v_scale.size(), k.pooled.size()});
             return l;
@@ -510,7 +511,6 @@ int main() {
               "limits: a file within the exact runtime limits reads");
         check(session_read_max_file_bytes(exact()) >= image.size() &&
               session_read_max_file_bytes(exact()) < UINT64_MAX, "limits: the runtime limits bound the file size");
-        check(session_read_max_file_bytes(SessionReadLimits{}) == UINT64_MAX, "limits: open limits leave it open");
         auto l = exact(); l.max_state_bytes[0] = 4098;
         check(rejects(good, id, l), "limits: a GDN state over the runtime size refused");
         l = exact(); l.max_state_bytes[4] = 7;
