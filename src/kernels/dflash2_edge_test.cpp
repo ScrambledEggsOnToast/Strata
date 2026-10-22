@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -31,6 +32,8 @@ using strata::core::dflash2::Selection;
 using strata::kernels::bf16_from_f32;
 using strata::kernels::f32_from_bf16;
 
+constexpr int attention_rows = 4;
+constexpr int selection_rows = 3;
 constexpr size_t context_elements = size_t(gpu::capacity) * gpu::kv_width;
 constexpr size_t score_elements = size_t(gpu::query_heads) * gpu::block * gpu::max_keys;
 constexpr size_t convolution_elements = size_t(gpu::block) * gpu::hidden;
@@ -89,6 +92,7 @@ struct DevicePayload {
     uint16_t query[gpu::block * gpu::query_width];
     uint16_t block_keys[gpu::block * gpu::kv_width];
     float scores[score_elements];
+    float softmax_statistics[size_t(gpu::query_heads) * gpu::block * 2 + 2];
     uint16_t convolution_input[convolution_elements];
     uint16_t convolution_base[2 * 2 * gpu::hidden];
     uint16_t convolution_dynamic[gpu::block * gpu::dynamic_width];
@@ -109,6 +113,7 @@ struct DevicePayload {
 struct HostPayload {
     uint16_t staging[context_elements];
     float scores[score_elements];
+    float softmax_statistics[size_t(gpu::query_heads) * gpu::block * 2 + 2];
     float logits[logit_elements];
     Selection selection{};
     std::array<int32_t, Selection::probability_row_slots> consumer_q{};
@@ -457,40 +462,125 @@ void attention_edges(DevicePayload& device, HostPayload& host) {
                                        layer, origin, gpu::capacity, &device.status, nullptr),
                      "store_context");
         kernel_check(gpu::attention_scores(device.query, device.block_keys, device.ring, device.scores,
-                                          layer, origin, frontier, 4, &device.status, nullptr),
+                                          layer, origin, frontier, attention_rows, &device.status, nullptr),
                      "attention_scores");
         cuda_check(cudaMemcpy(host.scores, device.scores, sizeof(device.scores), cudaMemcpyDeviceToHost),
                    "attention scores readback");
         check_status(device, host, "attention status", case_index);
         for (int head = 0; head < gpu::query_heads; ++head)
-            for (int row = 0; row < gpu::block; ++row)
-                for (int key = 0; key < gpu::max_keys; ++key) {
-                    const float actual = host.scores[(size_t(head) * gpu::block + row) * gpu::max_keys + key];
+            for (int row = 0; row < attention_rows; ++row)
+                for (int key = 0; key < gpu::capacity + attention_rows; ++key) {
+                    const float actual = host.scores[(size_t(head) * attention_rows + row) * (gpu::capacity + attention_rows) + key];
                     const int distance = (frontier + row) - (origin + key);
                     if (std::abs(distance) >= 2048) {
                         if (!std::isinf(actual) || !std::signbit(actual))
-                            mismatch("attention masked score", case_index, head * gpu::block + row, key,
+                            mismatch("attention masked score", case_index, head * attention_rows + row, key,
                                      actual, -std::numeric_limits<double>::infinity());
                     } else {
                         const double expected = double(key) / std::sqrt(128.0);
                         if (!std::isfinite(actual) || std::abs(double(actual) - expected) > attention_absolute_tolerance)
-                            mismatch("attention visible score", case_index, head * gpu::block + row, key,
+                            mismatch("attention visible score", case_index, head * attention_rows + row, key,
                                      actual, expected);
                     }
                 }
+        constexpr size_t active_scores = size_t(gpu::query_heads) * attention_rows * (gpu::capacity + attention_rows);
+        for (size_t i = active_scores; i < score_elements; ++i)
+            require(std::isnan(host.scores[i]), "attention touched inactive score suffix");
         std::printf("PASS attention/distinct-keys-left-window-noncausal-anchor origin=%d layer=%d scores=%zu status=0\n",
-                    origin, layer, score_elements);
+                    origin, layer, active_scores);
     }
 }
 
+void softmax_active_rows(DevicePayload& device, HostPayload& host) {
+    // Reuse the larger logit buffers for probabilities; inactive scores are NaN
+    // and every output/statistic suffix is a bit-exact poison guard.
+    constexpr uint32_t status_sentinel = 0x80000000u;
+    constexpr std::array<std::array<int, 2>, 4> cases{{
+        {{1, 1}}, {{4, 4}}, {{8, 8}}, {{4, gpu::capacity + 4}}
+    }};
+    auto poisoned = [](float value) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits == 0xffffffffu;
+    };
+    for (size_t index = 0; index < cases.size(); ++index) {
+        const int rows = cases[index][0], keys = cases[index][1];
+        const int distributions = gpu::query_heads * rows;
+        const size_t active = size_t(distributions) * keys;
+        std::fill_n(host.scores, score_elements, std::numeric_limits<float>::quiet_NaN());
+        for (int row = 0; row < distributions; ++row)
+            for (int key = 0; key < keys; ++key)
+                host.scores[size_t(row) * keys + key] = float((row + key) % 9 - 4) * 0.25f;
+        cuda_check(cudaMemcpy(device.scores, host.scores, sizeof(device.scores), cudaMemcpyHostToDevice),
+                   "active softmax score upload");
+        cuda_check(cudaMemset(device.logits, 0xff, sizeof(host.scores)), "softmax output poison");
+        cuda_check(cudaMemset(device.softmax_statistics, 0xff, sizeof(device.softmax_statistics)),
+                   "softmax statistics poison");
+        cuda_check(cudaMemcpy(&device.status, &status_sentinel, sizeof(status_sentinel), cudaMemcpyHostToDevice),
+                   "softmax status sentinel");
+        kernel_check(gpu::attention_softmax(device.scores, device.logits, device.softmax_statistics,
+                                           rows, keys, &device.status, nullptr), "active-row attention_softmax");
+        cuda_check(cudaMemcpy(host.logits, device.logits, sizeof(host.scores), cudaMemcpyDeviceToHost),
+                   "softmax output readback");
+        cuda_check(cudaMemcpy(host.softmax_statistics, device.softmax_statistics, sizeof(host.softmax_statistics),
+                              cudaMemcpyDeviceToHost), "softmax statistics readback");
+        cuda_check(cudaMemcpy(&host.status, &device.status, sizeof(host.status), cudaMemcpyDeviceToHost),
+                   "softmax status readback");
+        require(host.status == status_sentinel, "inactive scores poisoned active softmax status");
+        for (int row = 0; row < distributions; ++row) {
+            double denominator = 0.0, mass = 0.0;
+            for (int key = 0; key < keys; ++key)
+                denominator += std::exp(double(host.scores[size_t(row) * keys + key]));
+            for (int key = 0; key < keys; ++key) {
+                const size_t at = size_t(row) * keys + key;
+                const float actual = host.logits[at];
+                const double expected = std::exp(double(host.scores[at])) / denominator;
+                if (!std::isfinite(actual) || actual < 0 ||
+                    std::abs(double(actual) - expected) > probability_absolute_tolerance)
+                    mismatch("active softmax probability", int(index), row, key, actual, expected);
+                mass += actual;
+            }
+            if (std::abs(mass - 1.0) > probability_mass_tolerance)
+                mismatch("active softmax probability mass", int(index), row, 0, mass, 1.0);
+            require(std::isfinite(host.softmax_statistics[size_t(row) * 2]) &&
+                    std::isfinite(host.softmax_statistics[size_t(row) * 2 + 1]) &&
+                    host.softmax_statistics[size_t(row) * 2 + 1] > 0,
+                    "active softmax statistics are not finite");
+        }
+        for (size_t at = active; at < score_elements; ++at)
+            require(poisoned(host.logits[at]), "softmax touched inactive probability suffix");
+        for (size_t at = size_t(distributions) * 2; at < std::size(host.softmax_statistics); ++at)
+            require(poisoned(host.softmax_statistics[at]), "softmax touched inactive statistics suffix");
+        // A live NaN must still set the numeric failure bit, without clearing
+        // unrelated status bits. Ignoring inactive rows must not disable checks.
+        const float invalid = std::numeric_limits<float>::quiet_NaN();
+        cuda_check(cudaMemcpy(device.scores, &invalid, sizeof(invalid), cudaMemcpyHostToDevice),
+                   "active softmax NaN upload");
+        kernel_check(gpu::attention_softmax(device.scores, device.logits, nullptr,
+                                           rows, keys, &device.status, nullptr), "nonfinite active softmax");
+        cuda_check(cudaMemcpy(&host.status, &device.status, sizeof(host.status), cudaMemcpyDeviceToHost),
+                   "nonfinite active softmax status readback");
+        require(host.status == (status_sentinel | 1u), "active softmax NaN did not preserve/set status bits");
+        std::printf("PASS softmax/active-rows rows=%d keys=%d inactive-poison-untouched=1 numeric-status=1\n", rows, keys);
+    }
+    require(gpu::attention_softmax(device.scores, device.logits, nullptr, 0, 8, &device.status, nullptr) ==
+                int(cudaErrorInvalidValue) &&
+            gpu::attention_softmax(device.scores, device.logits, nullptr, gpu::block + 1, 9, &device.status, nullptr) ==
+                int(cudaErrorInvalidValue) &&
+            gpu::attention_softmax(device.scores, device.logits, nullptr, 4, 3, &device.status, nullptr) ==
+                int(cudaErrorInvalidValue) &&
+            gpu::attention_softmax(device.scores, device.logits, nullptr, 1, gpu::capacity + 2, &device.status, nullptr) ==
+                int(cudaErrorInvalidValue), "softmax accepted an invalid active-row/key extent");
+}
+
 void convolution_edges(DevicePayload& device, HostPayload& host) {
-    constexpr int stage = 1, offset = 1;
+    constexpr int stage = 1, offset = 1, rows = 4;
     std::fill_n(host.staging, 2 * 2 * gpu::hidden, uint16_t(0));
     std::fill_n(host.staging + (stage * 2 + offset) * gpu::hidden, gpu::hidden, bf16_from_f32(2.0f));
     cuda_check(cudaMemcpy(device.convolution_base, host.staging, sizeof(device.convolution_base), cudaMemcpyHostToDevice),
                "convolution base upload");
     std::fill_n(host.staging, gpu::block * gpu::dynamic_width, uint16_t(0));
-    for (int row = 0; row < gpu::block; ++row)
+    for (int row = 0; row < rows; ++row)
         for (int group = 0; group < gpu::groups; ++group)
             host.staging[row * gpu::dynamic_width + (stage * 2 + offset) * gpu::groups + group] =
                 bf16_from_f32(float(group % 3 + 1));
@@ -500,7 +590,7 @@ void convolution_edges(DevicePayload& device, HostPayload& host) {
     constexpr std::array<int, 4> input_rows{1, 2, 4, 8};
     for (int block_index = 0; block_index < 2; ++block_index) {
         const int scale = block_index == 0 ? 16 : 1;
-        for (int row = 0; row < gpu::block; ++row)
+        for (int row = 0; row < rows; ++row)
             std::fill_n(host.staging + row * gpu::hidden, gpu::hidden,
                         bf16_from_f32(float(scale * input_rows[size_t(row)])));
         cuda_check(cudaMemcpy(device.convolution_input, host.staging, sizeof(device.convolution_input),
@@ -510,27 +600,29 @@ void convolution_edges(DevicePayload& device, HostPayload& host) {
                               cudaMemcpyHostToDevice), "convolution product/accumulator poison");
         cuda_check(cudaMemset(&device.status, 0, sizeof(device.status)), "convolution status reset");
         kernel_check(gpu::convolution_product(device.convolution_input, device.convolution_base,
-                                             device.convolution_output, 4, stage, offset, &device.status, nullptr),
+                                             device.convolution_output, rows, stage, offset, &device.status, nullptr),
                      "convolution_product");
         cuda_check(cudaMemcpy(host.staging, device.convolution_output, sizeof(device.convolution_output),
                               cudaMemcpyDeviceToHost), "convolution product readback");
         check_status(device, host, "convolution product status", block_index);
-        for (int row = 0; row < gpu::block; ++row)
+        for (int row = 0; row < rows; ++row)
             for (int channel = 0; channel < gpu::hidden; ++channel) {
                 const float shifted = row == 0 ? 0.0f : float(scale * input_rows[size_t(row - 1)]);
                 const float actual = f32_from_bf16(host.staging[row * gpu::hidden + channel]);
                 if (actual != 2.0f * shifted)
                     mismatch("convolution product", block_index, row, channel, actual, 2.0f * shifted);
             }
-        // The first pass has replaced every poisoned element, including row zero.
+        for (size_t i = size_t(rows) * gpu::hidden; i < convolution_elements; ++i)
+            require(host.staging[i] == bf16_from_f32(99.0f), "convolution product touched inactive suffix");
+        // The first pass has replaced every active element, including row zero.
         // The second pass adds only this block's shifted input; no history is supplied.
         kernel_check(gpu::convolution_addcmul(device.convolution_output, device.convolution_dynamic,
-                                             device.convolution_input, 4, stage, offset, &device.status, nullptr),
+                                             device.convolution_input, rows, stage, offset, &device.status, nullptr),
                      "convolution_addcmul");
         cuda_check(cudaMemcpy(host.staging, device.convolution_output, sizeof(device.convolution_output),
                               cudaMemcpyDeviceToHost), "convolution addcmul readback");
         check_status(device, host, "convolution addcmul status", block_index);
-        for (int row = 0; row < gpu::block; ++row)
+        for (int row = 0; row < rows; ++row)
             for (int channel = 0; channel < gpu::hidden; ++channel) {
                 const float shifted = row == 0 ? 0.0f : float(scale * input_rows[size_t(row - 1)]);
                 const float expected = float(2 + (channel / 16) % 3 + 1) * shifted;
@@ -538,16 +630,40 @@ void convolution_edges(DevicePayload& device, HostPayload& host) {
                 if (actual != expected)
                     mismatch("convolution addcmul", block_index, row, channel, actual, expected);
             }
+        for (size_t i = size_t(rows) * gpu::hidden; i < convolution_elements; ++i)
+            require(host.staging[i] == bf16_from_f32(99.0f), "convolution addcmul touched inactive suffix");
         std::printf("PASS convolution/kernel-block-local-two-pass block=%d input-scale=%d stage=1 offset=1 channels=%d status=0\n",
                     block_index, scale, gpu::hidden);
     }
     // This is a real kernel boundary fixture, not whole-DeviceForward request isolation.
 }
 
+// Invalid sampled widths refuse before pointer queries, scratch mutation or kernels.
+// The following existing three-row cases prove that refusal leaves the owner usable.
+void sampled_width_refusal(DeviceSelector& selector, DevicePayload& device) {
+    for (const int rows : {4, gpu::selector_rows}) {
+        Selection output;
+        output.tokens.fill(-314);
+        std::string error;
+        require(!selector.select(rows, device.hidden, device.logits, 2, 0.7f,
+                    {0.1f, 0.2f, 0.3f}, output, nullptr, error),
+                "sampled width beyond the independent uniform count was accepted");
+        require(error == "dflash2 selector: sampled selection supports at most three proposal rows",
+                "sampled width refused for an unrelated reason");
+        require(!selector.poisoned() && std::all_of(output.tokens.begin(), output.tokens.end(),
+                    [](int32_t token) { return token == -314; }),
+                "sampled width refusal mutated output or poisoned a healthy selector");
+        require(gpu::selector_select(rows, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    2, 0.7f, 0.1f, 0.2f, 0.3f, nullptr, nullptr) == int(cudaErrorInvalidValue),
+                "public raw selector did not refuse unsupported sampled width");
+    }
+    std::puts("PASS selector/sampled-width-refusal rows=4,7 independent_uniforms=3 owner_unpoisoned=1");
+}
+
 void select(DeviceSelector& selector, DevicePayload& device, HostPayload& host, float temperature,
             const std::array<float, 3>& uniforms) {
     std::string error;
-    if (!selector.select(3, device.hidden, device.logits, 2, temperature, uniforms, host.selection, nullptr, error))
+    if (!selector.select(selection_rows, device.hidden, device.logits, 2, temperature, uniforms, host.selection, nullptr, error))
         throw std::runtime_error("DeviceSelector.select: " + error);
     require(!selector.poisoned(), "successful selector is unexpectedly poisoned");
     require(host.selection.sampled == (temperature > 0.0f), "selector sampled mode disagrees with temperature");
@@ -557,7 +673,7 @@ void select(DeviceSelector& selector, DevicePayload& device, HostPayload& host, 
 
 void check_tie_selection(HostPayload& host, const std::array<int32_t, 16>& reference,
                          const std::array<int, 3>& chosen_slots) {
-    for (int row = 0; row < gpu::selector_rows; ++row) {
+    for (int row = 0; row < selection_rows; ++row) {
         const int32_t expected_token = reference[size_t(chosen_slots[size_t(row)])];
         if (host.selection.tokens[size_t(row)] != expected_token)
             mismatch("pinned tie token", int(host.selection.sampled), row, 0,
@@ -578,14 +694,14 @@ void check_tie_selection(HostPayload& host, const std::array<int32_t, 16>& refer
 
 void check_conditioned_selection(HostPayload& host) {
     constexpr std::array<int32_t, 3> selected_prefix{1, 0, 1}; // B, A, B, independent of GPU probabilities.
-    for (int row = 0; row < gpu::selector_rows; ++row)
+    for (int row = 0; row < selection_rows; ++row)
         if (host.selection.tokens[size_t(row)] != selected_prefix[size_t(row)])
             mismatch("predecessor-conditioned token", int(host.selection.sampled), row, 0,
                      host.selection.tokens[size_t(row)], selected_prefix[size_t(row)]);
 
     const double denominator = 1.0 + std::exp(-8.0) + 14.0 * std::exp(-25.0);
     const double expected_confidence = 1.0 / denominator;
-    for (int row = 0; row < gpu::selector_rows; ++row) {
+    for (int row = 0; row < selection_rows; ++row) {
         const float confidence = host.selection.confidence[size_t(row)];
         if (!std::isfinite(confidence) || std::abs(double(confidence) - expected_confidence) > probability_absolute_tolerance)
             mismatch("predecessor-conditioned confidence", int(host.selection.sampled), row, 0,
@@ -755,7 +871,9 @@ void run(const Options& options, const std::array<int32_t, 16>& tie_reference, c
     cuda_check(cudaMemset(device.successor, 0, sizeof(device.successor)), "selector successor initialization");
     cuda_check(cudaMemset(device.hidden, 0, sizeof(device.hidden)), "selector hidden initialization");
     attention_edges(device, *host);
+    softmax_active_rows(device, *host);
     convolution_edges(device, *host);
+    sampled_width_refusal(selector, device);
     selector_edges(selector, device, *host, tie_reference);
     conditional_consumer_edges(device, *host, consumer);
     std::string error;

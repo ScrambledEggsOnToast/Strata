@@ -5138,7 +5138,8 @@ int main(int argc, char** argv) {
     strata::core::DraftAllocationPlan dflash_allocation;
     uint64_t dflash_dense_bytes = 0;
     const int dflash_device = split_devs.empty() ? primary_device : split_devs.back();
-    const size_t dflash_head_scratch = strata::kernels::native_q8_1_bytes(int(g.n_embd), 1);
+    const size_t dflash_head_scratch = strata::core::NativeHead::planned_projection_scratch_bytes(
+        int(g.n_embd), strata::core::dflash2::block_size - 1);
     if (!o.dflash2.empty()) {
         std::error_code error;
         dflash_dense_bytes = std::filesystem::file_size(std::filesystem::path(o.dflash2) / "dense.bin", error);
@@ -5466,6 +5467,10 @@ int main(int argc, char** argv) {
         if (const char* pool = std::getenv("STRATA_CKPT_POOL"); pool && std::atoi(pool))
             v0.add_unknown("ckpt_pool_storage",
                            "two complete all-stage checkpoint payloads are retained beyond the priced prompt-cache rows");
+        const uint64_t expert_reuse_trace_host = strata::core::Verifier::planned_expert_reuse_trace_host_bytes();
+        if (expert_reuse_trace_host && (o.batch != 1 || o.batch_groups != 1 || o.pipeline_windows != 0 ||
+                                       o.batch_mtp_pipeline || o.batch_mtp_third))
+            v0.add_unknown("expert_reuse_trace_scope", "diagnostic supports only one slot/group without pipeline copies");
         const bool profile_requested = std::getenv("STRATA_VERIFY_PROFILE") != nullptr || causal_requested;
         const uint64_t profile_bytes = profile_requested ? strata::core::Verifier::planned_profile_bytes(g) : 0;
         const uint64_t causal_host_bytes = causal_requested
@@ -6141,6 +6146,9 @@ int main(int argc, char** argv) {
             ram("resident_slot_draft_pinned", resident.slot_draft.pinned, "requested draft QSA staging and full logical ring backing");
             ram("resident_slot_draft_owner", resident.slot_draft_owner, "draft slot owner envelope, weights and scratch shared");
         }
+        if (expert_reuse_trace_host)
+            ram("expert_reuse_trace_host", byte_mul(stage_count, expert_reuse_trace_host),
+                "one optional pinned histogram page per Verifier; device histogram is counted in its arena");
         if (profile_requested && profile_bytes != UINT64_MAX && o.pipeline_windows == 0 && o.batch == 0)
             ram("verify_profile_host", byte_mul(split_devs.size() + 1, profile_bytes),
                 "one independently allocated Verifier host timestamp array per serial stage; object metadata already counted");

@@ -939,6 +939,11 @@ struct Prefill::Impl {
     int64_t dflash2_next = 0, dflash2_end = 0;
     uint64_t dflash2_staging_bytes = 0;
     std::array<float*, core::dflash2::tap_layers.size()> dflash2_host{}, dflash2_mapped{};
+    // Fixed per arena so an environment change cannot reinterpret an in-flight payload.
+    const bool dflash2_reduced = [] {
+        const char* value = std::getenv("STRATA_DFLASH2_REDUCE_CAPTURE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
     uint32_t* dflash2_on_host = nullptr;
     uint32_t* dflash2_on_mapped = nullptr;
     cudaStream_t cs = nullptr, copy = nullptr;
@@ -1326,8 +1331,12 @@ bool Prefill::arm_dflash2_capture(core::dflash2::CaptureOwner owner, int64_t fro
     // come from this operation's completed device writes, not an older payload.
     if (std::getenv("STRATA_STATE_HASH"))
         for (float* host : m.dflash2_host)
-            if (host) std::fill_n(host, size_t(std::min<int64_t>(count, core::dflash2::context_rows)) *
-                                 core::dflash2::residual_width, std::numeric_limits<float>::quiet_NaN());
+            if (host) {
+                const size_t rows = size_t(std::min<int64_t>(count, core::dflash2::context_rows));
+                if (m.dflash2_reduced)
+                    std::fill_n(reinterpret_cast<uint16_t*>(host), rows * core::dflash2::hidden_size, uint16_t(0x7fc0));
+                else std::fill_n(host, rows * core::dflash2::residual_width, std::numeric_limits<float>::quiet_NaN());
+            }
     return true;
 }
 
@@ -1340,7 +1349,9 @@ bool Prefill::dflash2_tap(core::dflash2::CaptureOwner owner, int tap_layer, core
     }
     for (size_t i = 0; i < core::dflash2::tap_layers.size(); ++i)
         if (tap_layer == core::dflash2::tap_layers[i])
-            return m.dflash2_capture.view(owner, int(i), m.dflash2_host[i], out, err);
+            return m.dflash2_reduced
+                ? m.dflash2_capture.view_reduced(owner, int(i), m.dflash2_host[i], out, err)
+                : m.dflash2_capture.view(owner, int(i), m.dflash2_host[i], out, err);
     err = "dflash2 capture: unknown tap layer"; return false;
 }
 
@@ -6109,6 +6120,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         for (size_t tap = 0; tap < core::dflash2::tap_layers.size(); ++tap)
                             if (l == core::dflash2::tap_layers[tap] && m.dflash2_mapped[tap]) {
                                 const auto capture_begin = capture_timing ? capture_clock() : decltype(capture_clock()){};
+                                #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+                                if (m.dflash2_reduced)
+                                    strata::kernels::tap_reduce_publish(m.R + size_t(part.source_row) * D,
+                                        reinterpret_cast<uint16_t*>(m.dflash2_mapped[tap]) +
+                                            size_t(part.staging_row) * core::dflash2::hidden_size,
+                                        part.count, core::dflash2::hidden_size, m.dflash2_on_mapped, m.cs);
+                                else
+                                #endif
                                 strata::kernels::tap_publish(m.R + size_t(part.source_row) * D,
                                     m.dflash2_mapped[tap] + size_t(part.staging_row) * D,
                                     int64_t(part.count) * D, m.dflash2_on_mapped, m.cs);

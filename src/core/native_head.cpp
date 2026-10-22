@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 #include <climits>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -16,6 +17,19 @@
 namespace {
 using strata::core::conversation_store_detail::sha256;
 using strata::core::conversation_store_detail::sha256_hex;
+bool head_il_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_NATIVE_HEAD_IL");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+bool head_il_shape(int columns) { return head_il_enabled() && columns >= 2 && columns <= 4; }
+size_t head_il_offset(int input, int columns) {
+    const size_t plain = strata::kernels::native_q8_1_bytes(input, columns);
+    return (plain + 255) / 256 * 256;
+}
+
 // Only verified loads stage/hash. Each upload reads the SAME bounded immutable
 // host chunk that entered SHA-256, rather than hashing a mapping then reopening it.
 cudaError_t upload_native(void* destination, const void* source, uint64_t bytes,
@@ -50,6 +64,7 @@ void NativeHead::unload() {
     scratch_ = nullptr;
     weights_ = nullptr;
     identity_ = {};
+    il_reported_.store(false, std::memory_order_relaxed);
 }
 
 bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err,
@@ -127,8 +142,22 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
     }
 }
 
+size_t NativeHead::planned_projection_scratch_bytes(int n_in, int ncols) {
+    if (n_in <= 0) return 0;
+    // This is a capacity query: a seven/eight-row owner also runs smaller
+    // windows. Reserve the largest eligible interleaved prefix, not just the
+    // exact requested width, before device/type eligibility is known.
+    const size_t plain = strata::kernels::native_q8_1_bytes(n_in, ncols);
+    if (head_il_enabled() && ncols >= 2) {
+        const int interleaved_rows = ncols < 4 ? ncols : 4;
+        const size_t interleaved = head_il_offset(n_in, interleaved_rows) +
+            strata::kernels::native_q8_1_il_bytes(n_in, interleaved_rows);
+        return plain > interleaved ? plain : interleaved;
+    }
+    return plain;
+}
 size_t NativeHead::projection_scratch_bytes(int ncols) const {
-    return n_in_ > 0 ? strata::kernels::native_q8_1_bytes(n_in_, ncols) : 0;
+    return planned_projection_scratch_bytes(n_in_, ncols);
 }
 bool NativeHead::run(const float* mixed, float* logits, void* stream, std::string& err) const {
     return run_with_scratch(mixed, logits, scratch_, projection_scratch_bytes(), stream, err);
@@ -145,7 +174,13 @@ bool NativeHead::run_rows_with_scratch(const float* mixed, float* logits, int nc
         return false;
     }
     try {
-        if (type_ == 13) {
+        if (head_il_shape(ncols) && strata::kernels::native_mmvq_il_supported(type_, ncols, n_out_)) {
+            auto* interleaved = static_cast<unsigned char*>(scratch) + head_il_offset(n_in_, ncols);
+            // Exactly the retained q8_1 bytes plus their interleaved copy. Full
+            // vocabulary and quantization remain unchanged.
+            strata::kernels::native_quantize_q8_1_il(mixed, scratch, interleaved, n_in_, ncols, stream);
+            strata::kernels::native_mmvq_il(type_, weights_, scratch, interleaved, logits, n_in_, n_out_, ncols, stream);
+        } else if (type_ == 13) {
             strata::kernels::native_q5_k_f32(weights_, mixed, scratch, logits, n_in_, n_out_, ncols, stream);
         } else {
             strata::kernels::native_quantize_q8_1(mixed, scratch, n_in_, ncols, stream);
@@ -297,6 +332,15 @@ void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, v
 
 void NativeEmbed::gather_one(int64_t token, float* out, void* stream) const {
     strata::kernels::iq_dequant_f32(type_, (const uint8_t*) dev_ + (size_t) token * row_, n_embd_, out, stream);
+}
+
+void NativeHead::report_rows_completed(int ncols) const {
+    const char* trace = std::getenv("STRATA_NATIVE_HEAD_IL_TRACE");
+    if (!trace || std::strcmp(trace, "1") != 0 || !loaded() || !head_il_shape(ncols) ||
+        !strata::kernels::native_mmvq_il_supported(type_, ncols, n_out_)) return;
+    if (!il_reported_.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "native borrowed head IL completed device=%d type=%d rows=%d input=%d vocabulary=%d scratch=%zu full_vocab=1\n",
+                     device_, type_, ncols, n_in_, n_out_, projection_scratch_bytes(ncols));
 }
 
 }  // namespace strata::core

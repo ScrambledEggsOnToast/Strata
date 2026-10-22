@@ -1128,6 +1128,7 @@ Verifier::~Verifier() {
         if (residency_->host) cudaFreeHost(residency_->host);
         delete residency_;
     }
+    if (expert_reuse_counts_h_) cudaFreeHost(expert_reuse_counts_h_);
     if (prof_) cudaFree(prof_);
     delete causal_;
     for (auto& e : exec_)
@@ -1234,7 +1235,14 @@ uint64_t Verifier::layout_arena(const ModelGeometry& g, int64_t context, int64_t
         take(&Verifier::one_, sizeof(int32_t), 4);
         take(&Verifier::hist_snap_, sizeof(float), T * HS);
         take(&Verifier::ple_key_, sizeof(float), T * (uint64_t) strata::kernels::NG_HC_DIM); take(&Verifier::ple_val_, sizeof(float), T * N);
+    if (planned_expert_reuse_trace_host_bytes())
+        take(&Verifier::expert_reuse_counts_, sizeof(uint32_t), 8);
     return b.used;
+}
+
+uint64_t Verifier::planned_expert_reuse_trace_host_bytes() {
+    static const bool enabled = env_on("STRATA_EXPERT_REUSE_TRACE");
+    return enabled ? 4096 : 0; // cudaHostAlloc's pinned page, not merely the 32-byte payload
 }
 
 uint64_t Verifier::planned_device_bytes(const ModelGeometry& g, int64_t context, int64_t vocab, int max_t) {
@@ -1624,6 +1632,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    if (planned_expert_reuse_trace_host_bytes() &&
+        cudaHostAlloc((void**) &expert_reuse_counts_h_, planned_expert_reuse_trace_host_bytes(),
+                      cudaHostAllocDefault) != cudaSuccess) {
+        err = "verify: expert reuse trace host allocation failed"; return false;
+    }
+
     if (bal_ != nullptr) {   // set_pcie_balance: four stamp words per (layer, group)
         if (!mapped((size_t) g.n_layers * 2 * 4 * 8, (void**) &h_bal_, (void**) &m_bal_)) {
             err = "verify: mapped balance stamps allocation failed";
@@ -2738,7 +2752,24 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }();
                 bool rows_ok = batch_rec_ && attn_rows && te - tb <= strata::kernels::kAttnRowsMax;
                 for (int t = tb; rows_ok && t < te; ++t) rows_ok = slot_ss(t).qsa_states[qi].kv_mode != 1;
-                if (rows_ok) {
+                static const bool same_slot_rows = env_on("STRATA_QSA_SAME_SLOT_ROWS");
+                if (qsa_same_slot_rows_eligible(same_slot_rows, batch_rec_, brow_ + tb, n,
+                                               slot_ss(tb).qsa_states[qi].kv_mode != 1)) {
+                    // The cache key includes the complete owner layout, and all rows here read
+                    // one resident pool. Existing nq-aware kernels retain the per-row arithmetic,
+                    // including the pre-SM75 attention route. Appends/commit stay unchanged.
+                    static const bool same_slot_trace = env_on("STRATA_QSA_SAME_SLOT_TRACE");
+                    if (same_slot_trace) trace_qsa_same_slot_selected(l, T);
+                    const QsaState& sx = slot_ss(tb).qsa_states[qi];
+                    qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount,
+                                     n, max_blocks_, s, scores_ + (size_t) tb * max_blocks_, cs);
+                    qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_,
+                                   cap_, s, sel_ + (size_t) tb * cap_, cs);
+                    qsa_decode_attn_batch(qcur_ + tb * NH * HD, qsa_attn_pools(sx), sel_ + (size_t) tb * cap_,
+                                          step_ + tb * kStepCount, cap_, s,
+                                          attn_scratch_ + (size_t) tb * attn_scratch_floats_,
+                                          attn_ + tb * NH * HD, n, cs);
+                } else if (rows_ok) {
                     const int n_rows = te - tb;
                     strata::kernels::QsaScoreRows sr;
                     strata::kernels::QsaAttnPoolsRows pr;
@@ -3053,7 +3084,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const auto& f = lay.fmt[(size_t) l];
                 const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
-                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, dst_buf, cs, gy);
+                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, dst_buf, cs, gy,
+                                      batch_rec_ && ar_on() && n >= 2 && n <= 4 ? expert_reuse_counts_ : nullptr);
             } else {
                 moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, dst_buf, cs);
@@ -4835,6 +4867,36 @@ void Verifier::report_batch_resources(const char* phase) const {
         (unsigned long long) b.history_bytes, b.graph_keys, b.graph_execs);
 }
 
+void Verifier::trace_qsa_same_slot_receipt(bool completed, const char* route) const {
+    std::fprintf(stderr, "strata qsa-same-slot: selected=%d completed=%d verifier=%p device=%d "
+                         "layers=%lld:%lld first_qsa_layer=%lld route=%s "
+                         "key=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                 completed ? 0 : 1, completed ? 1 : 0, static_cast<const void*>(this), device_,
+                 (long long) lb_, (long long) le_, (long long) qsa_trace_layer_, route,
+                 qsa_trace_key_[0], qsa_trace_key_[1], qsa_trace_key_[2], qsa_trace_key_[3],
+                 qsa_trace_key_[4], qsa_trace_key_[5], qsa_trace_key_[6], qsa_trace_key_[7],
+                 qsa_trace_key_[8], qsa_trace_key_[9], qsa_trace_key_[10]);
+}
+
+void Verifier::trace_qsa_same_slot_selected(int64_t layer, int rows) {
+    if (qsa_trace_state_ != QsaTraceState::unseen) return;
+    // Called only inside the selected resident same-owner branch during batch capture.
+    // A later capture failure cannot yield completion: no executable for this key is launched.
+    qsa_trace_key_ = bkey(brow_, rows, row_base_);
+    qsa_trace_layer_ = layer;
+    qsa_trace_state_ = QsaTraceState::selected;
+    trace_qsa_same_slot_receipt(false, "capture");
+}
+
+void Verifier::trace_qsa_same_slot_completed(const int* owners, int rows, int hbase, const char* route) {
+    if (qsa_trace_state_ != QsaTraceState::selected || bkey(owners, rows, hbase) != qsa_trace_key_) return;
+    const auto graph = exec_bm_.find(qsa_trace_key_);
+    if (graph == exec_bm_.end() || !graph->second) return;
+    // Callers have passed their existing compute/copy drains, canaries and finish_dflash2_batch.
+    qsa_trace_state_ = QsaTraceState::completed;
+    trace_qsa_same_slot_receipt(true, route);
+}
+
 bool Verifier::release_batch_graphs(std::string& err) {
     if (!context_idle(err)) return false;
     const OnDevice on_device(device_);
@@ -4844,6 +4906,9 @@ bool Verifier::release_batch_graphs(std::string& err) {
         }
     if (next_ && !next_->release_batch_graphs(err)) return false;
     report_batch_resources("before_graph_release");
+    // Never join an earlier selection to a recaptured/rebound executable with a reused key.
+    // Do not re-arm: diagnostics stay bounded to one selected/completed pair per Verifier.
+    if (qsa_trace_state_ == QsaTraceState::selected) qsa_trace_state_ = QsaTraceState::invalidated;
     for (auto* graphs : {&exec_bm_, &commit_bm_}) {
         for (auto& entry : *graphs) {
             if (entry.second && cudaGraphExecDestroy(entry.second) != cudaSuccess) {
@@ -4906,6 +4971,10 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     if (!reserve_batch_key(bkey(rows, S, hbase), err)) return false;
     cudaGraphExec_t& ex = exec_bm_[bkey(rows, S, hbase)];
     if (ex != nullptr) return true;
+    auto invalidate_qsa_trace = [&] {
+        if (qsa_trace_state_ == QsaTraceState::selected && qsa_trace_key_ == bkey(rows, S, hbase))
+            qsa_trace_state_ = QsaTraceState::invalidated;
+    };
     // A graph is instantiated only through the qualification seam, the batch window included: the key carries the
     // row count and the stage's layer range, so a denying observation scope ("no new graph-cache growth while
     // serving") refuses this capture before the stream capture starts instead of growing the cache behind it.
@@ -4928,14 +4997,16 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok || ce != cudaSuccess) {
+        invalidate_qsa_trace();
         if (graph) cudaGraphDestroy(graph);
         err = !ok ? rerr : std::string("verify: end batch capture: ") + cudaGetErrorString(ce);
         return false;
     }
     const bool instantiated = graph_capture_instantiate(probe, graph, ex, cs_, true, err);
     cudaGraphDestroy(graph);
-    if (!instantiated) return false;
+    if (!instantiated) { invalidate_qsa_trace(); return false; }
     if (!probe.check(GraphCapturePhase::Retained, err)) {
+        invalidate_qsa_trace();
         cudaGraphExecDestroy(ex);
         ex = nullptr;
         return false;
@@ -5249,6 +5320,52 @@ bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolM
     return run_slot_rows(rows, S, tokens, pos, pool, user, out, err);
 }
 
+bool Verifier::begin_expert_reuse_trace(const int* rows, int count, int base, std::string& err) {
+    if (!expert_reuse_counts_) return true;
+    if (expert_reuse_trace_pending_) {
+        err = "verify: previous expert reuse trace window did not complete"; return false;
+    }
+    if (expert_reuse_trace_attempted_ || count < 2 || count > 4) return true;
+    if (base != 0 || slots_.size() != 1 || !ar_on()) {
+        err = "verify: expert reuse trace requires one resident slot and base0"; return false;
+    }
+    for (int i = 0; i < count; ++i) if (rows[i] != 0) {
+        err = "verify: expert reuse trace owner mismatch"; return false;
+    }
+    expert_reuse_trace_attempted_ = true;
+    expert_reuse_trace_pending_ = true; // a failure cannot turn into a later completed receipt
+    expert_reuse_trace_rows_ = count;
+    if (cudaMemsetAsync(expert_reuse_counts_, 0, 8 * sizeof(uint32_t), cs_) != cudaSuccess) {
+        err = "verify: expert reuse trace reset failed"; return false;
+    }
+    return true;
+}
+
+bool Verifier::copy_expert_reuse_trace(std::string& err) {
+    if (!expert_reuse_trace_pending_) return true;
+    // Queued behind the real graph; the existing stream query/drain proves this copy complete.
+    if (cudaMemcpyAsync(expert_reuse_counts_h_, expert_reuse_counts_, 8 * sizeof(uint32_t),
+                        cudaMemcpyDeviceToHost, cs_) != cudaSuccess) {
+        err = "verify: expert reuse trace copy failed"; return false;
+    }
+    return true;
+}
+
+bool Verifier::complete_expert_reuse_trace(const char* route, std::string& err) {
+    if (!expert_reuse_trace_pending_) return true;
+    if (!h_plan_err_ || *(volatile uint32_t*) h_plan_err_) {
+        err = "verify: expert reuse trace has missing or stale resident plan status"; return false;
+    }
+    const uint32_t* c = expert_reuse_counts_h_;
+    std::fprintf(stderr, "EXPERT_REUSE completed=1 scope=Verifier device=%d layers=%lld:%lld "
+        "rows=%d type=21 groups=%u,%u,%u,%u,%u reused_chunks=%u,%u,%u route=%s "
+        "device_payload_bytes=32 host_allocation_bytes=4096\n",
+        device_, (long long) lb_, (long long) le_, expert_reuse_trace_rows_,
+        c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], route);
+    expert_reuse_trace_pending_ = false;
+    return true;
+}
+
 bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool,
                              void* user, int32_t* out, std::string& err) {
     using namespace strata::kernels;
@@ -5257,8 +5374,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     const ModelGeometry& g = *g_;
     ScratchGuard guard{*this, true};
     if (released_.load()) { err = "verify: watchdog released batch before launch"; return false; }
+    if (!begin_expert_reuse_trace(rows, S, 0, err)) return false;
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+    if (!copy_expert_reuse_trace(err)) return false;
     (void) cudaStreamQuery(cs_);
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
@@ -5279,7 +5398,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         }
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
-        cudaStreamSynchronize(copy_);
+        const cudaError_t qsa_copy_drain = cudaStreamSynchronize(copy_);
         if (released_.load()) { err = "verify: batch window released by watchdog"; return false; }        // FORK
         if (!check_canaries(false, err)) return false;                                                   // FORK
         if (prof_on_) collect_profile();
@@ -5288,6 +5407,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             if (next_ && !next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err)) return false;
             if (!scratch_.ready()) { err = "verify: batch ownership was poisoned"; return false; }        // FORK
             if (!finish_dflash2_batch(err)) return false;
+            if (qsa_copy_drain == cudaSuccess) {
+                trace_qsa_same_slot_completed(rows, S, 0, "run_slot_rows");
+                if (!complete_expert_reuse_trace("run_slot_rows", err)) return false;
+            }
             guard.keep = true;                                                                          // FORK
             return true;
         }
@@ -5298,6 +5421,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         progress_beat();
         if (!scratch_.ready()) { err = "verify: batch ownership was poisoned"; return false; }            // FORK
         if (!finish_dflash2_batch(err)) return false;
+        if (qsa_copy_drain == cudaSuccess) {
+            trace_qsa_same_slot_completed(rows, S, 0, "run_slot_rows");
+            if (!complete_expert_reuse_trace("run_slot_rows", err)) return false;
+        }
         guard.keep = true;                                                                              // FORK
         return true;
     }
@@ -5376,6 +5503,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         if (next_ && !next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err)) return false;
         if (!scratch_.ready()) { err = "verify: batch ownership was poisoned"; return false; }
         if (!finish_dflash2_batch(err)) return false;
+        trace_qsa_same_slot_completed(rows, S, 0, "run_slot_rows");
         guard.keep = true;
         return true;
     }
@@ -5386,6 +5514,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     progress_beat();
     if (!scratch_.ready()) { err = "verify: batch ownership was poisoned"; return false; }
     if (!finish_dflash2_batch(err)) return false;
+    trace_qsa_same_slot_completed(rows, S, 0, "run_slot_rows");
     guard.keep = true;
     return true;
 }
@@ -5547,10 +5676,12 @@ bool Verifier::batch_launch(int base, const int* rows, int S, const int32_t* tok
     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
     ScratchGuard guard{*this, true};
     if (released_.load()) { err = "verify: watchdog released batch before launch"; return false; }
+    if (!begin_expert_reuse_trace(rows, S, base, err)) return false;
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
     if (le == cudaSuccess && commit == BatchCommit::eager && !batch_self_commits(rows, S))
         le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+    if (!copy_expert_reuse_trace(err)) return false;
     (void) cudaStreamQuery(cs_);
     b_deferred_ = commit == BatchCommit::deferred;
     b_worker_failed_.store(false, std::memory_order_relaxed);
@@ -5712,6 +5843,8 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         }
     if (!(b_deferred_ ? scratch_.ready() : scratch_.finish_batch())) { err = "verify: batch ownership was poisoned"; return -1; }
     if (!finish_dflash2_batch(err)) return -1;
+    trace_qsa_same_slot_completed(last_rows_, S, row_base_, "batch_poll");
+    if (!complete_expert_reuse_trace("batch_poll", err)) return -1;
     guard.keep = true;
     progress_beat();
     return 1;

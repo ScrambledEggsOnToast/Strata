@@ -2,6 +2,7 @@
 // the system temp directory, fixtures built by hand, and checks that read the module's own observable contract -
 // matches, statuses, leases, epochs and byte counts.  Every check is a consumer-visible behaviour, not an internal.
 #include "strata/core/conversation_store.hpp"
+#include "strata/core/dflash2_bridge.hpp"
 
 #include "strata/core/conversation_reuse.hpp"
 #include "strata/program/conversation_store_admission.hpp"
@@ -602,6 +603,7 @@ void check_layout();
 void check_identity();
 void check_manifest();
 void check_round_trip();
+void check_native_draft_store();
 void check_draft_certification_codec();
 void check_draft_certification_store();
 void check_draft_reader_floor_failures();
@@ -710,6 +712,11 @@ int main() {
         std::printf("conversation_store_test object batch: %d checks, %d failures\n", checks, failures);
         return failures == 0 ? 0 : 1;
     }
+    if (::getenv("STRATA_STORE_NATIVE_DRAFT_ONLY")) {
+        check_native_draft_store();
+        std::printf("conversation_store_test native draft: %d checks, %d failures\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
     if (::getenv("STRATA_STORE_DRAFT_CERTIFICATION_ONLY")) {
         check_draft_certification_codec();
         check_draft_certification_store();
@@ -789,6 +796,7 @@ int main() {
     check_identity();
     check_manifest();
     check_round_trip();
+    check_native_draft_store();
     check_draft_certification_codec();
     check_draft_certification_store();
     check_draft_reader_floor_failures();
@@ -8825,6 +8833,119 @@ conversation_store_detail::ManifestMeta fixture_manifest(
     }
     meta.objects.assign(objects.begin(), objects.end());
     return meta;
+}
+
+// Exercise the real asynchronous writer and reopened reader, including the object
+// identities that pure snapshot/manifest roundtrips do not visit.
+void check_native_draft_store() {
+    using namespace conversation_store_detail;
+    for (int variant = 0; variant < 3; ++variant) {
+        const bool native = variant != 2;
+        const bool split = variant == 1;
+        auto image = native ? (split ? split_fixture(997, 8, 3) : fixture(997, 8))
+                            : certified_fixture(true);
+        auto& owner = split ? image.stage_images.back() : image;
+        size_t main = owner.kv.size() - (native ? 0 : 1);
+        if (native) {
+            image.checkpoints.clear();
+            for (auto& stage : image.stage_images) stage.checkpoints.clear();
+            owner.draft_identity.kind = DraftKind::dflash2;
+            owner.draft_identity.format = 1;
+            owner.draft_identity.weights = bytes_from("native weights");
+            owner.draft_identity.configuration = bytes_from("native configuration");
+            owner.draft_identity.borrowed_target = bytes_from("borrowed target");
+            owner.draft_identity.geometry = dflash2::native_geometry;
+            owner.draft_origin = owner.draft_begin = 0;
+            owner.draft_cells = int64_t(owner.live.ids.size());
+            owner.draft_next_token = -1;
+            for (int layer = 0; layer < 5; ++layer) {
+                ConversationKv kv;
+                kv.format = 0; kv.cells = owner.draft_cells;
+                kv.heads = 8; kv.head_dim = 128; kv.page_size = 1;
+                kv.pooled_rows = kv.idx_dim = 0;
+                const size_t bytes = size_t(kv.cells) * 8 * 128 * sizeof(uint16_t);
+                kv.k.resize(bytes, uint8_t(0x30 + layer));
+                kv.v.resize(bytes, uint8_t(0x50 + layer));
+                owner.kv.push_back(std::move(kv));
+            }
+        }
+        std::string why;
+        ImageLayout layout;
+        if (!image_layout(image, Digest{}, unconstrained_limits(), layout, why)) {
+            check(false, "native/MTP store fixture has a valid certified image layout");
+            continue;
+        }
+        const uint32_t stage = split ? 2 : 0;
+        const size_t layers = native ? 5 : 1;
+        uint64_t draft_bytes = owner.draft_boundary_residual.size();
+        for (size_t layer = 0; layer < layers; ++layer) {
+            const auto& kv = owner.kv[main + layer];
+            draft_bytes += kv.k.size() + kv.v.size() + kv.k_scale.size() + kv.v_scale.size() + kv.pooled.size();
+            for (auto kind : {ConversationStoreStreamKind::kv_k, ConversationStoreStreamKind::kv_v}) {
+                const ConversationStoreStreamId id{stage, uint16_t(kind), 0, uint64_t(main + layer)};
+                std::pair<Digest, uint64_t> identity;
+                check(identity_of(image, id, identity, why), "every certified draft layer has a physical object identity");
+                check_eq(identity.second, (uint64_t{1} << 63) | layer,
+                         "native layers are distinct; the historical MTP layer-zero ordinal is unchanged");
+                check(stream_read_component(id.kind, identity.second) == ConversationStoreReadComponent::draft,
+                      "all five native layer streams are charged to draft progress");
+            }
+        }
+        ConversationStoreReadProgress progress;
+        const auto meta = fixture_manifest(layout);
+        check(restore_progress_totals(meta, manifest_encoded_size(meta), progress, why),
+              "native/MTP restore computes bounded component totals");
+        check_eq(progress.components[size_t(ConversationStoreReadComponent::draft)].total, draft_bytes,
+                 "draft progress includes all layers and preserves MTP residual accounting");
+        if (native) {
+            for (int delta : {-1, 1}) {
+                auto bad = image;
+                auto& bad_owner = split ? bad.stage_images.back() : bad;
+                if (delta < 0) bad_owner.kv.pop_back();
+                else bad_owner.kv.push_back(bad_owner.kv.back());
+                ImageLayout refused;
+                check(!image_layout(bad, Digest{}, unconstrained_limits(), refused, why),
+                      "native four/six-layer captures remain refused");
+            }
+        }
+        TempRoot root;
+        const auto options = options_for(root.path, uint64_t(1) << 30, 0);
+        uint64_t head = 0;
+        {
+            ConversationStore store(options);
+            check(store.enabled(), "native/MTP writer opens the owned temporary store");
+            ConversationStorePublishResult published;
+            const bool settled = publish_and_wait(store, image, 1, 1, published);
+            check(settled && published.status == ConversationStorePublishStatus::stored && published.head_id != 0,
+                  "actual native/MTP writer publishes a durable head instead of refusing K/V object layout");
+            if (!settled || published.status != ConversationStorePublishStatus::stored) {
+                store.close();
+                continue;
+            }
+            head = published.head_id;
+            store.close();
+        }
+        {
+            ConversationStore store(options);
+            check(store.enabled(), "native/MTP reader reopens the durable store");
+            const auto query = query_of(image, 2, 1);
+            const auto matches = store.matches(query.selector, query.tokens, query.images);
+            check(!matches.empty() && matches.front().head_id == head,
+                  "reopened native/MTP lookup identifies the actual published head");
+            store.publish_read_allowance(uint64_t(64) << 20);
+            const bool admitted = store.demand(query, why);
+            check(admitted, "the actual native/MTP demand is admitted");
+            ConversationStoreRead read;
+            const bool ready = admitted && store.wait_ready(2, 1, read, 5000);
+            check(ready && read.status == ConversationStoreReadStatus::ready && read.image &&
+                      images_equal(*read.image, image, why),
+                  "reopened reader verifies object hashes and restores every native layer and identity exactly");
+            read.image.reset();
+            if (admitted) store.release_read(2, 1);
+            check_eq(store.ram_lease_bytes(), 0, "native/MTP read leases retire after release");
+            store.close();
+        }
+    }
 }
 
 void check_draft_certification_codec() {

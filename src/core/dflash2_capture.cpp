@@ -74,7 +74,9 @@ bool CaptureProducer::consume(const TapView& view, std::string& err, const Opera
         require_capture(!poisoned_ && active_ && view.owner == owner_ && view.phase == phase_ &&
                         view.start == start_ && view.count == count_ && view.keep >= 1 && view.keep <= count_ &&
                         (phase_ == CapturePhase::verify || view.keep == count_) &&
-                        view.residuals.size() == size_t(count_) * residual_width,
+                        ((view.reduced.empty() && view.residuals.size() == size_t(count_) * residual_width) ||
+                         (phase_ == CapturePhase::prefill && view.residuals.empty() &&
+                          view.reduced.size() == size_t(count_) * hidden_size)),
                         "stale/uncommitted or mismatched target tap");
         const auto tap = std::find(tap_layers.begin(), tap_layers.end(), view.tap_layer);
         require_capture(tap != tap_layers.end() && !(seen_ & (1u << (tap - tap_layers.begin()))),
@@ -89,7 +91,10 @@ bool CaptureProducer::consume(const TapView& view, std::string& err, const Opera
         require_capture(view.keep == keep_, "stage commit counts disagree");
         store_.capture(operation_, view.tap_layer, view.materialized_layer,
                        {positions_.data(), size_t(keep_)}, view.point,
-                       view.residuals.first(size_t(keep_) * residual_width));
+                       view.residuals.empty() ? std::span<const float>{} :
+                           view.residuals.first(size_t(keep_) * residual_width),
+                       view.reduced.empty() ? std::span<const uint16_t>{} :
+                           view.reduced.first(size_t(keep_) * hidden_size));
         seen_ |= 1u << (tap - tap_layers.begin());
         return true;
     } catch (const std::exception& error) { err = error.what(); abort(); return false; }

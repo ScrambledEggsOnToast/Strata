@@ -7,6 +7,8 @@
 #include <math_constants.h>
 
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 namespace strata::kernels::dflash2 {
 namespace {
@@ -132,6 +134,60 @@ __global__ void merge_top_kernel(SelectorWorkspace* work) {
     for (int slot = 0; slot < selector_candidates; ++slot) {
         work->result.candidates[row][slot] = heap[slot].token;
         work->unary[row][slot] = heap[slot].value;
+    }
+}
+
+// Parallel distinct-value fast path. Ties still require the full reference
+// replay below: arbitrary tie choices inside the shortlist are not published.
+__global__ void merge_top_parallel_kernel(SelectorWorkspace* work) {
+    constexpr int items = (selector_tiles * selector_tile_keep + tile_threads - 1) / tile_threads;
+    const int row = int(blockIdx.x), t = int(threadIdx.x), lane = t & 31, warp = t >> 5;
+    __shared__ int32_t stage_status;
+    __shared__ SelectorCandidate warp_best[tile_threads / 32];
+    __shared__ SelectorCandidate chosen;
+    __shared__ float previous;
+    if (t == 0) {
+        stage_status = work->result.status;
+        work->replay[row] = 0;
+        previous = CUDART_INF_F;
+    }
+    __syncthreads();
+    if (stage_status != 0) return;
+    SelectorCandidate values[items];
+    #pragma unroll
+    for (int j = 0; j < items; ++j) {
+        const int i = j * tile_threads + t;
+        values[j] = i < selector_tiles * selector_tile_keep
+            ? work->tiles[row][i / selector_tile_keep][i % selector_tile_keep]
+            : SelectorCandidate{-CUDART_INF_F, -1};
+    }
+    for (int slot = 0; slot < selector_tile_keep; ++slot) {
+        SelectorCandidate best{-CUDART_INF_F, -1};
+        #pragma unroll
+        for (int j = 0; j < items; ++j)
+            if (values[j].value > best.value) best = values[j];
+        best = warp_max(best);
+        if (lane == 0) warp_best[warp] = best;
+        __syncthreads();
+        if (warp == 0) {
+            best = lane < tile_threads / 32 ? warp_best[lane] : SelectorCandidate{-CUDART_INF_F, -1};
+            best = warp_max(best);
+            if (lane == 0) {
+                chosen = best;
+                if (slot && previous == best.value) work->replay[row] = 1;
+                previous = best.value;
+                if (slot < selector_candidates) {
+                    work->result.candidates[row][slot] = best.token;
+                    work->unary[row][slot] = best.value;
+                }
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int j = 0; j < items; ++j)
+            if (values[j].token == chosen.token) values[j].value = -CUDART_INF_F;
+        // Every thread must finish reading chosen before the next owner writes it.
+        __syncthreads();
     }
 }
 
@@ -278,7 +334,8 @@ int selector_select(int rows, const uint16_t* hidden, const float* logits, const
                     const uint16_t* predecessor_codebook, const uint16_t* successor_codebook,
                     int32_t anchor, float temperature, float uniform0, float uniform1, float uniform2,
                     SelectorWorkspace* workspace, void* stream) {
-    if (rows < 1 || rows > selector_rows) return int(cudaErrorInvalidValue);
+    if (rows < 1 || rows > selector_rows ||
+        (temperature > 0.0f && rows > selector_sampled_rows)) return int(cudaErrorInvalidValue);
     const auto cuda_stream = static_cast<cudaStream_t>(stream);
     cudaError_t status = cudaMemsetAsync(&workspace->result, 0, sizeof(SelectorResult), cuda_stream);
     if (status != cudaSuccess) return int(status);
@@ -288,7 +345,14 @@ int selector_select(int rows, const uint16_t* hidden, const float* logits, const
     tile_top_kernel<<<dim3(selector_tiles, rows), tile_threads, 0, cuda_stream>>>(logits, workspace);
     status = cudaGetLastError();
     if (status != cudaSuccess) return int(status);
-    merge_top_kernel<<<rows, 32, 0, cuda_stream>>>(workspace);
+    static const bool parallel_merge = [] {
+        const char* value = std::getenv("STRATA_DFLASH2_PARALLEL_SELECTOR");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (parallel_merge)
+        merge_top_parallel_kernel<<<rows, tile_threads, 0, cuda_stream>>>(workspace);
+    else
+        merge_top_kernel<<<rows, 32, 0, cuda_stream>>>(workspace);
     status = cudaGetLastError();
     if (status != cudaSuccess) return int(status);
     replay_ties_kernel<<<rows, 32, 0, cuda_stream>>>(logits, workspace);

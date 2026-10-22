@@ -71,10 +71,12 @@ void iq_xmx_grouped(int ty, const uint8_t* const* a, const uint8_t* const* b, co
 /// `grid_groups` (1 .. cap_groups; 0 = cap_groups) groups run side by side, a block row each striding over the rest:
 /// a call that usually has few groups or none (the verify window's PCIe share) launches less for the ones it does
 /// not have.  The results do not depend on it.
+/// Optional diagnostic_counts: eight zeroed uint32 bins, only the selected SM70 IQ3_S reuse path writes them.
+/// Bins: group sizes1/2/3/4/>4, then reused chunks2/3/4. Null adds no writes or allocations.
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                           int64_t grid_groups = 0);
+                           int64_t grid_groups = 0, uint32_t* diagnostic_counts = nullptr);
 /// true: `native_expert_grouped`'s launches before the group stride (STRATA_GROUPED_V1=1 at startup) - a block row
 /// per possible group, SwiGLU and the q8_1 quantization as two kernels over all cap_entries.  Bitwise the same results
 /// (native_grouped_parity checks it); kept for A/B timing.  Set before graph capture; captured graphs keep theirs.

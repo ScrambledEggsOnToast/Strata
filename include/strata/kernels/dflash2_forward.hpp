@@ -67,15 +67,40 @@ int store_context(const uint16_t* keys, const uint16_t* values, uint16_t* ring,
                    int layer, int first_position, int rows,
                    uint32_t* status, void* stream);
 
-// Explicit abs(query_position-key_position)<2048, including ALL four block
-// keys, not a causal block mask. Scores/probabilities are [32,4,context+4].
+// Explicit abs(query_position-key_position)<2048, including ALL active block
+// keys, not a causal block mask. Scores/probabilities are [32,rows,context+rows].
 // The pinned torch MATH path widens BF16 Q/K/V, scales Q and K separately by
 // sqrt(128**-0.5), and keeps scores, softmax and PV accumulation in FP32.
+// Frozen opt-in; exact grouped-K reuse on the exercised SM70 owner. No scratch.
+bool attention_grouped_scores_enabled() noexcept;
 int attention_scores(const uint16_t* query, const uint16_t* block_keys,
                       const uint16_t* ring, float* scores, int layer,
                       int context_begin, int frontier, int rows, uint32_t* status, void* stream);
 int attention_softmax(const float* scores, float* probabilities, float* statistics,
-                      int keys, uint32_t* status, void* stream);
+                      int rows, int keys, uint32_t* status, void* stream);
+// Experimental, frozen before planning. Reduction-order variant only on SM70,
+// context >=1024; other contexts/off mode keep attention_values unchanged.
+bool attention_value_split_enabled() noexcept;
+const char* attention_value_split_identity() noexcept;
+inline constexpr int attention_value_split_chunk = 128;
+inline constexpr int attention_value_split_min_context = 1024;
+inline constexpr int attention_value_split_max_chunks = (max_keys + 127) / 128;
+inline constexpr size_t attention_value_split_partial_count = size_t(query_heads) * block * attention_value_split_max_chunks * head_dim;
+inline constexpr size_t attention_value_split_flag_count = size_t(kv_heads) * block * attention_value_split_max_chunks * head_dim;
+inline constexpr size_t attention_value_split_bytes = attention_value_split_partial_count * sizeof(float) + attention_value_split_flag_count;
+static_assert(attention_value_split_bytes == 2367488);
+struct AttentionValueWorkspace {
+    float* partial = nullptr;
+    uint8_t* unsafe = nullptr;
+    size_t partial_count = 0, flag_count = 0;
+};
+// Enqueues only; caller owns non-overlapping scratch and serializes its lifetime.
+// Invalid active-path capacities refuse before either split kernel is submitted.
+int attention_values_planned(const float* probabilities, const uint16_t* block_values,
+                     const uint16_t* ring, uint16_t* output, int layer,
+                     int context_begin, int frontier, int rows, uint32_t* status,
+                     void* stream, const AttentionValueWorkspace& workspace);
+
 int attention_values(const float* probabilities, const uint16_t* block_values,
                      const uint16_t* ring, uint16_t* output, int layer,
                      int context_begin, int frontier, int rows, uint32_t* status, void* stream);

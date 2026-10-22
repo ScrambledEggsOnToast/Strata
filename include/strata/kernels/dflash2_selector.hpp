@@ -7,6 +7,9 @@
 namespace strata::kernels::dflash2 {
 
 inline constexpr int selector_rows = 7;
+// The public selector receives exactly three independent uniforms. Reusing the
+// last draw at later positions would invalidate exported conditional q.
+inline constexpr int selector_sampled_rows = 3;
 inline constexpr int selector_hidden = 2560;
 inline constexpr int selector_vocabulary = 248320;
 inline constexpr int selector_rank = 256;

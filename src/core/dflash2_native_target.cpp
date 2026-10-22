@@ -65,8 +65,8 @@ NativeTargetDeviceIo::NativeTargetDeviceIo(int embedding_device, int head_device
     {
         DeviceScope device(embedding_device);
         cuda_require(cudaStreamCreateWithFlags(&state->embedding_stream, cudaStreamNonBlocking), "embedding stream");
-        cuda_require(cudaMalloc(reinterpret_cast<void**>(&state->tokens), block_size * sizeof(int32_t)), "embedding tokens");
-        cuda_require(cudaMalloc(reinterpret_cast<void**>(&state->embedding), block_size * hidden_size * sizeof(float)),
+        cuda_require(cudaMalloc(reinterpret_cast<void**>(&state->tokens), reference_block_size * sizeof(int32_t)), "embedding tokens");
+        cuda_require(cudaMalloc(reinterpret_cast<void**>(&state->embedding), reference_block_size * hidden_size * sizeof(float)),
                      "embedding output");
     }
     {
@@ -80,13 +80,13 @@ NativeTargetDeviceIo::NativeTargetDeviceIo(int embedding_device, int head_device
 }
 NativeTargetDeviceIo::~NativeTargetDeviceIo() = default;
 void NativeTargetDeviceIo::begin_embeddings(std::span<const int32_t> ids) {
-    if (ids.size() != block_size) throw Refusal("native target embedding input shape");
+    if (ids.size() != reference_block_size) throw Refusal("native target embedding input shape");
     impl_->begin(impl_->embedding_device);
     cuda_require(cudaMemcpyAsync(impl_->tokens, ids.data(), ids.size_bytes(), cudaMemcpyHostToDevice,
                                  impl_->embedding_stream), "embedding token upload");
 }
 void NativeTargetDeviceIo::finish_embeddings(std::span<float> out) {
-    if (out.size() != block_size * hidden_size) throw Refusal("native target embedding output shape");
+    if (out.size() != reference_block_size * hidden_size) throw Refusal("native target embedding output shape");
     cuda_require(cudaPeekAtLastError(), "embedding gather launch");
     cuda_require(cudaMemcpyAsync(out.data(), impl_->embedding, out.size_bytes(), cudaMemcpyDeviceToHost,
                                  impl_->embedding_stream), "embedding readback");

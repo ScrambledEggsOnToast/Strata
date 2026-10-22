@@ -19,6 +19,7 @@
 #include "ggml-common.h"
 
 #include <cstdio>
+#include <cstring>
 #include <utility>
 #include <cstdlib>
 #include <type_traits>
@@ -4160,6 +4161,8 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
     }
 }
 
+#include "expert_reuse.cuh"
+
 int g_exp_mode = -1;   // native_expert_set_mode (the bench); -1 = STRATA_EXP_MODE, else the card's default
 int exp_mode() {
     static const int m = [] { const char* v = std::getenv("STRATA_EXP_MODE"); return v ? std::atoi(v) : -1; }();
@@ -4197,6 +4200,28 @@ int exp_mode() {
     return per_dev[dev] - 1;
 #endif
 }
+#endif
+#if STRATA_EXP_LAYOUTS && !defined(__HIPCC__)
+namespace {
+constexpr bool expert_reuse_arch(int major, int minor) { return major == 7 && minor == 0; }
+bool expert_reuse_sm70() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_EXPERT_REUSE");
+        return v && std::strcmp(v, "1") == 0;
+    }();
+    if (!enabled) return false;
+    static thread_local int per_device[64]{}; // 0 unknown, 1 retained, 2 qualified SM70
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64) return false;
+    if (!per_device[device]) {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) return false;
+        per_device[device] = expert_reuse_arch(major, minor) ? 2 : 1;
+    }
+    return per_device[device] == 2;
+}
+} // namespace
 #endif
 int g_exp_phase = 0;   // the bench: 0 all, 1 gate/up + swiglu + quantize only, 2 down only
 #if STRATA_EXP_LAYOUTS && !defined(__HIPCC__)
@@ -4262,7 +4287,7 @@ bool native_expert_expdec_takes(const NativeExpertLayout& L, bool& gu, bool& dow
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                           int64_t grid_groups) {
+                           int64_t grid_groups, uint32_t* diagnostic_counts) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
     if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); std::exit(1); }
     cudaStream_t s = (cudaStream_t) stream;
@@ -4350,7 +4375,17 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         switch (L.gu_type) {
             case 16: native_gu_fused_kernel<16><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 18: native_gu_fused_kernel<18><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
-            case 21: native_gu_fused_kernel<21><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 21:
+#if !defined(__HIPCC__)
+                if (expert_reuse_sm70()) {
+                    if (diagnostic_counts)
+                        native_gu_reuse_kernel<21, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq, diagnostic_counts);
+                    else
+                        native_gu_reuse_kernel<21, false><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq, nullptr);
+                } else
+#endif
+                    native_gu_fused_kernel<21><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq);
+                break;
             case 23: native_gu_fused_kernel<23><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             default: native_gu_fused_kernel<22><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
         }

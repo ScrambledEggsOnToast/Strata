@@ -2,6 +2,7 @@
 #include "strata/core/dflash2_forward.hpp"
 #include "strata/core/dflash2_selector.hpp"
 #include "strata/core/dflash2_weights.hpp"
+#include "strata/kernels/dflash2_context_blas.hpp"
 #include "strata/kernels/dflash2_forward.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "conversation_store_sha256.hpp"
@@ -10,6 +11,8 @@
 #include <charconv>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 
 namespace strata::core::dflash2 {
@@ -148,11 +151,13 @@ DflashNativeDrafter::DflashNativeDrafter(const RuntimeWeights& weights, Verified
     auto state = std::make_unique<Impl>(weights, std::move(verified), embedding, head, device);
     device_ = device; window_ = context_rows;
     identity_.kind = DraftKind::dflash2; identity_.format = 1;
-    identity_.geometry = {5, hidden_size, 8, 128, context_rows, block_size, max_position, 16};
+    identity_.geometry = native_geometry;
     require(conversation_store_detail::sha256_hex_parse(weights.manifest_sha256(), identity_.weights),
             "dflash2 runtime manifest digest is not canonical SHA256");
-    static constexpr char configuration[] = "dflash2:07ebd93db9f472af339b644bb70221ad8428328a:bf16:5:2560:7680:32x128:8x128:2047:block4:rope10000:rms1e-6:conv2g16:selector256top16";
-    identity_.configuration = conversation_store_detail::sha256(configuration, sizeof(configuration) - 1);
+    static constexpr char configuration[] = "dflash2:07ebd93db9f472af339b644bb70221ad8428328a:bf16:5:2560:7680:32x128:8x128:2047:block8:rope10000:rms1e-6:conv2g16:selector256top16";
+    const std::string mode_configuration = (kernels::dflash2::context_blas_enabled() || kernels::dflash2::attention_value_split_enabled())
+        ? std::string(configuration) + ":" + DeviceForward::numerical_mode() : std::string(configuration);
+    identity_.configuration = conversation_store_detail::sha256(mode_configuration.data(), mode_configuration.size());
     conversation_store_detail::Sha256 target;
     for (const auto* digest : {&weights.target_identity().pack_sha256, &weights.target_identity().embedding_sha256,
                               &weights.target_identity().head_sha256, &weights.target_identity().tokenizer_sha256}) {
@@ -162,6 +167,7 @@ DflashNativeDrafter::DflashNativeDrafter(const RuntimeWeights& weights, Verified
     identity_.borrowed_target = target.digest(); identity_.load_generation = state->verified.binding().load_generation;
     state->import_metadata.manifest_sha256 = weights.manifest_sha256();
     state->import_metadata.target = weights.target_identity();
+    state->import_metadata.projection_mode = DeviceForward::numerical_mode();
     {
         const OnDevice on(device);
         cuda_require(cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking), "dflash2 operation stream");
@@ -226,6 +232,10 @@ DraftAllocationPlan DflashNativeDrafter::planned_allocation(int device, size_t d
     if (head_device == device) plan.shared_device += head_three_row_bytes + head_scratch_bytes;
     plan.shared_host = DeviceSelector::pinned_bytes() + kOperationCanaryHostBytes + max_feature_bytes +
                        sizeof(DflashNativeDrafter) + sizeof(Impl) + 65536;
+    if (kernels::dflash2::context_blas_enabled()) {
+        plan.shared_device += kernels::dflash2::ContextBlas::device_budget;
+        plan.shared_host += kernels::dflash2::ContextBlas::host_budget;
+    }
     plan.owner_device = DeviceForward::context_bytes();
     // Include conservative opaque numerical/metadata-control admission allowances,
     // in addition to the exact payloads and three reserved request-id strings.
@@ -333,13 +343,34 @@ bool DflashNativeDrafter::prepare_slot(int slot, uint64_t request_id, int64_t pr
     if (reset) {
         if (!reset_owner(slot, expected, 0, error)) return false;
     } else {
+        const auto prior_coverage = slot_coverage(slot);
+        const auto prior_capture_owner = request->producer.owner();
         Operation operation(*this, error, slot, nullptr, 0, int32_t(cells), &expected);
         if (!operation || !impl_->forward->rewind(*request->context, int(cells), error)) return false;
         operation.writes(request->context->begin(), cells, -1);
         if (!operation.finish(error)) return false;
+        const bool new_capture_owner = expected.incarnation > prior_capture_owner.incarnation;
         if (!request->producer.resume(expected.request, expected.incarnation, request->context->origin(),
                                        int(cells), error)) return false;
+        // Capture generations restart only when resume accepts a newer owner.
+        // Keep the consumed-generation floor on a same-incarnation rewind.
+        if (new_capture_owner) request->last_capture = 0;
         request->uniforms_valid = false;
+        // Report only a completed retained certificate handoff, never a copy or
+        // a same-seat inference. These are the existing capture diagnostic flags.
+        if (new_capture_owner && prior_coverage.present && prior_coverage.owner.seat == slot &&
+            prior_coverage.owner.request == prior_capture_owner.request &&
+            prior_coverage.owner.incarnation == prior_capture_owner.incarnation &&
+            prior_coverage.certified_begin <= request->context->begin() &&
+            prior_coverage.certified_end >= cells &&
+            (std::getenv("STRATA_STATE_HASH") || std::getenv("DFLASH2_CAPTURE_DIR"))) {
+            std::fprintf(stderr, "DFLASH2_RETAINED_HANDOFF prior_request=%llu prior_incarnation=%llu "
+                "request=%llu incarnation=%llu slot=%d origin=%d begin=%d end=%d frontier=%lld\n",
+                (unsigned long long)prior_coverage.owner.request,
+                (unsigned long long)prior_coverage.owner.incarnation,
+                (unsigned long long)expected.request, (unsigned long long)expected.incarnation, slot,
+                request->context->origin(), request->context->begin(), request->context->end(), (long long)cells);
+        }
     }
     request->state.prompt_len = prompt_length;
     if (slot == 8) prompt_len_ = prompt_length;
@@ -440,6 +471,8 @@ bool DflashNativeDrafter::proposal_preflight(int slot, const float*, int32_t anc
     const auto coverage = slot_coverage(slot);
     const auto& sampling = sampling_[size_t(slot)];
     const bool sampled = !sampling.greedy && sampling.temperature > 0;
+    if (sampled && draft_positions() > kernels::dflash2::selector_sampled_rows)
+        return refuse(error, "sampled proposals support at most three independently drawn rows");
     if (!request || !coverage.present || !coverage.coherent || cell < 0 ||
         cell + 1 != request->context->end() || cell + 1 > max_position - block_size ||
         anchor < 0 || anchor >= vocabulary_size || !std::isfinite(sampling.temperature) ||
@@ -500,6 +533,7 @@ bool DflashNativeDrafter::propose_impl(Operation& operation, const float*, int32
             if (!impl_->head.run_rows_with_scratch(impl_->head_float, logits, rows,
                     impl_->head_scratch, impl_->head_scratch_bytes, impl_->head_stream, error)) return false;
             cuda_require(cudaStreamSynchronize(impl_->head_stream), "native draft head completion");
+            impl_->head.report_rows_completed(rows);
         }
         if (impl_->head.device() != device_) {
             cuda_require(cudaMemcpyPeerAsync(impl_->logits, device_, impl_->head_logits, impl_->head.device(),

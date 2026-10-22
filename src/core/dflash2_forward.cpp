@@ -1,12 +1,15 @@
 #include "strata/core/dflash2_forward.hpp"
 #include "strata/core/conversation_buffer.hpp"
 #include "strata/kernels/dflash2_forward.hpp"
+#include "strata/kernels/dflash2_context_blas.hpp"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <exception>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <stdexcept>
 #include <utility>
@@ -67,6 +70,7 @@ struct Scratch {
     uint16_t *attention = nullptr, *gate = nullptr, *up = nullptr, *cosine = nullptr, *sine = nullptr;
     float *scores = nullptr, *probabilities = nullptr, *statistics = nullptr, *inverse = nullptr;
     uint32_t* status = nullptr;
+    gpu::AttentionValueWorkspace value_workspace;
     size_t bytes = 0;
 };
 struct Arena {
@@ -103,6 +107,12 @@ Scratch scratch_layout(void* allocation) {
     s.statistics = a.take<float>(size_t(context_rows) * gpu::kv_heads * 2);
     s.inverse = a.take<float>(64);
     s.status = a.take<uint32_t>(1);
+    if (gpu::attention_value_split_enabled()) {
+        s.value_workspace.partial = a.take<float>(gpu::attention_value_split_partial_count);
+        s.value_workspace.unsafe = a.take<uint8_t>(gpu::attention_value_split_flag_count);
+        s.value_workspace.partial_count = gpu::attention_value_split_partial_count;
+        s.value_workspace.flag_count = gpu::attention_value_split_flag_count;
+    }
     s.bytes = a.used;
     return s;
 }
@@ -121,8 +131,8 @@ bool metadata_range(const ContextSnapshotMetadata& m, std::string& error) {
     return true;
 }
 bool identity_matches(const ContextSnapshotMetadata& m, const std::string& digest,
-                       const TargetIdentity& target, std::string& error) {
-    return (m.manifest_sha256 == digest && m.target == target) ||
+                       const TargetIdentity& target, const std::string& mode, std::string& error) {
+    return (m.manifest_sha256 == digest && m.target == target && m.projection_mode == mode) ||
         refuse(error, "snapshot immutable runtime/borrowed-target identity mismatch");
 }
 bool legal_request(std::string_view id) {
@@ -157,6 +167,8 @@ struct Execution {
     void* stream;
     std::string& error;
     ForwardTraceSink* trace = nullptr;
+    bool split_value_submitted = false;
+    bool grouped_score_submitted = false;
     void must(int status, const char* operation) {
         if (status == int(cudaSuccess)) return;
         error = "dflash2 forward: "; error += operation; error += ": ";
@@ -204,9 +216,9 @@ struct DeviceContextSnapshot::Impl {
     ContextSnapshotMetadata metadata;
     std::unique_ptr<uint16_t[]> storage;
     bool valid = false;
-    Impl(const std::string& digest, const TargetIdentity& target)
+    Impl(const std::string& digest, const TargetIdentity& target, const std::string& mode)
         : storage(std::make_unique_for_overwrite<uint16_t[]>(gpu::kv_elements)) {
-        metadata.manifest_sha256 = digest; metadata.target = target;
+        metadata.manifest_sha256 = digest; metadata.target = target; metadata.projection_mode = mode;
     }
 };
 struct DeviceForward::Impl {
@@ -223,6 +235,12 @@ struct DeviceForward::Impl {
     std::string manifest;
     TargetIdentity target_identity;
     DeviceAllocation weights, scratch;
+    std::unique_ptr<gpu::ContextBlas> context_blas;
+    const std::string projection_mode = DeviceForward::numerical_mode();
+    const bool value_trace = [] { const char* v = std::getenv("STRATA_DFLASH2_VALUE_SPLIT_TRACE"); return v && std::strcmp(v, "1") == 0; }();
+    bool value_reported = false;
+    const bool grouped_score_trace = [] { const char* v = std::getenv("STRATA_DFLASH2_SCORE_GROUPED_TRACE"); return v && std::strcmp(v, "1") == 0; }();
+    bool grouped_score_reported = false;
     Scratch s;
     std::array<Layer, gpu::layers> layer{};
     std::array<Entry, 81> entries;
@@ -238,6 +256,12 @@ struct DeviceForward::Impl {
         cudaDeviceProp properties{};
         checked(cudaGetDeviceProperties(&properties, device), "read device capability");
         if (properties.major < 7) throw Refusal("dflash2 forward: requires CUDA SM70 or later");
+        if (gpu::attention_value_split_enabled() && (properties.major != 7 || properties.minor != 0))
+            throw Refusal("dflash2 split value mode requires exercised CUDA SM70");
+        if (gpu::attention_grouped_scores_enabled() &&
+            !((properties.major == 7 && properties.minor == 0) || (properties.major == 8 && properties.minor == 6)))
+            throw Refusal("dflash2 grouped scores require CUDA SM70 or SM86");
+        if (gpu::context_blas_enabled()) context_blas = std::make_unique<gpu::ContextBlas>(device);
         weights.allocate(weight_bytes, device);
         scratch.allocate(DeviceForward::scratch_bytes(), device);
         s = scratch_layout(scratch.pointer);
@@ -347,11 +371,17 @@ struct DeviceForward::Impl {
         e.must(gpu::linear_bf16(input, weight, output, rows, ni, no, e.stream, s.status), name);
         e.emit(name, index, output, ForwardTrace::Type::bf16, {rows, no}, position);
     }
+    void project_context(Execution& e, const char* name, int index, const uint16_t* input,
+                         const uint16_t* weight, uint16_t* output, int rows, int ni, int no, int position) const {
+        if (!context_blas || rows < 128) { project(e, name, index, input, weight, output, rows, ni, no, position); return; }
+        if (!context_blas->project(input, weight, output, rows, ni, no, s.status, e.stream, e.error)) throw SubmittedFailure{};
+        e.emit(name, index, output, ForwardTrace::Type::bf16, {rows, no}, position);
+    }
     void context_layer(Execution& e, DeviceContext::Impl& c, const FeatureView& f, int index) const {
         if (!f.count) return;
         const auto& l = layer[size_t(index)];
-        project(e, "context.k_proj", index, s.target, l.k, s.context_k, f.count, hidden_size, gpu::kv_width, f.start);
-        project(e, "context.v_proj", index, s.target, l.v, s.context_v, f.count, hidden_size, gpu::kv_width, f.start);
+        project_context(e, "context.k_proj", index, s.target, l.k, s.context_k, f.count, hidden_size, gpu::kv_width, f.start);
+        project_context(e, "context.v_proj", index, s.target, l.v, s.context_v, f.count, hidden_size, gpu::kv_width, f.start);
         normalize(e, "context.k_norm.normalized", "context.k_norm.weighted", index,
                   s.context_k, s.context_k, l.k_norm, f.count * gpu::kv_heads, gpu::head_dim, f.start);
         e.must(gpu::rotary_bf16(s.context_k, s.cosine, s.sine, f.count, gpu::kv_heads, s.status, e.stream), "context RoPE");
@@ -397,11 +427,13 @@ struct DeviceForward::Impl {
         e.emit("block.k_rope", index, s.block_k, ForwardTrace::Type::bf16, {block, gpu::kv_heads, gpu::head_dim}, frontier);
         const int keys = frontier - begin + block;
         e.must(gpu::attention_scores(s.query, s.block_k, c.ring(), s.scores, index, begin, frontier, block, s.status, e.stream), "absolute-window attention scores");
+        e.grouped_score_submitted |= gpu::attention_grouped_scores_enabled();
         e.emit("attention.scaled_masked_scores", index, s.scores, ForwardTrace::Type::fp32, {gpu::query_heads, block, keys}, begin);
-        e.must(gpu::attention_softmax(s.scores, s.probabilities, s.statistics, keys, s.status, e.stream), "FP32 attention softmax");
+        e.must(gpu::attention_softmax(s.scores, s.probabilities, s.statistics, block, keys, s.status, e.stream), "FP32 attention softmax");
         e.emit("attention.softmax", index, s.probabilities, ForwardTrace::Type::fp32, {gpu::query_heads, block, keys}, begin);
         e.emit("attention.max_and_sum", index, s.statistics, ForwardTrace::Type::fp32, {gpu::query_heads, block, 2}, frontier);
-        e.must(gpu::attention_values(s.probabilities, s.block_v, c.ring(), s.attention, index, begin, frontier, block, s.status, e.stream), "FP32 attention value product");
+        e.must(gpu::attention_values_planned(s.probabilities, s.block_v, c.ring(), s.attention, index, begin, frontier, block, s.status, e.stream, s.value_workspace), "FP32 attention value product");
+        e.split_value_submitted |= gpu::attention_value_split_enabled() && frontier - begin >= gpu::attention_value_split_min_context;
         e.emit("attention.value_product", index, s.attention, ForwardTrace::Type::bf16, {block, gpu::query_width}, frontier);
         project(e, "attention.o_proj", index, s.attention, l.o, s.normalized, block, gpu::query_width, hidden_size, frontier);
         convolve(e, s.normalized, l.attention_base, true, 1, index, frontier, block);
@@ -457,7 +489,7 @@ struct DeviceForward::Impl {
             if (features.count) {
                 e.must(gpu::finite_bf16(s.features, uploaded, s.status, stream), "validate committed feature finiteness");
                 e.emit("context.features", -1, s.features, ForwardTrace::Type::bf16, {features.count, feature_width}, features.start);
-                project(e, "context.fc", -1, s.features, fc, s.target, features.count, feature_width, hidden_size, features.start);
+                project_context(e, "context.fc", -1, s.features, fc, s.target, features.count, feature_width, hidden_size, features.start);
                 normalize(e, "hidden_norm.normalized", "hidden_norm.weighted", -1,
                           s.target, s.target, hidden_norm, features.count, hidden_size, features.start);
             }
@@ -480,7 +512,7 @@ struct DeviceForward::Impl {
             }
             if (proposal) {
                 normalize(e, "norm.normalized", "norm.weighted", -1, s.hidden, s.hidden,
-                          final_norm, block_size, hidden_size, frontier);
+                          final_norm, proposal_rows, hidden_size, frontier);
                 e.must(cudaMemcpyAsync(output, s.hidden, size_t(proposal_rows) * hidden_size * sizeof(uint16_t), cudaMemcpyDeviceToDevice,
                                        static_cast<cudaStream_t>(stream)), "publish four normalized BF16 hidden rows");
             }
@@ -488,7 +520,19 @@ struct DeviceForward::Impl {
                                    static_cast<cudaStream_t>(stream)), "read numerical failure flag");
             e.must(cudaStreamSynchronize(static_cast<cudaStream_t>(stream)), "complete all five layers and trace readbacks");
             if (numeric) { error = "dflash2 forward: nonfinite BF16/FP32 operation poisoned context and scratch"; throw SubmittedFailure{}; }
+            if (context_blas) context_blas->report_completed();
             publish(c, features, begin, frontier);
+            if (e.split_value_submitted && value_trace && !value_reported) {
+                std::fprintf(stderr, "DFLASH2_VALUE_SPLIT completed=1 scope=DeviceForward device=%d rows=%d context=%d chunk=%d workspace=%zu mode=%s\n",
+                    device, proposal_rows, frontier - begin, gpu::attention_value_split_chunk,
+                    gpu::attention_value_split_bytes, projection_mode.c_str());
+                value_reported = true;
+            }
+            if (e.grouped_score_submitted && grouped_score_trace && !grouped_score_reported) {
+                std::fprintf(stderr, "DFLASH2_GROUPED_SCORE completed=1 scope=DeviceForward device=%d rows=%d context=%d heads_per_kv=4 workspace=0\n",
+                    device, proposal_rows, frontier - begin);
+                grouped_score_reported = true;
+            }
             guard.complete(); error.clear(); return true;
         } catch (const SubmittedFailure&) {
             e.drain_or_terminate(device);
@@ -504,7 +548,7 @@ struct DeviceForward::Impl {
         return false;
     }
     bool same_snapshot(const DeviceContextSnapshot::Impl& image, std::string& error) const {
-        return metadata_range(image.metadata, error) && identity_matches(image.metadata, manifest, target_identity, error);
+        return metadata_range(image.metadata, error) && identity_matches(image.metadata, manifest, target_identity, projection_mode, error);
     }
     // Device ring <-> chronological host image. Two 2D copies cover a wrap;
     // each 2D height is eight heads, not a per-row upload/readback loop.
@@ -561,7 +605,7 @@ size_t DeviceContextSnapshot::storage_bytes() noexcept { return DeviceForward::c
 bool DeviceContextSnapshot::assign(const ContextSnapshotMetadata& metadata, std::span<const uint16_t> payload,
                                     std::string& error) {
     if (!metadata_range(metadata, error) ||
-        !identity_matches(metadata, impl_->metadata.manifest_sha256, impl_->metadata.target, error)) return false;
+        !identity_matches(metadata, impl_->metadata.manifest_sha256, impl_->metadata.target, impl_->metadata.projection_mode, error)) return false;
     if (payload.size() != payload_elements(metadata.begin, metadata.end) || (payload.size() && !payload.data()))
         return refuse(error, "snapshot payload does not own the declared retained KV");
     for (uint16_t bits : payload)
@@ -575,7 +619,7 @@ bool DeviceContextSnapshot::assign(const ContextSnapshotMetadata& metadata,
                                     const std::array<const ConversationBuffer*, 10>& parts,
                                     std::string& error) {
     if (!metadata_range(metadata, error) ||
-        !identity_matches(metadata, impl_->metadata.manifest_sha256, impl_->metadata.target, error)) return false;
+        !identity_matches(metadata, impl_->metadata.manifest_sha256, impl_->metadata.target, impl_->metadata.projection_mode, error)) return false;
     const size_t elements = size_t(gpu::kv_heads) * (metadata.end - metadata.begin) * gpu::head_dim;
     const size_t bytes = elements * sizeof(uint16_t);
     for (const auto* part : parts)
@@ -604,9 +648,17 @@ bool DeviceContextSnapshot::assign(const ContextSnapshotMetadata& metadata,
 DeviceForward::DeviceForward(const RuntimeWeights& runtime, int device) : impl_(std::make_unique<Impl>(runtime, device)) {}
 DeviceForward::~DeviceForward() = default;
 int DeviceForward::device() const noexcept { return impl_->device; }
-size_t DeviceForward::device_bytes() const noexcept { return impl_->weight_bytes + scratch_bytes(); }
+size_t DeviceForward::device_bytes() const noexcept { return impl_->weight_bytes + scratch_bytes() + (impl_->context_blas ? gpu::ContextBlas::device_budget : 0); }
 size_t DeviceForward::context_bytes() noexcept { return gpu::kv_elements * sizeof(uint16_t); }
 size_t DeviceForward::scratch_bytes() noexcept { return scratch_layout(nullptr).bytes; }
+const std::string& DeviceForward::numerical_mode() {
+    static const std::string mode = [] {
+        std::string result = gpu::context_projection_identity();
+        if (gpu::attention_value_split_enabled()) { result += ":"; result += gpu::attention_value_split_identity(); }
+        return result;
+    }();
+    return mode;
+}
 const uint16_t* DeviceForward::weight(std::string_view name) const {
     for (size_t i = 0; i < impl_->entry_count; ++i) if (impl_->entries[i].name == name) return impl_->entries[i].device;
     throw Refusal("dflash2 forward: unknown immutable device tensor");
@@ -621,7 +673,7 @@ std::unique_ptr<DeviceContext> DeviceForward::create_context(int origin) const {
 }
 std::unique_ptr<DeviceContextSnapshot> DeviceForward::create_snapshot() const {
     return std::unique_ptr<DeviceContextSnapshot>(new DeviceContextSnapshot(
-        std::make_unique<DeviceContextSnapshot::Impl>(impl_->manifest, impl_->target_identity)));
+        std::make_unique<DeviceContextSnapshot::Impl>(impl_->manifest, impl_->target_identity, impl_->projection_mode)));
 }
 bool DeviceForward::forward(DeviceContext& context, const FeatureView& features, const uint16_t* embeddings,
                             int rows, int frontier, uint16_t* output, void* stream, std::string& error,

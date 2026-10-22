@@ -319,14 +319,64 @@ void producer_refusals() {
         check(d::CaptureAllocation::stage(bounds[0], bounds[1], allocation, err), "allocator-derived stage quote");
         pf += allocation.prefill; vr += allocation.verify; flags += allocation.flags;
     }
-    check(d::feature_row_bytes == 25600 && pf == 419225600 && vr == 819200 && flags == 24576,
+    check(d::feature_row_bytes == 25600 && pf == 419225600 && vr == size_t(d::block_size) * d::residual_row_bytes * d::tap_layers.size() && flags == 24576,
           "admission separates 50MiB BF16 context, 400MiB raw taps and per-stage mapped flags");
+}
+void reduced_prefill() {
+    constexpr int rows = 3;
+    std::vector<float> raw(rows * d::residual_width);
+    std::vector<uint16_t> reduced(rows * d::hidden_size);
+    for (int row = 0; row < rows; ++row) for (int col = 0; col < d::hidden_size; ++col) {
+        const float v = float(row * 10 + col % 17) / 8;
+        for (int stream = 0; stream < 4; ++stream)
+            raw[size_t(row) * d::residual_width + stream * d::hidden_size + col] = v;
+        reduced[size_t(row) * d::hidden_size + col] = strata::kernels::bf16_from_f32(v);
+    }
+    d::CaptureProducer reference, candidate;
+    std::string err;
+    for (auto* producer : {&reference, &candidate}) {
+        check(producer->reset(7, 9, 0, err), "reset reduced comparison");
+        check(producer->begin(d::CapturePhase::prefill, 0, rows, err), "begin reduced comparison");
+        for (int tap : d::tap_layers) {
+            d::TapView view{0, rows, rows, tap, tap, d::CapturePhase::prefill,
+                           d::CapturePoint::completed_second_residual_write, {}, producer->owner()};
+            if (producer == &reference) view.residuals = raw; else view.reduced = reduced;
+            check(producer->consume(view, err), "consume reduced comparison");
+        }
+        check(producer->publish(err), "publish reduced comparison");
+    }
+    const auto a = reference.store().committed_since(0).segments[0];
+    const auto b = candidate.store().committed_since(0).segments[0];
+    check(a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin()), "raw/reduced committed features agree");
+    for (int fault = 0; fault < 4; ++fault) {
+        d::CaptureProducer producer;
+        check(producer.reset(7, 9, 0, err) && producer.begin(d::CapturePhase::prefill, 0, rows, err), "fault setup");
+        auto values = reduced;
+        d::TapView view{0, rows, rows, 5, 5, d::CapturePhase::prefill,
+                       d::CapturePoint::completed_second_residual_write, {}, producer.owner(), values};
+        if (fault == 0) view.residuals = raw;
+        if (fault == 1) view.reduced = view.reduced.first(values.size() - 1);
+        if (fault == 2) values.back() = 0x7fc0;
+        if (fault == 3) view.materialized_layer = 6;
+        check(!producer.consume(view, err) && producer.frontier() == 0, "malformed/nonfinite reduced capture refused");
+    }
+    auto capture = state(d::CapturePhase::prefill);
+    std::vector<float> staging(rows * d::residual_width);
+    d::TapView view;
+    check(capture.arm(owner(), rows, 0, rows, err), "reduced view arm");
+    check(!capture.view_reduced(owner(), 0, staging.data(), view, err), "reduced view waits for completion");
+    check(capture.begin_run(7, 0, rows, err), "reduced view begin");
+    for (int tap = 0; tap < 5; ++tap) check(capture.record(tap, {0, 0, rows}, err), "reduced view record");
+    check(capture.finish_run(err), "reduced view finish");
+    check(capture.view_reduced(owner(), 0, staging.data(), view, err) && view.residuals.empty() &&
+          view.reduced.size() == rows * d::hidden_size, "compact reduced view shape");
+    check(!capture.view_reduced(owner(2), 0, staging.data(), view, err), "reduced view fences stale owner");
 }
 } // namespace
 
 int main() {
     try {
-        verification(); frontier(); prefill_tail(); split_stages(); producer_split_tail(); producer_refusals();
+        reduced_prefill(); verification(); frontier(); prefill_tail(); split_stages(); producer_split_tail(); producer_refusals();
         std::printf("dflash2 capture: %d CPU checks passed\n", checks);
         return 0;
     } catch (const std::exception& error) {

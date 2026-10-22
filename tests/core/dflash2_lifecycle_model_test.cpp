@@ -202,7 +202,7 @@ int resident_native_model_checks(strata::program::ResidentSlots& owner, strata::
                 owner.prepare(1, peer_prompt, peer_request, peer, error) && peer.position == 0,
                 "prepare actual independent native resident owners without an ambient-state handoff");
 
-        auto ingest = [&](int slot, int start, int count, uint32_t seed) {
+        auto ingest = [&](int slot, int start, int count, uint32_t seed, int64_t stale_generation = 0) {
             const auto expected = draft.owner(slot);
             core::DraftOwner ticket;
             require(draft.reserve_inputs(slot, expected, start, count, ticket, error),
@@ -224,6 +224,17 @@ int resident_native_model_checks(strata::program::ResidentSlots& owner, strata::
             }
             require(producer.publish(error), "publish only after all five matching tap completions");
             const auto features = producer.store().committed_since(start);
+            if (stale_generation) {
+                require(count == 1 && features.generations[0].size() == 1 && features.generations[1].empty(),
+                        "same-owner replay probe is one real contiguous published feature row");
+                auto stale = features;
+                const std::array<int64_t, 1> stale_tags{stale_generation};
+                stale.generations[0] = stale_tags;
+                require(!draft.ingest_committed(operation, stale, error) &&
+                        error == "dflash2 drafter: stale feature generation",
+                        "same-incarnation preparation preserves the consumed-generation replay floor");
+                error.clear();
+            }
             require(features.start == start && features.count == count &&
                     draft.ingest_committed(operation, features, error) && operation.finish(error),
                     "project the actual committed BF16 feature ring on GPU and drain before certification");
@@ -485,6 +496,32 @@ int resident_native_model_checks(strata::program::ResidentSlots& owner, strata::
                 owner.owns(1, peer_identity.request, peer_identity.incarnation),
                 "stale resume_work preserves both actual peer payload and peer ownership");
         owner.cancel(2);
+
+        // The legacy GEN continuation rebinds working seat 8 without a snapshot
+        // transfer. Exercise the actual producer and GPU ingest after that seam.
+        const std::vector<int64_t> direct_prompt(6, 11);
+        require(owner.begin(-1, direct_prompt, request, error) &&
+                draft.prepare_slot(8, owner.working().request, direct_prompt.size(), 0, true, error),
+                "prepare a fresh actual working owner for direct retained continuation");
+        ingest(8, 0, 1, 0x71a3u);
+        ingest(8, 1, 1, 0x71a3u);
+        const auto previous_capture_owner = draft.capture_producer(8).owner();
+        require(previous_capture_owner.generation == 2 &&
+                owner.begin(-1, direct_prompt, request, error) &&
+                draft.owner(8).incarnation > previous_capture_owner.incarnation &&
+                draft.prepare_slot(8, owner.working().request, direct_prompt.size(), 2, false, error) &&
+                draft.capture_producer(8).owner().generation == 0,
+                "verified newer working incarnation restarts its capture domain over retained context");
+        ingest(8, 2, 1, 0x71a3u);
+        const auto resumed_capture_owner = draft.capture_producer(8).owner();
+        require(resumed_capture_owner.generation == 1 &&
+                draft.prepare_slot(8, owner.working().request, direct_prompt.size(), 3, false, error) &&
+                draft.capture_producer(8).owner() == resumed_capture_owner,
+                "same-incarnation direct preparation preserves the existing capture domain");
+        ingest(8, 3, 1, 0x71a3u, 1);
+        require(draft.capture_producer(8).owner().generation == 2 &&
+                same_payload(peer_image, capture(1, owner.slots()[1].ids, true)),
+                "fresh continuation succeeds after stale replay refusal and preserves the peer");
         require(owner.abort_preparation(source, error) && owner.abort_preparation(peer, error) &&
                 draft.idle(error) && owner.release_resources(error),
                 "retire both real prepared owners and release only drained resident resources");
@@ -492,6 +529,7 @@ int resident_native_model_checks(strata::program::ResidentSlots& owner, strata::
         std::printf("DFLASH2_NATIVE_LIFECYCLE source_origin=%lld retained_begin=%lld certified_end=%lld "
                     "certified_cells=%lld retained_rows=%d restored=1 absent_refused=1 peer_unchanged=1 "
                     "identity_refusals=%d pending_refused=1 stale_resume_work_refused=1 stages=3 seats=4 "
+                    "retained_generation_rebind=1 same_owner_replay_refused=1 "
                     "synthetic_host_taps=1 native_gpu_projection=1 target_inference=0 checks=%d failures=0\n",
                     (long long)native.draft_origin, (long long)native.draft_begin, (long long)native.draft_cells,
                     (long long)native.draft_cells,

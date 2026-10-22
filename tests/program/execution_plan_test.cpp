@@ -455,14 +455,14 @@ int main() {
               p.draft_kind == strata::core::DraftKind::dflash2 &&
               p.proposal == ep::ProposalShape::serial_block_draft,
               "native serial execution reports its canonical kind and block proposal, never serial MTP");
-        check(p.draft_max_t == 4 && p.mtp_max_t == 4 && p.proposal_positions == 3 &&
+        check(p.draft_max_t == 8 && p.mtp_max_t == 4 && p.proposal_positions == 3 &&
               p.verifier_max_rows == 8 && p.draft_handoff_rows == 8,
               "three native proposals plus their anchor do not inflate the eight-row physical target verifier");
         check(p.drafting.support == ep::Support::conditional && p.memory_classes.empty() &&
               p.admission.support == ep::Support::off,
               "a no-load native plan claims neither successful graph capture nor retained admission");
         const auto text = report(p, 0);
-        check(has(text, "\"kind\":\"dflash2\"") && has(text, "\"draft_max\":4,\"proposal_positions\":3") &&
+        check(has(text, "\"kind\":\"dflash2\"") && has(text, "\"draft_max\":8,\"proposal_positions\":3") &&
               has(text, "\"verifier_max_rows\":8,\"draft_handoff_rows\":8") &&
               has(text, "\"execution\":{\"support\":\"conditional\"") && !has(text, "\"mtp_max\""),
               "native JSON separates actual block geometry and conditional execution from legacy MTP sizing");
@@ -472,19 +472,19 @@ int main() {
         for (int width : {2, 3, 4}) {
             in.spec_requested = width;
             const auto p = ep::resolve_execution_plan(in);
-            check(!p.refused && p.spec == width && p.mtp_max_t == width && p.draft_max_t == 4 &&
+            check(!p.refused && p.spec == width && p.mtp_max_t == width && p.draft_max_t == 8 &&
                   p.proposal_positions == width - 1,
                   "short target windows consume only their native proposal prefix without resizing the forward block");
         }
         in.spec_requested = 4;
         in.suffix_draft = 12;
         const auto suffix = ep::resolve_execution_plan(in);
-        check(!suffix.refused && suffix.spec == 6 && suffix.mtp_max_t == 4 && suffix.draft_max_t == 4 &&
+        check(!suffix.refused && suffix.spec == 6 && suffix.mtp_max_t == 4 && suffix.draft_max_t == 8 &&
               suffix.proposal_positions == 3 && suffix.lookup.support == ep::Support::on,
               "native suffix lookup expands only the serial target window from four to six");
         in.lookup_chain = 2;
         const auto chain = ep::resolve_execution_plan(in);
-        check(!chain.refused && chain.spec == 8 && chain.mtp_max_t == 4 && chain.draft_max_t == 4 &&
+        check(!chain.refused && chain.spec == 8 && chain.mtp_max_t == 4 && chain.draft_max_t == 8 &&
               chain.proposal_positions == 3 && chain.verifier_max_rows == 8,
               "native lookup chaining reaches eight target rows without inventing neural proposals four through seven");
         in.lookup_chain = 20;
@@ -494,8 +494,16 @@ int main() {
         in.mtp_max_requested = 8;
         const auto capped = ep::resolve_execution_plan(in);
         check(!capped.refused && capped.mtp_max_t == 4 && capped.proposal_positions == 3,
-              "a legacy prefix override cannot expand the native four-row block");
-        for (int width : {0, 1, 5, 8}) {
+              "a legacy prefix override keeps its four-row neural prefix within eight-row capacity");
+        in.mtp_max_requested = 0;
+        for (int width : {5, 8}) {
+            in.spec_requested = width;
+            const auto wider = ep::resolve_execution_plan(in);
+            check(!wider.refused && wider.draft_max_t == 8 && wider.mtp_max_t == width &&
+                  wider.proposal_positions == width - 1 && wider.verifier_max_rows == 8,
+                  "explicit wider native plans remain within the eight-row capacity");
+        }
+        for (int width : {0, 1, 9}) {
             in.spec_requested = width;
             const auto p = ep::resolve_execution_plan(in);
             check(p.refused && p.drafting.support == ep::Support::refused &&

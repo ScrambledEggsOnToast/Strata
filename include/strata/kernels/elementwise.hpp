@@ -107,6 +107,11 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream);
 /// Host reads ONLY after stream/commit completion, never by polling the payload.
 /// Both payload pointers and n must be float4 aligned, as in copy_from_mapped.
 void tap_publish(const float* src, float* dst, int64_t n, const uint32_t* enabled, void* stream);
+/// Ordered FP32 mean of four streams, rounded once to BF16, then published on
+/// the same stream. Invalid inputs/results remain nonfinite for host rejection.
+/// src: [rows,4,hidden], dst: [rows,hidden]. Completion rules match tap_publish.
+void tap_reduce_publish(const float* src, uint16_t* dst, int rows, int hidden,
+                        const uint32_t* enabled, void* stream);
 /// `rows` rows of `width` floats from mapped memory, except the rows listed in hit_rows[0, *count) (device),
 /// which are written +0.0 instead (a verify window's GPU-computed entries: the pool leaves zeros there).
 /// multi-GPU: dst[rows[r] * width ..] = src[r * width ..] for r < n (float4; dst may be mapped host memory).

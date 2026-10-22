@@ -18,6 +18,8 @@ inline constexpr int hidden_size = 2560;
 inline constexpr int vocabulary_size = 248320;
 inline constexpr int mask_token = 248077;
 inline constexpr int block_size = 8;
+// The versioned CPU-reference exchange retains its original four-row wire contract.
+inline constexpr int reference_block_size = 4;
 
 // Proposals constructed per verification step (1..block_size-1). The checkpoint publishes block_size 8; the
 // reference exercised 4 positions, so the default keeps the long-validated width while widths above it can be
@@ -32,6 +34,9 @@ inline bool set_draft_positions(int positions) {
 inline constexpr int max_verify_rows = 8; // engine mixed-policy target window, not the fixed drafter block
 inline constexpr int context_rows = 2047;
 inline constexpr int max_position = 262144;
+// One identity for native snapshots, file records and durable-store manifests.
+inline constexpr std::array<int64_t, 8> native_geometry{
+    5, hidden_size, 8, 128, context_rows, block_size, max_position, 16};
 inline constexpr std::array<int, 5> tap_layers{5, 15, 25, 35, 45};
 inline constexpr int feature_width = hidden_size * int(tap_layers.size());
 inline constexpr size_t feature_row_bytes = feature_width * sizeof(uint16_t);
@@ -97,7 +102,8 @@ public:
     // the next layer's FIRST gr_read_group and before its attention writes R.
     void capture(const Operation&, int tap_layer, int materialized_layer,
                  std::span<const int> positions, CapturePoint,
-                 std::span<const float> residuals);
+                 std::span<const float> residuals,
+                 std::span<const uint16_t> reduced = {});
     // Caller acknowledgement of an already successful target commit. Prefill
     // keeps its whole chunk; verification keeps 1..4 rows, rejecting the suffix.
     void commit(const Operation&, int keep);
@@ -170,8 +176,8 @@ public:
 };
 
 struct Proposals {
-    std::array<int64_t, block_size - 1> tokens;
-    std::array<std::array<int64_t, 16>, block_size - 1> candidates;
+    std::array<int64_t, reference_block_size - 1> tokens;
+    std::array<std::array<int64_t, 16>, reference_block_size - 1> candidates;
 };
 
 // Engine side of tools/dflash2_cpu/exchange.py version 1. Adopts and closes an

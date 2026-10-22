@@ -144,7 +144,7 @@ void reduction_and_capture_tests() {
         store.commit(op, keep);
         check(store.frontier() == 37 + keep, "rejected suffix published");
         check_features(store.committed_since(37));
-        check(store.storage_bytes() == d::CaptureStore::planned_bytes(4),
+        check(store.storage_bytes() == d::CaptureStore::planned_bytes(d::block_size),
               "unexpected observer allocation bound");
     }
     d::CaptureStore store("request-A", 7, 37, 1);
@@ -222,7 +222,7 @@ void ring_and_refusal_tests() {
         const auto op = operation(1, scenario == 2 ? 40 : 37);
         refuses([&] {
             if (scenario == 0) store.begin(op, 38, 1, d::CapturePhase::verify);
-            if (scenario == 1) store.begin(op, 37, 5, d::CapturePhase::verify);
+            if (scenario == 1) store.begin(op, 37, d::max_verify_rows + 1, d::CapturePhase::verify);
             if (scenario == 2) {
                 store.begin(op, 37, 3, d::CapturePhase::prefill);
                 capture_all(store, op, 37, 3, d::CapturePhase::prefill);

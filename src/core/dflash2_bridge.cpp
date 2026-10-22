@@ -27,9 +27,10 @@ static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559);
 static_assert(std::endian::native == std::endian::little,
               "DFlash2 wire tensors require a little-endian host");
 constexpr unsigned all_taps = (1u << tap_layers.size()) - 1;
-constexpr size_t hidden_values = (block_size - 1) * hidden_size;
-constexpr size_t embedding_values = block_size * hidden_size;
-constexpr size_t proposal_values = (block_size - 1) * 17;
+constexpr size_t hidden_values = (reference_block_size - 1) * hidden_size;
+constexpr size_t embedding_values = reference_block_size * hidden_size;
+constexpr size_t reference_logits_bytes = (reference_block_size - 1) * vocabulary_size * sizeof(float);
+constexpr size_t proposal_values = (reference_block_size - 1) * 17;
 
 // No borrowed work or exchange bytes have started when this refusal is raised.
 struct ScratchUnavailable : Refusal { using Refusal::Refusal; };
@@ -45,7 +46,7 @@ void validate_operation_fields(std::string_view request, int64_t incarnation, in
                 (c >= '0' && c <= '9') || c == '_' || c == '.' || c == ':' || c == '-',
                 "invalid request identity");
     require(incarnation >= 0 && generation > 0 && frontier >= 0 &&
-            frontier <= max_position - (capture ? 0 : block_size), "invalid operation extent/generation");
+            frontier <= max_position - (capture ? 0 : reference_block_size), "invalid operation extent/generation");
 }
 void validate_operation(const Operation& op, bool capture = false) {
     validate_operation_fields(op.request_id, op.incarnation, op.generation, op.frontier, capture);
@@ -292,7 +293,7 @@ void CaptureStore::begin(const Operation& op, int start, int count, CapturePhase
 }
 void CaptureStore::capture(const Operation& op, int layer, int materialized_layer,
                           std::span<const int> positions, CapturePoint point,
-                          std::span<const float> residuals) {
+                          std::span<const float> residuals, std::span<const uint16_t> reduced) {
     try {
         require(!poisoned_ && active_ && op == operation_, "stale/unowned capture completion");
         require(!shared_lease_ || (active_lease_ && active_lease_->holds(*shared_lease_)),
@@ -305,10 +306,25 @@ void CaptureStore::capture(const Operation& op, int layer, int materialized_laye
                 point == (phase_ == CapturePhase::verify ? CapturePoint::next_layer_first_gr_read_group :
                           CapturePoint::completed_second_residual_write),
                 "capture requires the completed unmixed residual at its declared seam");
-        require(positions.size() == size_t(count_) && residuals.size() == size_t(count_) * 4 * hidden_size,
+        require(positions.size() == size_t(count_) &&
+                ((reduced.empty() && residuals.size() == size_t(count_) * 4 * hidden_size) ||
+                 (phase_ == CapturePhase::prefill && residuals.empty() &&
+                  reduced.size() == size_t(count_) * hidden_size)),
                 "capture position/residual shape mismatch");
         for (int row = 0; row < count_; ++row)
             require(positions[size_t(row)] == start_ + row, "capture positions contain gaps/duplicates/reordering");
+        if (!reduced.empty()) {
+            for (int row = 0; row < count_; ++row) {
+                const uint16_t* input = reduced.data() + size_t(row) * hidden_size;
+                uint16_t* output = tentative_data_ + size_t(row) * feature_width + tap * hidden_size;
+                for (int column = 0; column < hidden_size; ++column) {
+                    require((input[column] & 0x7f80u) != 0x7f80u, "nonfinite reduced target feature");
+                    output[column] = input[column];
+                }
+            }
+            seen_ |= 1u << tap;
+            return;
+        }
         require_fp32_environment();
         for (int row = 0; row < count_; ++row) {
             const float* streams = residuals.data() + size_t(row) * 4 * hidden_size;
@@ -397,7 +413,7 @@ struct Bridge::Impl {
                 "borrowed daily target identity/geometry/load mismatch");
         require(!store.poisoned() && !store.capturing() && !store.bridge_attached_,
                 "capture store is poisoned/busy or already has a bridge");
-        logits = std::make_unique_for_overwrite<float[]>(size_t(block_size - 1) * vocabulary_size);
+        logits = std::make_unique_for_overwrite<float[]>(size_t(reference_block_size - 1) * vocabulary_size);
         store.bridge_attached_ = true;
     }
     ~Impl() {
@@ -442,7 +458,7 @@ Proposals Bridge::propose(const Operation& op, int32_t anchor) {
                 throw Refusal("borrowed native-head scratch is poisoned");
             }
             state.channel.begin(started);
-            const std::array<int32_t, block_size> ids{anchor, mask_token, mask_token, mask_token};
+            const std::array<int32_t, reference_block_size> ids{anchor, mask_token, mask_token, mask_token};
             std::fill(state.raw.begin(), state.raw.end(), std::numeric_limits<float>::quiet_NaN());
             state.target.raw_embeddings(op, ids, state.raw);
             state.check_binding();
@@ -458,14 +474,14 @@ Proposals Bridge::propose(const Operation& op, int32_t anchor) {
                 {{"origin", state.store.origin()}, {"feature_start", features.start},
                  {"feature_count", features.count}, {"embedding_ids", ids}},
                 Json::array({tensor("features", "bf16", {1, features.count, feature_width}, feature_bytes),
-                             tensor("embeddings", "bf16", {1, block_size, hidden_size},
+                             tensor("embeddings", "bf16", {1, reference_block_size, hidden_size},
                                     sizeof(state.embeddings), feature_bytes)}), feature_bytes + sizeof(state.embeddings)),
                 {std::as_bytes(features.segments[0]), std::as_bytes(features.segments[1]),
                  std::as_bytes(std::span{state.embeddings})});
             state.channel.receive(header("hidden", op, state.binding.identity, {{"origin", state.store.origin()}},
-                Json::array({tensor("hidden", "bf16", {1, block_size - 1, hidden_size}, sizeof(state.hidden))}),
+                Json::array({tensor("hidden", "bf16", {1, reference_block_size - 1, hidden_size}, sizeof(state.hidden))}),
                 sizeof(state.hidden)), std::as_writable_bytes(std::span{state.hidden}));
-            for (int row = 0; row < block_size - 1; ++row) {
+            for (int row = 0; row < reference_block_size - 1; ++row) {
                 state.check_binding();
                 for (int column = 0; column < hidden_size; ++column) {
                     const uint16_t bits = state.hidden[size_t(row) * hidden_size + column];
@@ -482,19 +498,19 @@ Proposals Bridge::propose(const Operation& op, int32_t anchor) {
             lease.complete(); // all borrowed target consumers are host-complete
         } // release shared scratch before sending logits or waiting on the selector
         state.channel.send(header("logits", op, state.binding.identity, Json::object(),
-            Json::array({tensor("logits", "f32", {1, block_size - 1, vocabulary_size}, logits_bytes)}), logits_bytes),
-            {std::as_bytes(std::span{state.logits.get(), size_t(block_size - 1) * vocabulary_size})});
+            Json::array({tensor("logits", "f32", {1, reference_block_size - 1, vocabulary_size}, reference_logits_bytes)}), reference_logits_bytes),
+            {std::as_bytes(std::span{state.logits.get(), size_t(reference_block_size - 1) * vocabulary_size})});
         state.channel.receive(header("proposals", op, state.binding.identity, Json::object(),
-            Json::array({tensor("tokens", "i64", {1, block_size - 1}, (block_size - 1) * sizeof(int64_t)),
-                         tensor("candidates", "i64", {1, block_size - 1, 16},
-                                (block_size - 1) * 16 * sizeof(int64_t), (block_size - 1) * sizeof(int64_t))}),
+            Json::array({tensor("tokens", "i64", {1, reference_block_size - 1}, (reference_block_size - 1) * sizeof(int64_t)),
+                         tensor("candidates", "i64", {1, reference_block_size - 1, 16},
+                                (reference_block_size - 1) * 16 * sizeof(int64_t), (reference_block_size - 1) * sizeof(int64_t))}),
             sizeof(state.proposals)), std::as_writable_bytes(std::span{state.proposals}));
         Proposals result;
-        for (int row = 0; row < block_size - 1; ++row) {
+        for (int row = 0; row < reference_block_size - 1; ++row) {
             const int64_t token = state.proposals[size_t(row)];
             auto& candidates = result.candidates[size_t(row)];
             for (size_t column = 0; column < candidates.size(); ++column) {
-                const int64_t candidate = state.proposals[block_size - 1 + size_t(row) * 16 + column];
+                const int64_t candidate = state.proposals[reference_block_size - 1 + size_t(row) * 16 + column];
                 require(candidate >= 0 && candidate < vocabulary_size, "selector candidate outside vocabulary");
                 require(std::find(candidates.begin(), candidates.begin() + column, candidate) == candidates.begin() + column,
                         "duplicate selector candidate");

@@ -1,3 +1,4 @@
+#include "strata/core/dflash2_bridge.hpp"
 // Host-only lifecycle regression. No CUDA initialization or neural arithmetic:
 // the fixture writes five explicit host feature markers while the REAL common
 // Operation owns them. The production owner, pending tickets, q validation,
@@ -23,7 +24,7 @@ public:
     explicit HostRows(DraftKind kind = DraftKind::dflash2) {
         identity_.kind = kind; identity_.format = 1;
         identity_.weights[0] = 1; identity_.configuration[0] = 2; identity_.borrowed_target[0] = 3;
-        identity_.geometry = {5, 2560, 8, 128, 2047, 4, 262144, 16};
+        identity_.geometry = dflash2::native_geometry;
         origins_.fill(kind == DraftKind::dflash2 ? 7 : 0);
         origins_[1] = kind == DraftKind::dflash2 ? 19 : 0;
         for (size_t seat = 0; seat < states_.size(); ++seat) states_[seat].cells = origins_[seat];

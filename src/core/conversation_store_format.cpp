@@ -1,3 +1,4 @@
+#include "strata/core/dflash2_bridge.hpp"
 // The durable store's pure byte/tree layer: the canonical stream enumeration of one SavedConversation tree, the
 // manifest and catalog encodings, the exact-prefix chain digests a lookup compares, and the bounded restore that
 // turns a manifest back into a complete image.  No file I/O, no threads, no GPU, no global state: every entry point
@@ -335,7 +336,7 @@ bool check_draft(const std::array<int64_t, 18>& g, int64_t lo, int64_t hi, uint6
         why = "neural draft has absent weight identity or unsupported numerical format"; return false;
     }
     if (native) {
-        if (identity.geometry != std::array<int64_t, 8>{5, 2560, 8, 128, 2047, 4, 262144, 16} ||
+        if (identity.geometry != dflash2::native_geometry ||
             !digest_nonzero(identity.configuration) || !digest_nonzero(identity.borrowed_target) ||
             origin < 0 || begin < origin || cells < begin || cells > 262144 || uint64_t(cells) != tokens ||
             begin != std::max(origin, cells - int64_t(2047)) || next != -1 || boundary || g[1] <= 0 ||
@@ -2359,12 +2360,17 @@ bool stream_kv_layout(const std::vector<ContainerMeta>& containers, const Conver
         const int64_t first = count ? std::min(stage->layer_lo / interval, count - 1) : 0;
         const uint64_t allocated = uint64_t(std::max<int64_t>(
             stage->layer_hi / interval - stage->layer_lo / interval, count ? 1 : 0));
-        if (stage->kv.size() < allocated || stage->kv.size() - allocated > 1) {
+        const bool native = stage->draft_identity.kind == DraftKind::dflash2;
+        if (stage->kv.size() < allocated ||
+            (native ? stage->kv.size() - allocated != 5 : stage->kv.size() - allocated > 1)) {
             why = "a K/V object count disagrees with the captured attention layers";
             return false;
         }
-        // The extra pool is the drafter, not the next main-model attention layer.
-        ordinal = id.ordinal == allocated ? uint64_t{1} << 63 : uint64_t(first) + id.ordinal;
+        // Draft pools occupy a separate namespace. Keep the existing MTP ordinal
+        // unchanged; native's five layers each need their own physical identity.
+        ordinal = id.ordinal >= allocated
+            ? (uint64_t{1} << 63) | (id.ordinal - allocated)
+            : uint64_t(first) + id.ordinal;
         kv = &stage->kv[size_t(id.ordinal)];
     }
     return true;
@@ -2385,7 +2391,7 @@ bool stream_object_identity(const std::vector<ContainerMeta>& containers, const 
 
 ConversationStoreReadComponent stream_read_component(uint16_t kind, uint64_t object_ordinal) {
     if (kind == kDraftBoundaryKind) return ConversationStoreReadComponent::draft;
-    if (conversation_store_kv_kind(kind) && object_ordinal == (uint64_t{1} << 63))
+    if (conversation_store_kv_kind(kind) && (object_ordinal & (uint64_t{1} << 63)))
         return ConversationStoreReadComponent::draft;
     switch (ConversationStoreStreamKind(kind)) {
         case ConversationStoreStreamKind::live_gdn:

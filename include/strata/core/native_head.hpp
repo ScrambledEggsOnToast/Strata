@@ -2,6 +2,7 @@
 
 #include "strata/core/native_weight_identity.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -35,7 +36,10 @@ public:
     // so batching three drafter rows is an arithmetic-preserving scheduling change, not a new contract.
     bool run_rows_with_scratch(const float* hidden_rows, float* logits_rows, int ncols, void* scratch,
                                size_t scratch_bytes, void* stream, std::string& err) const;
+    static size_t planned_projection_scratch_bytes(int n_in, int ncols = 1);
     size_t projection_scratch_bytes(int ncols = 1) const;
+    // Diagnostic only: caller invokes after its existing successful completion fence.
+    void report_rows_completed(int ncols) const;
     const NativeTensorIdentity& identity() const { return identity_; }
     uint64_t weight_bytes() const { return bytes_; }
     bool loaded() const { return weights_ != nullptr; }
@@ -55,6 +59,7 @@ private:
     int type_ = -1;
     int device_ = -1;
     NativeTensorIdentity identity_;
+    mutable std::atomic<bool> il_reported_{false};
 };
 
 /// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row

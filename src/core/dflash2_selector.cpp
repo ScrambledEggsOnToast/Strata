@@ -158,6 +158,10 @@ bool DeviceSelector::select(int rows, const uint16_t* hidden, const float* logit
         error = "dflash2 selector: proposal row count is outside 1..selector_rows";
         lease.complete(); return false;
     }
+    if (temperature > 0.0f && rows > selector::selector_sampled_rows) {
+        error = "dflash2 selector: sampled selection supports at most three proposal rows";
+        lease.complete(); return false;
+    }
     if (anchor < 0 || anchor >= selector::selector_vocabulary || !std::isfinite(temperature) || temperature < 0.0f) {
         error = "dflash2 selector: anchor or temperature is outside the reference contract";
         lease.complete(); return false;

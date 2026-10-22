@@ -1,9 +1,13 @@
 #include "strata/kernels/dflash2_forward.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "dflash2_value_split.cuh"
+#include "dflash2_grouped_scores.cuh"
 
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 namespace strata::kernels::dflash2 {
 namespace {
@@ -49,6 +53,31 @@ __global__ void linear_small(const uint16_t* input, const uint16_t* weight,
     if (lane == 0) output[size_t(row) * no + o] = rounded(sum, status);
 }
 
+// Four independent row accumulators share each weight load. Each accumulator
+// retains the original lane-strided FMA order and warp reduction.
+__global__ void linear_small_reuse(const uint16_t* input, const uint16_t* weight,
+                                    uint16_t* output, int rows, int ni, int no,
+                                    uint32_t* status) {
+    const int o = int(blockIdx.x) * 8 + int(threadIdx.x >> 5);
+    if (o >= no) return;
+    const int first = int(blockIdx.y) * 4, lane = int(threadIdx.x & 31);
+    float sum[4] = {};
+    for (int i = lane; i < ni; i += 32) {
+        const float w = f32_from_bf16(weight[size_t(o) * ni + i]);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            if (first + j < rows)
+                sum[j] = fmaf(f32_from_bf16(input[size_t(first + j) * ni + i]), w, sum[j]);
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        if (first + j < rows) {
+            sum[j] = warp_sum(sum[j]);
+            if (lane == 0) output[size_t(first + j) * no + o] = rounded(sum[j], status);
+        }
+    }
+}
+
 // Large context projection: each BF16 weight/input tile is widened once and
 // reused over 16 rows/outputs. FP32 scalar arithmetic works unchanged on SM70.
 __global__ void linear_context(const uint16_t* input, const uint16_t* weight,
@@ -75,6 +104,54 @@ __global__ void linear_context(const uint16_t* input, const uint16_t* weight,
         __syncthreads();
     }
     if (row < rows && o < no) output[size_t(row) * no + o] = rounded(sum, status);
+}
+
+// A thread owns a 4x4 output tile. Shared loads cover 64 rows/outputs;
+// per-output FMA order is identical to linear_context, including K padding.
+__global__ void linear_context_reuse(const uint16_t* input, const uint16_t* weight,
+                                      uint16_t* output, int rows, int ni, int no,
+                                      uint32_t* status) {
+    __shared__ float x[64][33];
+    __shared__ float w[64][33];
+    const int tx = int(threadIdx.x), ty = int(threadIdx.y), linear = ty * 16 + tx;
+    float sum[4][4] = {};
+    for (int start = 0; start < ni; start += 32) {
+        for (int t = linear; t < 64 * 32; t += 256) {
+            const int a = t / 32, k = t % 32;
+            const int xr = int(blockIdx.y) * 64 + a;
+            const int wo = int(blockIdx.x) * 64 + a;
+            x[a][k] = xr < rows && start + k < ni
+                ? f32_from_bf16(input[size_t(xr) * ni + start + k]) : 0.0f;
+            w[a][k] = wo < no && start + k < ni
+                ? f32_from_bf16(weight[size_t(wo) * ni + start + k]) : 0.0f;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < 32; ++k) {
+            #pragma unroll
+            for (int a = 0; a < 4; ++a) {
+                const float v = x[ty + 16 * a][k];
+                #pragma unroll
+                for (int b = 0; b < 4; ++b)
+                    sum[a][b] = fmaf(v, w[tx + 16 * b][k], sum[a][b]);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        const int row = int(blockIdx.y) * 64 + ty + 16 * a;
+        #pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            const int o = int(blockIdx.x) * 64 + tx + 16 * b;
+            if (row < rows && o < no) output[size_t(row) * no + o] = rounded(sum[a][b], status);
+        }
+    }
+}
+
+bool enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value && std::strcmp(value, "1") == 0;
 }
 
 __global__ void finite_kernel(const uint16_t* input, size_t count, uint32_t* status) {
@@ -270,6 +347,33 @@ __global__ void value_kernel(const float* probabilities, const uint16_t* block_v
     }
     output[(row * query_heads + hq) * head_dim + d] = rounded(sum, status);
 }
+// Same ordered FP32 FMA chain as value_kernel. The retained context fits one
+// ring, so its values occupy at most two contiguous spans. Keep the head/row
+// launch geometry; only address computation and the context/block branch move
+// out of the key loop. In particular, zero-probability keys are still read.
+__global__ void value_spans_kernel(const float* probabilities, const uint16_t* block_values,
+                                   const uint16_t* ring, uint16_t* output, int layer,
+                                   int begin, int frontier, int rows, uint32_t* status) {
+    const int hq = int(blockIdx.x) / rows, row = int(blockIdx.x) % rows;
+    const int hk = hq / (query_heads / kv_heads), d = int(threadIdx.x);
+    const int context = frontier - begin, keys = context + rows;
+    const float* p = probabilities + (size_t(hq) * rows + row) * keys;
+    const uint16_t* head = ring + ((size_t(layer) * 2 + 1) * kv_heads + hk) * capacity * head_dim + d;
+    const int slot = begin % capacity;
+    const int first = context < capacity - slot ? context : capacity - slot;
+    const uint16_t* tail = head + size_t(slot) * head_dim;
+    float sum = 0.0f;
+    for (int k = 0; k < first; ++k)
+        sum = fmaf(p[k], f32_from_bf16(tail[size_t(k) * head_dim]), sum);
+    p += first;
+    for (int k = 0; k < context - first; ++k)
+        sum = fmaf(p[k], f32_from_bf16(head[size_t(k) * head_dim]), sum);
+    p += context - first;
+    const uint16_t* block_head = block_values + hk * head_dim + d;
+    for (int k = 0; k < rows; ++k)
+        sum = fmaf(p[k], f32_from_bf16(block_head[size_t(k) * kv_width]), sum);
+    output[(row * query_heads + hq) * head_dim + d] = rounded(sum, status);
+}
 inline int launched() { return int(cudaGetLastError()); }
 inline unsigned blocks(size_t count) { return unsigned((count + threads - 1) / threads); }
 } // namespace
@@ -278,8 +382,15 @@ int linear_bf16(const uint16_t* input, const uint16_t* weight, uint16_t* output,
                 int rows, int ni, int no, void* stream, uint32_t* status) {
     if (!input || !weight || !output || rows < 1 || rows > capacity || ni < 1 || no < 1)
         return int(cudaErrorInvalidValue);
-    if (rows <= block)
+    // Freeze process-wide experimental choices before the first graph capture.
+    static const bool reuse_small = enabled("STRATA_DFLASH2_LINEAR_REUSE");
+    static const bool reuse_context = enabled("STRATA_DFLASH2_LINEAR_CONTEXT");
+    if (rows <= block && reuse_small)
+        linear_small_reuse<<<dim3(unsigned((no + 7) / 8), unsigned((rows + 3) / 4)), threads, 0, (cudaStream_t)stream>>>(input, weight, output, rows, ni, no, status);
+    else if (rows <= block)
         linear_small<<<dim3(unsigned((no + 7) / 8), unsigned(rows)), threads, 0, (cudaStream_t)stream>>>(input, weight, output, ni, no, status);
+    else if (reuse_context && rows >= 128)
+        linear_context_reuse<<<dim3(unsigned((no + 63) / 64), unsigned((rows + 63) / 64)), dim3(16, 16), 0, (cudaStream_t)stream>>>(input, weight, output, rows, ni, no, status);
     else
         linear_context<<<dim3(unsigned((no + 15) / 16), unsigned((rows + 15) / 16)), dim3(16, 16), 0, (cudaStream_t)stream>>>(input, weight, output, rows, ni, no, status);
     return launched();
@@ -362,18 +473,29 @@ int store_context(const uint16_t* keys, const uint16_t* values, uint16_t* ring,
     store_kernel<<<blocks(size_t(rows) * kv_width), threads, 0, (cudaStream_t)stream>>>(keys, values, ring, layer, first, rows, status);
     return launched();
 }
+bool attention_grouped_scores_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_DFLASH2_SCORE_GROUPED_HEADS");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
 int attention_scores(const uint16_t* query, const uint16_t* block_keys, const uint16_t* ring,
                       float* scores, int layer, int begin, int frontier, int rows, uint32_t* status, void* stream) {
     if (!query || !block_keys || !ring || !scores || layer < 0 || layer >= layers || rows < 1 || rows > block ||
         begin < 0 || frontier < begin || frontier - begin > capacity || frontier > 262144 - rows)
         return int(cudaErrorInvalidValue);
+    if (attention_grouped_scores_enabled())
+        return int(score_grouped_detail::launch(query, block_keys, ring, scores, layer, begin, frontier, rows,
+                                                status, static_cast<cudaStream_t>(stream)));
     score_kernel<<<dim3(unsigned((frontier - begin + rows + 7) / 8), query_heads * rows), threads, 0, (cudaStream_t)stream>>>(query, block_keys, ring, scores, layer, begin, frontier, rows, status);
     return launched();
 }
 int attention_softmax(const float* scores, float* probabilities, float* statistics,
-                      int keys, uint32_t* status, void* stream) {
-    if (!scores || !probabilities || keys < block || keys > max_keys) return int(cudaErrorInvalidValue);
-    softmax_kernel<<<query_heads * block, threads, 0, (cudaStream_t)stream>>>(scores, probabilities, statistics, keys, status);
+                      int rows, int keys, uint32_t* status, void* stream) {
+    if (!scores || !probabilities || rows < 1 || rows > block || keys < rows || keys > capacity + rows)
+        return int(cudaErrorInvalidValue);
+    softmax_kernel<<<query_heads * rows, threads, 0, (cudaStream_t)stream>>>(scores, probabilities, statistics, keys, status);
     return launched();
 }
 int attention_values(const float* probabilities, const uint16_t* block_values,
@@ -382,7 +504,42 @@ int attention_values(const float* probabilities, const uint16_t* block_values,
     if (!probabilities || !block_values || !ring || !output || layer < 0 || layer >= layers || rows < 1 || rows > block ||
         begin < 0 || frontier < begin || frontier - begin > capacity || frontier > 262144 - rows)
         return int(cudaErrorInvalidValue);
-    value_kernel<<<query_heads * rows, head_dim, 0, (cudaStream_t)stream>>>(probabilities, block_values, ring, output, layer, begin, frontier, rows, status);
+    static const bool contiguous_spans = enabled("STRATA_DFLASH2_VALUE_SPANS");
+    if (contiguous_spans)
+        value_spans_kernel<<<query_heads * rows, head_dim, 0, (cudaStream_t)stream>>>(probabilities, block_values, ring, output, layer, begin, frontier, rows, status);
+    else
+        value_kernel<<<query_heads * rows, head_dim, 0, (cudaStream_t)stream>>>(probabilities, block_values, ring, output, layer, begin, frontier, rows, status);
     return launched();
+}
+
+bool attention_value_split_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_DFLASH2_VALUE_SPLIT");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+const char* attention_value_split_identity() noexcept {
+    return attention_value_split_enabled() ? "value-split128-context1024-fp32-guard-v1" : "legacy-value-v1";
+}
+int attention_values_planned(const float* probabilities, const uint16_t* values,
+                     const uint16_t* ring, uint16_t* output, int layer,
+                     int begin, int frontier, int rows, uint32_t* status,
+                     void* stream, const AttentionValueWorkspace& workspace) {
+    // Validate extents before subtraction or selecting either implementation.
+    if (layer < 0 || layer >= layers || rows < 1 || rows > block || begin < 0 ||
+        frontier < begin || frontier > 262144 - rows || frontier - begin > capacity)
+        return int(cudaErrorInvalidValue);
+    if (!attention_value_split_enabled() || frontier - begin < attention_value_split_min_context)
+        return attention_values(probabilities, values, ring, output, layer, begin, frontier, rows, status, stream);
+    const int chunks = (frontier - begin + rows + attention_value_split_chunk - 1) / attention_value_split_chunk;
+    if (!workspace.partial || !workspace.unsafe ||
+        reinterpret_cast<uintptr_t>(workspace.partial) % alignof(float) ||
+        workspace.partial_count < value_split_detail::partial_count(rows, chunks) ||
+        workspace.flag_count < value_split_detail::flag_count(rows, chunks))
+        return int(cudaErrorInvalidValue);
+    return int(value_split_detail::launch<attention_value_split_chunk>(probabilities, values, ring,
+        workspace.partial, workspace.unsafe, output, layer, begin, frontier, rows, status,
+        static_cast<cudaStream_t>(stream)));
 }
 } // namespace strata::kernels::dflash2

@@ -331,6 +331,41 @@ void tap_publish(const float* src, float* dst, int64_t n, const uint32_t* enable
     check_launch("tap_publish");
 }
 
+// Explicit PTX prevents --use_fast_math from introducing FTZ or reassociation.
+// The CUDA-only DFlash2 prefill path calls this; HIP retains its raw capture path.
+#if !defined(__HIPCC__)
+__global__ void tap_reduce_publish_kernel(const float* __restrict__ src,
+                                          uint16_t* __restrict__ dst, int64_t n, int hidden,
+                                          const volatile uint32_t* enabled) {
+    if (*enabled == 0) return;
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += int64_t(gridDim.x) * blockDim.x) {
+        const int64_t base = (i / hidden) * 4 * hidden + i % hidden;
+        const float a = src[base], b = src[base + hidden];
+        const float c = src[base + 2 * hidden], d = src[base + 3 * hidden];
+        float sum, mean;
+        asm("add.rn.f32 %0, %1, %2;" : "=f"(sum) : "f"(a), "f"(b));
+        asm("add.rn.f32 %0, %1, %2;" : "=f"(sum) : "f"(sum), "f"(c));
+        asm("add.rn.f32 %0, %1, %2;" : "=f"(sum) : "f"(sum), "f"(d));
+        asm("mul.rn.f32 %0, %1, %2;" : "=f"(mean) : "f"(sum), "f"(0.25f));
+        dst[i] = bf16_from_f32(mean);
+    }
+    __threadfence_system();
+}
+void tap_reduce_publish(const float* src, uint16_t* dst, int rows, int hidden,
+                        const uint32_t* enabled, void* stream) {
+    if (rows <= 0) return;
+    if (hidden <= 0 || !src || !dst || !enabled) {
+        std::fprintf(stderr, "tap_reduce_publish: invalid shape or missing payload/enable word\n");
+        std::exit(1);
+    }
+    const int64_t n = int64_t(rows) * hidden;
+    const int blocks = int((n + 255) / 256 < 64 ? (n + 255) / 256 : 64);
+    tap_reduce_publish_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(src, dst, n, hidden, enabled);
+    check_launch("tap_reduce_publish");
+}
+#endif
+
 __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                         const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,
                                         float* w_out, uint32_t* seq) {

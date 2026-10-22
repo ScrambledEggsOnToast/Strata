@@ -131,6 +131,8 @@ public:
               const NativeHead* head, int max_t, std::string& err);
     /// Device arena only; same allocation sequence as init, no allocation or GPU work.
     static uint64_t planned_device_bytes(const ModelGeometry& g, int64_t context, int64_t vocab, int max_t);
+    /// Diagnostic histogram: zero when disabled, one pinned page per owner when enabled.
+    static uint64_t planned_expert_reuse_trace_host_bytes();
     /// One optional timestamp array's payload, on device and independently on host.
     /// Serial capture uses one pair per stage; pipelined copies are priced separately.
     static uint64_t planned_profile_bytes(const ModelGeometry& g) {
@@ -547,6 +549,22 @@ private:
     BatchKey bkey(const int* rows, int S, int hbase) const {
         return verify_batch_graph_key(rows, S, hbase, bool(ar_off_));
     }
+    // Diagnostic-only first selected/completed QSA graph key. Owner-local and never device-visible.
+    enum class QsaTraceState : uint8_t { unseen, selected, completed, invalidated };
+    QsaTraceState qsa_trace_state_ = QsaTraceState::unseen;
+    BatchKey qsa_trace_key_{};
+    int64_t qsa_trace_layer_ = -1;
+    void trace_qsa_same_slot_selected(int64_t layer, int rows);
+    void trace_qsa_same_slot_completed(const int* owners, int rows, int hbase, const char* route);
+    void trace_qsa_same_slot_receipt(bool completed, const char* route) const;
+    // Optional completed mode8/type21 exposure. Device bytes are part of layout_arena.
+    uint32_t* expert_reuse_counts_ = nullptr;
+    uint32_t* expert_reuse_counts_h_ = nullptr;
+    bool expert_reuse_trace_attempted_ = false, expert_reuse_trace_pending_ = false;
+    int expert_reuse_trace_rows_ = 0;
+    bool begin_expert_reuse_trace(const int* rows, int count, int base, std::string& err);
+    bool copy_expert_reuse_trace(std::string& err);
+    bool complete_expert_reuse_trace(const char* route, std::string& err);
     // External serving publishes layer completion; the submitter retains the scratch lease and CUDA drain.
     std::atomic<bool> b_running_{false};
     bool b_deferred_ = false;

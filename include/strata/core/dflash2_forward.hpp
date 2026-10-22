@@ -66,6 +66,10 @@ struct ContextSnapshotMetadata {
     bool initialized = false;
     std::string manifest_sha256;
     TargetIdentity target;
+    // Historical field name covers all forward arithmetic modes, including attention.
+    // Legacy default preserves existing import compatibility; numerical variants
+    // must match even when immutable checkpoint/target identities are equal.
+    std::string projection_mode = "legacy-bf16-v1";
 };
 class DeviceContextSnapshot {
 public:
@@ -123,6 +127,8 @@ public:
     size_t device_bytes() const noexcept;
     static size_t context_bytes() noexcept;
     static size_t scratch_bytes() noexcept;
+    // Off-mode identities stay byte-for-byte compatible with prior snapshots.
+    static const std::string& numerical_mode();
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

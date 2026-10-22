@@ -74,7 +74,7 @@ public:
     ~NativeTargetDeviceIo();
     NativeTargetDeviceIo(const NativeTargetDeviceIo&) = delete;
     NativeTargetDeviceIo& operator=(const NativeTargetDeviceIo&) = delete;
-    static constexpr size_t embedding_device_bytes() { return block_size * (sizeof(int32_t) + hidden_size * sizeof(float)); }
+    static constexpr size_t embedding_device_bytes() { return reference_block_size * (sizeof(int32_t) + hidden_size * sizeof(float)); }
     static constexpr size_t head_device_bytes(size_t scratch) { return (hidden_size + vocabulary_size) * sizeof(float) + scratch; }
     void begin_embeddings(std::span<const int32_t>);
     void finish_embeddings(std::span<float>);
@@ -119,13 +119,13 @@ public:
                     (op.request_id != last_operation_.request_id || op.incarnation != last_operation_.incarnation ||
                      (op.generation > last_operation_.generation && op.frontier >= last_operation_.frontier)),
                     "stale/outstanding native target operation");
-            require(ids.size() == block_size && out.size() == block_size * hidden_size &&
+            require(ids.size() == reference_block_size && out.size() == reference_block_size * hidden_size &&
                     ids[0] >= 0 && ids[0] < vocabulary_size &&
                     std::all_of(ids.begin() + 1, ids.end(), [](int32_t token) { return token == mask_token; }),
                     "native embedding requires anchor/mask/mask/mask and four raw rows");
             operation_ = op; active_ = true; head_rows_ = 0;
             io_.begin_embeddings(ids);
-            embedding_.gather_dev(io_.tokens(), block_size, io_.embedding_rows(), io_.embedding_stream());
+            embedding_.gather_dev(io_.tokens(), reference_block_size, io_.embedding_rows(), io_.embedding_stream());
             io_.finish_embeddings(out);
             check_loaded();
         } catch (...) { fail(); throw; }
@@ -133,7 +133,7 @@ public:
     void native_head(const Operation& op, std::span<const float> hidden, std::span<float> out) override {
         try {
             check_loaded();
-            require(active_ && op == operation_ && head_rows_ < block_size - 1 &&
+            require(active_ && op == operation_ && head_rows_ < reference_block_size - 1 &&
                     hidden.size() == hidden_size && out.size() == vocabulary_size,
                     "native head requires three serial owned hidden rows and full vocabulary");
             // This is a widening check, NOT a norm: the upstream draft has already
@@ -148,7 +148,7 @@ public:
                 throw Refusal("borrowed native projection failed: " + error_);
             io_.finish_head(out);
             check_loaded();
-            if (++head_rows_ == block_size - 1) {
+            if (++head_rows_ == reference_block_size - 1) {
                 active_ = false; last_operation_ = operation_;
             }
         } catch (...) { fail(); throw; }
@@ -157,7 +157,7 @@ private:
     static void require(bool ok, const char* message) { if (!ok) throw Refusal(message); }
     static bool valid_operation(const Operation& op) {
         return !op.request_id.empty() && op.request_id.size() <= 128 && op.incarnation >= 0 &&
-            op.generation > 0 && op.frontier >= 0 && op.frontier <= max_position - block_size &&
+            op.generation > 0 && op.frontier >= 0 && op.frontier <= max_position - reference_block_size &&
             std::all_of(op.request_id.begin(), op.request_id.end(), [](unsigned char c) {
                 return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                        (c >= '0' && c <= '9') || c == '_' || c == '.' || c == ':' || c == '-';

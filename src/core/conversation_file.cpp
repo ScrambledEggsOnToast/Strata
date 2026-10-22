@@ -1,3 +1,4 @@
+#include "strata/core/dflash2_bridge.hpp"
 #include "strata/core/conversation_file.hpp"
 
 #include <algorithm>
@@ -878,7 +879,7 @@ bool session_draft_validate(const SavedConversation& image, const Kv* kv, size_t
         const auto nonzero = [](const auto& digest) {
             return std::any_of(digest.begin(), digest.end(), [](uint8_t value) { return value != 0; });
         };
-        if (id.geometry != std::array<int64_t, 8>{5, 2560, 8, 128, 2047, 4, 262144, 16} ||
+        if (id.geometry != dflash2::native_geometry ||
             !nonzero(id.configuration) || !nonzero(id.borrowed_target) || image.draft_origin < 0 ||
             image.draft_begin != std::max(image.draft_origin, image.draft_cells - int64_t(2047)) ||
             image.draft_cells != live || image.draft_cells > 262144 || image.draft_next_token != -1 ||

@@ -1,3 +1,4 @@
+#include "strata/core/dflash2_bridge.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "conversation_checked.hpp"
 #include "strata/plan/resident.hpp"
@@ -663,7 +664,7 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
         return fail(error, "incoherent saved draft interval");
     if (native) {
         if (unknown || !image.draft_identity.bound() || image.draft_identity.format != 1 ||
-            image.draft_identity.geometry != std::array<int64_t, 8>{5, 2560, 8, 128, 2047, 4, 262144, 16} ||
+            image.draft_identity.geometry != dflash2::native_geometry ||
             image.draft_origin < 0 || image.draft_origin > image.draft_begin ||
             image.draft_cells > 262144 || image.draft_cells - image.draft_begin > 2047 ||
             !image.draft_boundary_residual.empty())

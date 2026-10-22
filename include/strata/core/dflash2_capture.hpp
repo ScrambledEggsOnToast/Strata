@@ -24,6 +24,7 @@ struct TapView {
     CapturePoint point = CapturePoint::completed_second_residual_write;
     std::span<const float> residuals; // immutable [row, four streams, 2560]
     CaptureOwner owner;
+    std::span<const uint16_t> reduced{}; // exclusive alternative: [row, 2560] BF16
 };
 struct CaptureSlice {
     int source_row = 0, staging_row = 0, count = 0;
@@ -133,6 +134,14 @@ public:
                phase_ == CapturePhase::verify ? CapturePoint::next_layer_first_gr_read_group :
                                                CapturePoint::completed_second_residual_write,
                {host, size_t(count_) * residual_width}, owner_};
+        return true;
+    }
+    bool view_reduced(CaptureOwner owner, int tap, const float* host, TapView& out, std::string& err) const {
+        if (phase_ != CapturePhase::prefill)
+            return refuse(err, "reduced capture is supported only for prefill");
+        if (!view(owner, tap, host, out, err)) return false;
+        out.residuals = {};
+        out.reduced = {reinterpret_cast<const uint16_t*>(host), size_t(count_) * hidden_size};
         return true;
     }
     bool release(CaptureOwner owner, std::string& err) {
