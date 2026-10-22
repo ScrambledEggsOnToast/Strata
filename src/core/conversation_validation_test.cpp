@@ -563,6 +563,16 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     SavedConversation unpublished;
     check(!conversation_snapshot_save(unpublished,view,ss,g,draft.st,error,std::move(reuse)), "incremental capture copy failure is reported");
     check(unpublished.kv.empty() && unpublished.live.ids.empty(), "failed incremental capture cannot publish a partial image");
+    reset(); fail_copy = 2;
+    std::fill(gdn.begin(), gdn.end(), 0x3c);
+    SavedConversation preserved = full;
+    check(!conversation_snapshot_save(preserved,view,ss,g,draft.st,error) && copy_calls == 2,
+          "a partially filled snapshot reports its second-copy failure");
+    check(preserved.live.ids == full.live.ids && preserved.live.gdn == full.live.gdn &&
+          preserved.live.ple == full.live.ple && preserved.live.tails == full.live.tails &&
+          preserved.live.dead == full.live.dead && preserved.live.block_pos == full.live.block_pos &&
+          preserved.kv.size() == full.kv.size() && preserved.kv[0].k == full.kv[0].k,
+          "partial capture failure leaves an existing published snapshot unchanged");
     reset();
     Pools direct_source(g,format);
     for (auto& bytes : direct_source.data) std::fill(bytes.begin(),bytes.end(),0x3c);

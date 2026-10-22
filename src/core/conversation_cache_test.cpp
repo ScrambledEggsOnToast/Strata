@@ -892,6 +892,26 @@ int main(int argc, char** argv) {
         check(another.gdn.bytes()==payload_charge && payload_charge>=survivor.gdn.size(),
               "each shared reference retains its conservative payload charge");
     }
+    {
+        CheckpointBytes source({7, 11, 13});
+        source.resize(5);
+        check(source == std::vector<uint8_t>({7, 11, 13, 0, 0}),
+              "ordinary checkpoint growth remains zero-filled");
+        source.seal();
+        auto writer = source;
+        writer.resize_for_overwrite(8);
+        std::fill(writer.write().begin() + 5, writer.write().end(), uint8_t(29));
+        writer.write()[0] = 31;
+        writer.seal();
+        check(source == std::vector<uint8_t>({7, 11, 13, 0, 0}) &&
+              writer == std::vector<uint8_t>({31, 11, 13, 0, 0, 29, 29, 29}) &&
+              source.data() != writer.data(),
+              "overwrite growth preserves existing bytes and cannot mutate sealed aliases");
+        writer.resize(3);
+        writer.resize(6);
+        check(writer == std::vector<uint8_t>({31, 11, 13, 0, 0, 0}),
+              "ordinary growth after overwrite and shrink does not expose stale tail bytes");
+    }
 
     {
         ConversationScope scope;

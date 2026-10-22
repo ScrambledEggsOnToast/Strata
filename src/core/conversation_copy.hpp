@@ -72,9 +72,9 @@ inline long test_slow_copy_us() {
     return v;
 }
 
-template<class T>
-inline std::vector<T> copy_beating(const std::vector<T>& src) {
-    std::vector<T> out;
+template<class T, class Allocator>
+inline std::vector<T, Allocator> copy_beating(const std::vector<T, Allocator>& src) {
+    std::vector<T, Allocator> out;
     out.reserve(src.size());
     const size_t step = std::max<size_t>(1, ((size_t) 1 << 20) / sizeof(T));
     for (size_t at = 0; at < src.size(); at += step) {

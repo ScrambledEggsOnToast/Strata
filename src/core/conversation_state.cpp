@@ -7,6 +7,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 
 namespace strata::core {
@@ -188,8 +191,8 @@ bool window_checkpoint_restore(const strata::core::ConversationCheckpoint& c, st
 namespace strata::core {
 #endif
 
-bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState& ss,
-                                  const ModelGeometry& g, std::string& error) {
+static bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss,
+                            const ModelGeometry& g, std::string& error, bool overwrite) {
 #if defined(STRATA_GPU_METAL)
     (void) ss; (void) g;
     return strata::metal_engine::window_checkpoint_save(c, error);
@@ -197,8 +200,13 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
-    c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
-    c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
+    const auto resize = [overwrite](CheckpointBytes& bytes, size_t count) {
+        if (overwrite) bytes.resize_for_overwrite(count);
+        else bytes.resize(count);
+    };
+    resize(c.gdn, z.gdn); resize(c.ple, ss.ple_hist ? z.ple : 0);
+    resize(c.tails, layers * z.tail); resize(c.dead, layers * z.dead);
+    resize(c.block_pos, layers * z.block_pos);
     if (!copy(c.gdn.write().data(), ss.gdn_state, c.gdn.size(), error, admission_copy::gdn, admission_copy::capture) ||
         !copy(c.ple.write().data(), ss.ple_hist, c.ple.size(), error, admission_copy::ple, admission_copy::capture)) return false;
     for (size_t j = 0; j < layers; ++j) {
@@ -208,7 +216,17 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
             !copy(c.block_pos.write().data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error, admission_copy::index_position, admission_copy::capture)) return false;
     }
     if (immutable_checkpoints_enabled()) c.seal();
+    if (overwrite) {
+        static const int receipt = std::fprintf(stderr,
+            "SNAPSHOT_CAPTURE_OVERWRITE completed=1 first_gdn_bytes=%zu\n", c.gdn.size());
+        (void) receipt;
+    }
     return true;
+}
+
+bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState& ss,
+                                  const ModelGeometry& g, std::string& error) {
+    return checkpoint_save(c, ss, g, error, false);
 }
 
 bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,
@@ -496,7 +514,14 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     captured.kv = std::move(reuse.kv);
     captured.kv.resize(layers + (draft ? 1 : 0) +
                        (view.draft_identity.kind == DraftKind::dflash2 ? 5 : 0));
-    if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
+    // Only this fresh, unpublished snapshot may skip destination initialization.
+    // A failed copy returns before image receives captured; ordinary checkpoint
+    // saves and file/store restoration keep their existing zero-filled builders.
+    static const bool overwrite = [] {
+        const char* value = std::getenv("STRATA_SNAPSHOT_CAPTURE_OVERWRITE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (!checkpoint_save(captured.live, ss, g, error, overwrite)) return false;
     const int64_t upto = (int64_t) view.ids.size();
     for (size_t j = 0; j < layers; ++j) {
         std::array<uint64_t, 5> kept{};
