@@ -321,6 +321,51 @@ change is not a full-model, HIP or daily qualification; the protected resident
 fixture must establish the new host-scratch bound before full-model use. See
 [the allocation audit and fixture limits](docs/experiments/direct-slot-discriminator.md#mode-specific-host-transient-accounting-source-only).
 
+## Native DFlash2 construction and verification bounds
+
+`--dflash2-draft-positions D` sets construction once at startup (`1..7`, default `3`).
+Every eligible native proposal still constructs the anchor plus all `D` mask rows:
+its absolute frontier must fit `D+1` rows within 262144 positions. Verification caps,
+confidence and remaining output/context rows do not shrink that construction.
+`DeviceForward` instead reserves its explicit forward row count; committed-feature
+ingest reserves zero rows, so ingest can reach position 262144. The versioned CPU
+reference, proposal observer and parity replay retain their fixed four-row,
+three-proposal contract rather than the native eight-row capacity.
+
+`--dflash2-proposals N` caps available neural proposals before confidence-width
+selection in both resident and serial serving (`1..7`, default `3`). Sampled lookup
+competition uses the capped pre-draw neural ceiling, independently of the current
+draw's confidence or token agreement; greedy competition still uses its selected
+width. A lookup replacement or chained tail can exceed `N+1` total verification
+rows. The cap does not authorize sampled construction wider than three proposals.
+
+`dflash2_frontier_cap_test` compiles source fragments for the native uniform and
+proposal guards, forward preflight/row dispatch, resident and serial admission
+predicates, width/competition selection and fixed-reference endpoint validators.
+It covers exact endpoints and one beyond, constructed-seven/cap-one separation,
+explicit forward rows and endpoint ingest, sampled-ceiling independence, and
+representative existing refusal guards. Its host records are not a GPU owner,
+kernel/reference arithmetic test or end-to-end serving qualification.
+
+The queued integrated CUDA build `fixb7cc59183` completed, and direct executions of
+`dflash2_frontier_cap_test`, `draft_policy_test` and `dflash2_prefix_decision_test`
+passed. The pre-fix source-fragment run failed at the first uniform endpoint
+assertion; it did not reach the width cases and is not a separate pre-fix F2
+reproduction. The prefix-decision fixture uses derived inputs, not another target
+model run. The standalone CPU-only configuration and CTest recipe below remain
+unrun:
+
+```sh
+cmake -S . -B build-frontier-cpu -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_ENABLE_HIP=OFF -DSTRATA_BUILD_TESTS=ON
+cmake --build build-frontier-cpu --target dflash2_frontier_cap_test draft_policy_test dflash2_prefix_decision_test
+ctest --test-dir build-frontier-cpu --output-on-failure -R '^(dflash2_frontier_cap_test|draft_policy_test|dflash2_prefix_decision_test)$'
+```
+
+HIP builds and, for these corrections, native GPU owner publication/retirement,
+real capture/replay I/O, full-context serving and performance remain unverified.
+The source-fragment checks establish host predicate/width behavior only; this
+change makes no speed or release-provenance claim.
+
 ## Experimental DFlash2 diagnostics
 
 `STRATA_DFLASH2_PHASES=1` reports inclusive host proposal subspans and completed

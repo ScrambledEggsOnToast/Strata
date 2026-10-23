@@ -1054,7 +1054,8 @@ spec_verify_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_voca
             double sum = 0.0;
             for (int i = 0; i < n_keep; ++i) sum += rw[i];
             if (!(sum > 0.0)) {
-                tok = d;   // p and q agree everywhere (rounding): the draft is as likely as it can be
+                // No positive residual remains; rounded q may dominate p without equality.
+                tok = d;   // retain the existing draft fallback
             } else {
                 const float u = philox_uniform(p.seed, pos | strata::core::kSpecCtrResid);
                 double cum = 0.0;

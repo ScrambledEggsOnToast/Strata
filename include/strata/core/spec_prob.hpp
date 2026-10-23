@@ -210,7 +210,8 @@ inline SpecResult spec_verify_row(const SpecP& P, int32_t d, const SpecQ& Q, flo
         w[i] = wi;
         sum += wi;
     }
-    if (!(sum > 0.0)) return {d, 1};   // p and q agree everywhere (rounding): the draft is as likely as it can be
+    // No positive residual remains; rounded q may dominate p without equality.
+    if (!(sum > 0.0)) return {d, 1};   // retain the existing draft fallback
     return {spec_pick(SpecP{P.id, P.p, n}, w, sum, u_resid), 0};
 }
 

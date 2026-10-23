@@ -253,7 +253,7 @@ private:
                         c.owner.incarnation <= uint64_t(std::numeric_limits<int64_t>::max()) &&
                         c.owner.generation <= uint64_t(std::numeric_limits<int64_t>::max()),
                         "capture owner exceeds signed reference operation bounds");
-            io::require(c.origin >= 0 && c.frontier >= c.origin && c.frontier <= max_position - block_size &&
+            io::require(c.origin >= 0 && c.frontier >= c.origin && c.frontier <= max_position - reference_block_size &&
                         c.anchor >= 0 && c.anchor < vocabulary_size && c.device >= 0 &&
                         c.raw_embeddings_device && c.hidden_device && c.logits_device,
                         "invalid real proposal buffers/range");

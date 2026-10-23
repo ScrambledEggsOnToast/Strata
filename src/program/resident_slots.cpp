@@ -2,6 +2,7 @@
 #include "strata/program/session_fingerprint.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/neural_drafter.hpp"
+#include "strata/core/dflash2_bridge.hpp"
 #include "strata/core/admission_copy_observer.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/resident_memory.hpp"
@@ -1413,7 +1414,8 @@ bool ResidentSlots::propose(int slot, const float* residual, std::string& error)
     auto& state = slots_[(size_t) slot];
     state.proposal.clear();
     if (state.stop || state.produced >= state.max_new || state.p >= context_ ||
-        (draft_.kind() == core::DraftKind::dflash2 && state.p > 262144 - 4)) return true;
+        (draft_.kind() == core::DraftKind::dflash2 &&
+         !core::dflash2::absolute_range_fits(state.p, core::dflash2::constructed_rows()))) return true;
     if (!draft_.propose_slot(slot, residual, state.x, state.p - 1, state.proposal, error)) return fail(slot);
     return true;
 }

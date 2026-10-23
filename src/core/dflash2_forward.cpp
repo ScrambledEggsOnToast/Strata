@@ -350,9 +350,9 @@ struct DeviceForward::Impl {
             ? "shared scratch is poisoned" : "shared operation lease timed out");
     }
     bool feature_preflight(const DeviceContext::Impl& c, const FeatureView& f,
-                           int frontier, bool proposal, int& begin, std::string& error) const {
+                           int frontier, int forward_rows, int& begin, std::string& error) const {
         if (!owns(c, error)) return false;
-        if (frontier < c.origin || frontier > max_position - (proposal ? block_size : 0) ||
+        if (frontier < c.origin || !absolute_range_fits(frontier, forward_rows) ||
             f.count < 0 || f.count > context_rows || f.start < c.origin ||
             f.start > frontier || f.count != frontier - f.start ||
             (c.initialized ? f.start != c.end : f.start != std::max(c.origin, frontier - context_rows)))
@@ -492,7 +492,7 @@ struct DeviceForward::Impl {
         if (!acquire(guard, error)) return false;
         const bool proposal = embeddings != nullptr;
         int begin = 0;
-        if (!feature_preflight(c, features, frontier, proposal, begin, error)) { guard.complete(); return false; }
+        if (!feature_preflight(c, features, frontier, proposal ? proposal_rows : 0, begin, error)) { guard.complete(); return false; }
         bool submitted = false;
         uint32_t numeric = 0;
         Execution e{stream, error, trace};

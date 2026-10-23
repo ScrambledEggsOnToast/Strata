@@ -216,8 +216,8 @@ int run(const Options& o) {
     io::require(bundle.at("schema") == 1 && bundle.at("kind") == "strata-dflash2-real-proposal" &&
         bundle.at("target") == io::target_document(verified.binding().identity) && bundle.at("runtime_manifest_sha256") == o.manifest,
         "bundle is not bound to independently loaded actual target/runtime bytes");
-    const int origin = bounded(bundle.at("origin"), 0, df::max_position - df::block_size, "origin");
-    const int frontier = bounded(bundle.at("frontier"), origin, df::max_position - df::block_size, "frontier");
+    const int origin = bounded(bundle.at("origin"), 0, df::max_position - df::reference_block_size, "origin");
+    const int frontier = bounded(bundle.at("frontier"), origin, df::max_position - df::reference_block_size, "frontier");
     const int anchor = bounded(bundle.at("anchor"), 0, df::vocabulary_size - 1, "anchor");
     const auto& context_metadata = bundle.at("context");
     const int begin = bounded(context_metadata.at("begin"), origin, frontier, "context begin");

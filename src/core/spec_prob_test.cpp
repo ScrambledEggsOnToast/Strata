@@ -14,11 +14,16 @@
 // up in the pairs first), with a draft of depth 2 whose second row is conditioned on the first draft.
 // Truncation regressions: a point-mass row inside a window that also has q rows (a lookup chain's tail) behaves as
 // exact match (accept probability p(d)), and "no list" is never "q = 0".
+// --rounding-witness runs only deterministic FP32-q/acceptance arithmetic and exact 24-bit CDF interval checks.
 #include "strata/core/spec_prob.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -185,9 +190,132 @@ std::vector<float> rand_logits(std::mt19937_64& g, float spread) {
     return l;
 }
 
+constexpr uint32_t uniform_grid_size = 1u << 24;
+constexpr float uniform_grid_step = 0x1p-24f;
+
+void exact_check(bool ok, const char* reason) {
+    ++g_cases;
+    if (!ok) { ++g_fail; std::fprintf(stderr, "FAIL: rounding witness: %s\n", reason); }
+}
+
+// Count j / 2^24 in each strict inverse-CDF interval, indexed by TOKEN ID, not rank.
+// Multiplication by 2^24 is exact for these double CDF boundaries. Probe both ends
+// with the real CPU sampler helper, including exact dyadic boundaries.
+std::array<uint32_t, V> cdf_grid_counts(const SpecP& P) {
+    std::array<uint32_t, V> count{};
+    double cumulative = 0.0;
+    uint32_t begin = 0;
+    for (int i = 0; i < P.n; ++i) {
+        cumulative += P.p[i];
+        const auto end = uint32_t(std::clamp(std::ceil(cumulative * uniform_grid_size),
+                                             0.0, double(uniform_grid_size)));
+        if (end > begin) {
+            exact_check(spec_sample(P, float(begin) * uniform_grid_step) == P.id[i],
+                        "strict CDF interval lower endpoint");
+            exact_check(spec_sample(P, float(end - 1) * uniform_grid_step) == P.id[i],
+                        "strict CDF interval upper endpoint");
+            count[size_t(P.id[i])] += end - begin;
+        }
+        begin = end;
+    }
+    // Match spec_sample's last-token fallback if the measured mass is below one.
+    count[size_t(P.id[P.n - 1])] += uniform_grid_size - begin;
+    return count;
+}
+
+void rounding_witness() {
+    std::printf("rounding witness: CPU helpers, manual candidate order; no selector/Philox/CUDA execution\n");
+    std::vector<float> logits(V, -200.0f);
+    logits[4] = logits[9] = 0.0f;
+    logits[2] = -uniform_grid_step;
+    const List P = chain_list(logits, Chain{3, 1.0f, 0.0f, 1.0f});
+    exact_check(P.id == std::vector<int32_t>{4, 9, 2}, "explicit target token-ID order");
+    if (P.id != std::vector<int32_t>{4, 9, 2}) return;
+
+    // An admitted numerical row, not an asserted output of the real selector.
+    // Its CDF must use the exported FP32 probabilities, not chain_list's doubles.
+    List Q;
+    Q.id = P.id;
+    for (int id = 0; id < V; ++id)
+        if (std::find(Q.id.begin(), Q.id.end(), id) == Q.id.end()) Q.id.push_back(id);
+    Q.q.assign(V, 0.0f);
+    std::fill_n(Q.q.begin(), 3, float(1.0 / 3.0));
+    double mass = 0.0;
+    for (float q : Q.q) { Q.p.push_back(double(q)); mass += double(q); }
+    exact_check(mass > 1.0 && mass - 1.0 <= V * double(std::numeric_limits<float>::epsilon()),
+                "FP32 mass overshoots one within the sixteen-candidate bound");
+    const SpecP sp{P.id.data(), P.p.data(), int(P.id.size())};
+    const SpecP draft_cdf{Q.id.data(), Q.p.data(), int(Q.id.size())};
+    const SpecQ sq{Q.id.data(), Q.q.data(), int(Q.id.size())};
+    const auto target_counts = cdf_grid_counts(sp);
+    exact_check(target_counts == cdf_grid_counts(draft_cdf),
+                "target and exported-FP32 draft have identical exact token-ID grid counts");
+    List reordered = Q;
+    std::swap(reordered.id[0], reordered.id[1]);
+    const SpecP reordered_cdf{reordered.id.data(), reordered.p.data(), int(reordered.id.size())};
+    exact_check(target_counts != cdf_grid_counts(reordered_cdf),
+                "swapping candidate token IDs changes the count map despite identical rank masses");
+
+    const int32_t d = P.id[2];
+    const double pd = P.p[2], qd = double(Q.q[2]);
+    const float maximum = 1.0f - uniform_grid_step;
+    const float preceding = maximum - uniform_grid_step;
+    exact_check(maximum < 1.0f && preceding == std::nextafter(maximum, 0.0f),
+                "adjacent highest uniforms on the 24-bit grid");
+    exact_check(double(preceding) * qd < pd && double(maximum) * qd > pd,
+                "preceding grid point accepts while the maximum strictly fails raw acceptance");
+    double residual = 0.0;
+    for (size_t i = 0; i < P.id.size(); ++i) {
+        exact_check(P.p[i] < double(Q.q[i]), "target mass is strictly below rounded q, not equal");
+        residual += std::max(0.0, P.p[i] - double(Q.q[i]));
+    }
+    exact_check(residual == 0.0, "all positive residual weights are zero");
+    const SpecResult kept_before = spec_verify_row(sp, d, sq, preceding, 0.5f);
+    const SpecResult kept_after = spec_verify_row(sp, d, sq, maximum, 0.5f);
+    exact_check(kept_before.token == d && kept_before.accepted == 1, "CPU helper keeps the accepted draft");
+    exact_check(kept_after.token == d && kept_after.accepted == 1,
+                "CPU zero-residual fallback reports a kept draft despite the failed raw predicate");
+
+    // Expose the same raw acceptance boundary through an observable rejection:
+    // keep p(d) unchanged, but move mass between other IDs to create a residual.
+    List positive_residual = P;
+    positive_residual.p[0] += uniform_grid_step;
+    positive_residual.p[1] -= uniform_grid_step;
+    const SpecP rp{positive_residual.id.data(), positive_residual.p.data(), int(positive_residual.id.size())};
+    const SpecResult before = spec_verify_row(rp, d, sq, preceding, 0.5f);
+    const SpecResult after = spec_verify_row(rp, d, sq, maximum, 0.5f);
+    exact_check(before.token == d && before.accepted == 1, "real CPU helper accepts preceding grid point");
+    exact_check(after.token == P.id[0] && after.accepted == 0,
+                "real CPU helper rejects maximum grid point into the positive residual");
+
+    // Equality must reject, not accept: u*q(d) == p(d) exactly in binary.
+    const int32_t ids[] = {4, 9};
+    const double p[] = {0.25, 0.75};
+    const float q[] = {0.5f, 0.5f};
+    const SpecP boundary{ids, p, 2};
+    const SpecQ boundary_q{ids, q, 2};
+    const SpecResult below = spec_verify_row(boundary, ids[0], boundary_q, std::nextafter(0.5f, 0.0f), 0.0f);
+    const SpecResult equal = spec_verify_row(boundary, ids[0], boundary_q, 0.5f, 0.0f);
+    exact_check(below.token == ids[0] && below.accepted == 1, "acceptance just below an exact boundary");
+    exact_check(equal.token == ids[1] && equal.accepted == 0, "strict acceptance at an exact boundary");
+    const auto boundary_counts = cdf_grid_counts(boundary);
+    exact_check(boundary_counts[size_t(ids[0])] == uniform_grid_size / 4 &&
+                boundary_counts[size_t(ids[1])] == 3 * (uniform_grid_size / 4),
+                "strict CDF counts at an exact dyadic boundary");
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 2 || (argc == 2 && std::strcmp(argv[1], "--rounding-witness") != 0)) {
+        std::fprintf(stderr, "usage: spec_prob_test [--rounding-witness]\n");
+        return 2;
+    }
+    rounding_witness();
+    if (argc == 2) {
+        std::printf("spec_prob_test: %d deterministic checks, %d failed\n", g_cases, g_fail);
+        return g_fail == 0 ? 0 : 1;
+    }
     std::mt19937_64 g(20261006);
     const int N = 2000000;
     const std::vector<Chain> chains = {{64, 1.0f, 0.0f, 1.0f},  {1, 1.0f, 0.0f, 1.0f},   {5, 1.0f, 0.0f, 1.0f},

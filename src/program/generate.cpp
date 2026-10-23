@@ -942,7 +942,7 @@ struct Options {
     /// this probability under the draft layer; 0 = always --spec-1 drafts.
     double spec_min_p = 0.0;
     bool dflash2_accept_hist = false;   // opt-in: per-(offered,accepted) histogram on resident completion
-    int dflash2_max_proposals = 3;      // native drafter: proposals verified per step (1..3); lossless truncation
+    int dflash2_max_proposals = 3;      // native drafter: proposals verified per step (1..7); lossless truncation
     int dflash2_draft_positions = 3;    // native drafter: proposals constructed per step (1..7)
     /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
     bool stop_eos = false;
@@ -17111,7 +17111,7 @@ int main(int argc, char** argv) {
             if (use_dflash) {
                 const auto& state = bs[size_t(slot)];
                 if (S_mtp <= 1 || state.max_new - state.produced <= 1 || o.max_context - state.p <= 1 ||
-                    state.p > strata::core::dflash2::max_position - 4) return true;
+                    !strata::core::dflash2::absolute_range_fits(state.p, strata::core::dflash2::constructed_rows())) return true;
                 if (!prepare_native_uniforms(slot, state.p, state.sampling, why)) return false;
             }
             if (private_preparation && slot >= 0 && size_t(slot) < packed_owners.size() &&
@@ -17432,12 +17432,11 @@ int main(int argc, char** argv) {
         // the stage-to-verifier mapping: one definition, before every use below (`batch_step` and the pipelined pump)
         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
         auto neural_row_width = [&](const BSlot& slot) {
-            int proposals = use_dflash ? strata::spec::neural_window_width(slot.proposal.confidence.data(),
-                slot.proposal.count, S_mtp, float(slot.input.spec_min_probability),
+            // Cap available neural proposals before confidence selection; this does not
+            // shrink the constructed block or a later lookup/chained target window.
+            const int proposals = use_dflash ? strata::spec::neural_window_width(slot.proposal.confidence.data(),
+                std::min(slot.proposal.count, o.dflash2_max_proposals), S_mtp, float(slot.input.spec_min_probability),
                 !slot.sampling.greedy && slot.sampling.temperature > 0) - 1 : 1;
-            // Truncating the draft width is lossless: unverified proposals are simply discarded, exactly as if the
-            // drafter had offered fewer. It is the knob that trades verified rows against acceptance length.
-            if (use_dflash) proposals = std::min(proposals, o.dflash2_max_proposals);
             return int(std::max<int64_t>(1, std::min<int64_t>(
                 proposals + 1, std::min(slot.max_new - slot.produced, o.max_context - slot.p))));
         };
@@ -24169,7 +24168,7 @@ int main(int argc, char** argv) {
                     dflash && !input.images &&
                     !pipe && merge_T == 0 && o.spec_corrupt <= 0 && S_mtp > 1 &&
                     max_new > 1 && p > 0 && o.max_context - p > 1 &&
-                    p <= strata::core::dflash2::max_position - strata::core::dflash2::block_size &&
+                    strata::core::dflash2::absolute_range_fits(p, strata::core::dflash2::constructed_rows()) &&
                     !stop_req.load()) {
                     const auto coverage = neural->slot_coverage(8);
                     if (coverage.present && coverage.coherent && coverage.certified_end == p) {
@@ -24186,9 +24185,12 @@ int main(int argc, char** argv) {
                 }
 #endif
                 const bool initial_native_window = first_window && initial_native_proposal;
+                const int neural_proposals = use_dflash ? std::min(serial_proposal.count, o.dflash2_max_proposals) : S_mtp - 1;
+                // Sampled source competition uses this capped pre-draw ceiling, not
+                // the confidence-selected width of the current neural draws.
+                const int neural_ceiling = std::min(S_mtp, neural_proposals + 1);
                 int T = !use_neural ? 1 : strata::spec::neural_window_width(dprob.data(),
-                    use_dflash ? serial_proposal.count : S_mtp - 1, S_mtp,
-                    float(req_spec_min_p), sampled_request);
+                    neural_proposals, S_mtp, float(req_spec_min_p), sampled_request);
                 if (first_window && !initial_native_window) T = merge_T > 0 ? merge_T : 1;
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
@@ -24201,7 +24203,7 @@ int main(int argc, char** argv) {
                     lookup_proposed = k;
                     sfx_match = sfx.last_match();
                     if (k > 0 && strata::spec::lookup_competes(sampled_request, use_neural, sbuf[0], drafts[0])) {
-                        const strata::spec::DraftPolicy::Pick pk = policy.choose(sampled_request ? S_mtp : T, k, sfx_match);
+                        const strata::spec::DraftPolicy::Pick pk = policy.choose(sampled_request ? neural_ceiling : T, k, sfx_match);
                         if (pk.lookup) { T = pk.t; from_sfx = true; }
                     }
                 }
@@ -24592,7 +24594,8 @@ int main(int argc, char** argv) {
                     const auto draft_started = Clock::now();
                     serial_proposal.clear();
                     if (!terminal && !admission_yield && S_mtp > 1 && max_new - produced_n > 1 &&
-                        o.max_context - (p + keep) > 1 && p + keep <= strata::core::dflash2::max_position - 4) {
+                        o.max_context - (p + keep) > 1 &&
+                        strata::core::dflash2::absolute_range_fits(p + keep, strata::core::dflash2::constructed_rows())) {
                         drafted = prepare_native_uniforms(8, p + keep, req_sp, err) &&
                             neural->propose_slot(8, nullptr, outv[size_t(keep - 1)], p + keep - 1, serial_proposal, err);
                         if (drafted) {

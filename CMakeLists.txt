@@ -407,6 +407,59 @@ if(STRATA_BUILD_TESTS)
     string(SUBSTRING "${text}" 0 ${last} text)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/${output}.inc" "${text}\n")
   endfunction()
+  # Native D+1 reservations and capped neural competition: compile real caller
+  # predicates against small host records, without constructing a GPU owner.
+  strata_cpu_fixture_piece(src/core/dflash2_drafter.cpp
+    "    if (!request || !owns(expected) || expected.seat != slot || !expected.request ||"
+    "\n    return true;\n}\nvoid DflashNativeDrafter::set_draft_sampling" dflash2_uniform_guard)
+  strata_cpu_fixture_piece(src/core/dflash2_drafter.cpp
+    "    const bool sampled = !sampling.greedy && sampling.temperature > 0;\n    if (sampled && draft_positions()"
+    "\n    return true;\n}\nbool DflashNativeDrafter::propose_impl" dflash2_proposal_guard)
+  strata_cpu_fixture_piece(src/core/dflash2_drafter.cpp
+    "    const int rows = constructed_rows() - 1;"
+    "\n    request->uniforms_valid = false;" dflash2_constructed_ids)
+  strata_cpu_fixture_piece(src/core/dflash2_forward.cpp
+    "bool legal_request(std::string_view id)" "\nbool device_pointer(" dflash2_request_id)
+  strata_cpu_fixture_piece(src/core/dflash2_forward.cpp
+    "    bool owns(const DeviceContext::Impl& c" "\n    bool acquire(" dflash2_forward_owner)
+  strata_cpu_fixture_piece(src/core/dflash2_forward.cpp
+    "    bool feature_preflight(" "\n    void publish(" dflash2_forward_features)
+  strata_cpu_fixture_piece(src/core/dflash2_forward.cpp
+    "        const bool proposal = embeddings != nullptr;"
+    "\n        bool submitted = false;" dflash2_forward_extent)
+  strata_cpu_fixture_piece(src/core/dflash2_forward.cpp
+    "    if (!embeddings || !output) return refuse(error, \"proposal requires embedding and output rows\");"
+    "\n    return impl_->run(" dflash2_forward_public_guard)
+  strata_cpu_fixture_piece(src/program/generate.cpp
+    "                if (S_mtp <= 1 || state.max_new - state.produced <= 1 || o.max_context - state.p <= 1 ||"
+    "\n                if (!prepare_native_uniforms(" dflash2_resident_gate)
+  strata_cpu_fixture_piece(src/program/resident_slots.cpp
+    "    if (state.stop || state.produced >= state.max_new || state.p >= context_ ||"
+    "\n    if (!draft_.propose_slot(" dflash2_resident_final_gate)
+  strata_cpu_fixture_piece(src/program/generate.cpp
+    "                if (first_window && ((native_first_block && admit_slot < 0) || admit_first_block) &&"
+    "\n                    const auto coverage = " dflash2_initial_gate)
+  strata_cpu_fixture_piece(src/program/generate.cpp
+    "                    if (!terminal && !admission_yield && S_mtp > 1 && max_new - produced_n > 1 &&"
+    "\n                        drafted = prepare_native_uniforms(" dflash2_continuation_gate)
+  strata_cpu_fixture_piece(src/program/generate.cpp
+    "        auto neural_row_width = " "\n        auto append_neural_rows = " dflash2_resident_width)
+  strata_cpu_fixture_piece(src/program/generate.cpp
+    "                const bool initial_native_window = first_window && initial_native_proposal;"
+    "\n                const auto proposal_ns = " dflash2_serial_width)
+  strata_cpu_fixture_piece(src/program/generate.cpp
+    "                int T_mtp = T;"
+    "\n                const bool timed_round = " dflash2_mixed_width)
+  strata_cpu_fixture_piece(include/strata/program/dflash2_parity_capture.hpp
+    "            io::require(c.owner.request && c.owner.generation && c.owner.seat >= 0 && c.owner.seat <= 8 &&"
+    "\n            io::require(c.context.start == " dflash2_observer_range)
+  strata_cpu_fixture_piece(src/program/dflash2_parity.cpp
+    "    const int origin = bounded(bundle.at(\"origin\"),"
+    "\n    const int anchor = bounded(" dflash2_replay_range)
+  add_executable(dflash2_frontier_cap_test tests/program/dflash2_frontier_cap_test.cpp)
+  target_include_directories(dflash2_frontier_cap_test PRIVATE include "${CMAKE_CURRENT_BINARY_DIR}")
+  add_test(NAME dflash2_frontier_cap_test COMMAND dflash2_frontier_cap_test)
+  set_tests_properties(dflash2_frontier_cap_test PROPERTIES TIMEOUT 10)
   # #295: retained real row-zero decision, not a second target inference.
   strata_cpu_fixture_piece(src/program/generate.cpp
     "                int a = merged ? T - 1 : 0;"

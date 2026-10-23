@@ -151,6 +151,27 @@ void lifecycle() {
           proposal.owner.incarnation == 1 && proposal.frontier == rows.slot_cells(0) &&
           rows.owner(1) == second && rows.inputs_pending(1) && rows.fingerprint(0) == once,
           "proposal binds the current producer while preserving a peer's pending capture and committed rows");
+    {
+        // Retain the real common owner's request/incarnation/generation and completed frontier.
+        DraftProposal rounded = proposal;
+        for (int row = 0; row < rounded.count; ++row) {
+            rounded.confidence[row] = float(1.0 / 3.0);
+            for (int item = 0; item < kSpecQEntries; ++item) {
+                rounded.q[size_t(row) * kSpecQStride + item] = item < 16 ? 100 + item : -1;
+                rounded.q[size_t(row) * kSpecQStride + kSpecQEntries + item] =
+                    std::bit_cast<int32_t>(item < 3 ? float(1.0 / 3.0) : 0.0f);
+            }
+        }
+        check(rounded.owner.request && rounded.owner.incarnation && rounded.owner.generation &&
+              rounded.frontier == rows.slot_cells(0) && rounded.count == 3 &&
+              rounded.validate(1024, error, DraftKind::dflash2),
+              "owned sixteen-candidate DFlash proposal admits three rounded positive masses and thirteen zeros");
+        DraftProposal three = rounded;
+        for (int row = 0; row < three.count; ++row)
+            std::fill_n(three.q.begin() + size_t(row) * kSpecQStride + 3, kSpecQEntries - 3, -1);
+        check(three.validate(1024, error) && !three.validate(1024, error, DraftKind::dflash2),
+              "numerically valid three-candidate rows cannot substitute for sixteen-candidate DFlash rows");
+    }
     check(rows.complete(second, 19, 3, all_layers, error),
           "second request independently completes its own nonzero-origin context after the peer's proposal");
     const auto observed = rows.owner(0);

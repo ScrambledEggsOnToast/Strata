@@ -3,6 +3,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/dflash2_drafter.hpp"
 #include "strata/core/dflash2_weights.hpp"
+#include "strata/core/family_layout.hpp"
 #include "strata/core/native_head.hpp"
 #include <cuda_runtime.h>
 #include <array>
@@ -107,9 +108,11 @@ void run(const std::map<std::string, std::string>& args) {
     check(shards.size() == 2, "fixture requires the verified two-shard daily target");
     strata::core::ModelGeometry geometry;
     const strata::GgufFile model(shards.front());
-    std::string error = strata::read_geometry(model, geometry);
-    check(error.empty(), error.c_str());
-    error = strata::geometry_unsupported(geometry);
+    std::string error;
+    int64_t top_k = 0;
+    const bool geometry_ok = strata::core::geometry_from_gguf(model, geometry, top_k, error);
+    check(geometry_ok, error.c_str());
+    error = strata::core::compiled_geometry_mismatch(geometry);
     check(error.empty(), error.c_str());
     strata::core::NativeEmbed embedding;
     cuda_check(__real_cudaSetDevice(0));

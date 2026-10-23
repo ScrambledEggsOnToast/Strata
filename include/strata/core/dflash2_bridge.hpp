@@ -3,6 +3,7 @@
 
 #include "strata/core/operation_lease.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -30,10 +31,16 @@ inline bool set_draft_positions(int positions) {
     if (positions < 1 || positions >= block_size) return false;
     draft_positions_storage() = positions;
     return true;
-}   // published block_size; the draft position count is per-request
+}
 inline constexpr int max_verify_rows = 8; // engine mixed-policy target window, not the fixed drafter block
 inline constexpr int context_rows = 2047;
 inline constexpr int max_position = 262144;
+// Native construction always reserves the anchor plus the full startup-configured
+// proposal block, independently of verification caps, confidence and output limits.
+inline int constructed_rows() { return std::clamp(draft_positions(), 1, block_size - 1) + 1; }
+inline constexpr bool absolute_range_fits(int64_t frontier, int rows) {
+    return rows >= 0 && rows <= max_position && frontier >= 0 && frontier <= max_position - rows;
+}
 // One identity for native snapshots, file records and durable-store manifests.
 inline constexpr std::array<int64_t, 8> native_geometry{
     5, hidden_size, 8, 128, context_rows, block_size, max_position, 16};

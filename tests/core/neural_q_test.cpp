@@ -1,6 +1,7 @@
 #include "strata/core/spec_prob.hpp"
 
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -56,6 +57,30 @@ int main() {
     changed = valid;
     probability(changed, 32, 0.25f);
     check("probability outside declared support", changed, 15, false);
+    {
+        Row rounded = valid;
+        for (int i = 0; i < 16; ++i) probability(rounded, i, i < 3 ? float(1.0 / 3.0) : 0.0f);
+        check("sixteen candidates with three rounded positive masses", rounded, 2, true);
+        check("rounded row still requires positive chosen-token mass", rounded, 15, false);
+        Row three = rounded;
+        std::fill(three.begin() + 3, three.begin() + strata::core::kSpecQEntries, -1);
+        check("three rounded masses satisfy the generic numerical contract", three, 2, true);
+        probability(rounded, 16, std::numeric_limits<float>::denorm_min());
+        check("rounded row requires a zero probability tail", rounded, 2, false);
+
+        // The mass bound is inclusive and counts all sixteen candidates, not just positive masses.
+        const float tolerance = 16 * std::numeric_limits<float>::epsilon();
+        Row boundary = valid;
+        for (int i = 0; i < 16; ++i) probability(boundary, i, i == 0 ? 0.5f : i < 3 ? 0.25f : 0.0f);
+        probability(boundary, 0, 0.5f + tolerance);
+        check("upper mass tolerance boundary with thirteen zeros", boundary, 2, true);
+        probability(boundary, 0, std::nextafter(0.5f + tolerance, 1.0f));
+        check("one float step above upper mass tolerance", boundary, 2, false);
+        probability(boundary, 0, 0.5f - tolerance);
+        check("lower mass tolerance boundary with thirteen zeros", boundary, 2, true);
+        probability(boundary, 0, std::nextafter(0.5f - tolerance, 0.0f));
+        check("one float step below lower mass tolerance", boundary, 2, false);
+    }
     {
         std::array<int32_t, 3 * strata::core::kSpecQStride> prefix{};
         for (int row = 0; row < 3; ++row)

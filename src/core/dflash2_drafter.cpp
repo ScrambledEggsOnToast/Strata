@@ -482,7 +482,7 @@ bool DflashNativeDrafter::set_proposal_uniforms(int slot, const DraftOwner& expe
         const std::array<float, 3>& uniforms, std::string& error) {
     auto* request = impl_->request(slot);
     if (!request || !owns(expected) || expected.seat != slot || !expected.request ||
-        frontier != request->context->end() || frontier > max_position - block_size)
+        frontier != request->context->end() || !absolute_range_fits(frontier, constructed_rows()))
         return refuse(error, "stale proposal random owner/frontier");
     for (float value : uniforms)
         if (!std::isfinite(value) || value < 0 || value >= 1)
@@ -508,7 +508,7 @@ bool DflashNativeDrafter::proposal_preflight(int slot, const float*, int32_t anc
     if (sampled && draft_positions() > kernels::dflash2::selector_sampled_rows)
         return refuse(error, "sampled proposals support at most three independently drawn rows");
     if (!request || !coverage.present || !coverage.coherent || cell < 0 ||
-        cell + 1 != request->context->end() || cell + 1 > max_position - block_size ||
+        cell + 1 != request->context->end() || !absolute_range_fits(cell + 1, constructed_rows()) ||
         anchor < 0 || anchor >= vocabulary_size || !std::isfinite(sampling.temperature) ||
         sampling.temperature < 0 || (sampled && (!request->uniforms_valid ||
         request->uniform_owner != expected || request->uniform_frontier != frontier)))
@@ -523,7 +523,7 @@ bool DflashNativeDrafter::propose_impl(Operation& operation, const float*, int32
     const auto& sampling = sampling_[size_t(expected.seat)];
     const bool sampled = !sampling.greedy && sampling.temperature > 0;
     const auto uniforms = request->uniforms;
-    const int rows = std::max(1, std::min(draft_positions(), int(block_size) - 1));
+    const int rows = constructed_rows() - 1;
     std::array<int32_t, block_size> ids{};
     ids[0] = anchor;
     for (int row = 1; row < rows + 1; ++row) ids[size_t(row)] = mask_token;
