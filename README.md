@@ -283,7 +283,9 @@ refusal and poisoned guards. It requires one actual pre75 chunk launch on SM70
 and the existing scalar fallback on SM86. Both devices passed this bounded
 functional check. A six-task c4 service screen completed cleanly with actual
 mixed-path exposure on both SM70 stages, but DFlash2 throughput fell 1.22%
-with the feature (95.21 to 94.05 committed tokens/s); MTP also fell 3.80%.
+(whole-cohort span: 95.2073 to 94.0419 committed tokens/s); MTP fell 3.80%.
+The retained client instead sums wave spans, excluding about 0.5 ms between
+waves; both calculations are preserved and give the same rejection.
 The candidate failed the predeclared +3% confirmation threshold and remains
 disabled and unadopted. This single screen does not establish broader effects.
 
