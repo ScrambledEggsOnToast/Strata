@@ -74,6 +74,9 @@ public:
     bool load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err,
               bool verify_identity = false);
     bool loaded() const { return dev_ != nullptr; }
+    // A loaded cudaHostAlloc table, not the VRAM fallback. Cross-device CUDA
+    // callers must also require unified addressing on both participating devices.
+    bool mapped_host() const { return host_ != nullptr && dev_ != nullptr; }
     int device() const { return identity_.device; }
     const NativeTensorIdentity& identity() const { return identity_; }
     /// Rows for device token ids.

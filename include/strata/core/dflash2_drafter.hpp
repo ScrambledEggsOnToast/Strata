@@ -41,8 +41,9 @@ public:
     bool enabled() const override { return true; }
     uint64_t vram_bytes() const override;
     DraftAllocationPlan allocation_plan() const override;
-    // Allocations made on embedding/head GPUs, if distinct from the drafter.
+    // Allocations made on embedding/head execution GPUs, if distinct from the drafter.
     DraftAllocationPlan target_allocation_plan(int device) const;
+    // embedding_device is the resolved execution GPU, not the immutable load receipt.
     static DraftAllocationPlan planned_allocation(int device, size_t dense_bytes,
                                                   int embedding_device, int head_device,
                                                   size_t head_scratch_bytes);

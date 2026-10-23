@@ -5159,6 +5159,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%s\n", err.c_str()); return 2;
     }
     const bool device_features = strata::core::dflash2::device_features_enabled();
+    const bool local_embedding = strata::core::dflash2::local_embedding_enabled();
+    if (local_embedding && o.dflash2.empty()) {
+        std::fprintf(stderr, "strata dflash2: local embedding requires the DFlash2 drafter\n"); return 2;
+    }
     if (device_features && (o.dflash2.empty() || !o.dflash2_capture || split_auto)) {
         std::fprintf(stderr, "strata dflash2: device features require native capture and resolved non-auto layer placement\n");
         return 2;
@@ -5166,6 +5170,9 @@ int main(int argc, char** argv) {
 #if !defined(STRATA_DFLASH2_CAPTURE)
     if (device_features) {
         std::fprintf(stderr, "strata dflash2: device features require the CUDA native adapter\n"); return 2;
+    }
+    if (local_embedding) {
+        std::fprintf(stderr, "strata dflash2: local embedding requires the CUDA native adapter\n"); return 2;
     }
 #endif
     std::array<uint64_t, SplitDrive::kMax> capture_device_bytes{};
@@ -5195,6 +5202,7 @@ int main(int argc, char** argv) {
     strata::core::DraftAllocationPlan dflash_allocation;
     uint64_t dflash_dense_bytes = 0;
     const int dflash_device = split_devs.empty() ? primary_device : split_devs.back();
+    const int dflash_embedding_device = local_embedding ? dflash_device : primary_device;
     if (device_features) {
         std::array<int, SplitDrive::kMax> sources{};
         sources[0] = primary_device;
@@ -5213,7 +5221,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata dflash2: cannot price the converted dense weight file\n"); return 2;
         }
         dflash_allocation = strata::core::dflash2::DflashNativeDrafter::planned_allocation(
-            dflash_device, size_t(dflash_dense_bytes), primary_device, dflash_device, dflash_head_scratch);
+            dflash_device, size_t(dflash_dense_bytes), dflash_embedding_device, dflash_device, dflash_head_scratch);
     }
 #endif
 
@@ -5846,7 +5854,7 @@ int main(int argc, char** argv) {
                         "independent conditional-q/proposed-token transport per physical head verifier");
                 }
                 const auto transfer = strata::core::dflash2::DflashNativeDrafter::planned_target_allocation(
-                    id, dflash_device, primary_device, dflash_device, dflash_head_scratch);
+                    id, dflash_device, dflash_embedding_device, dflash_device, dflash_head_scratch);
                 if (transfer.shared_device)
                     found->vram.add("dflash2_native_target_transfer", transfer.shared_device,
                         "actual cross-device embedding/head buffers, no second target allocation");

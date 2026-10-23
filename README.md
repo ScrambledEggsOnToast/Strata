@@ -264,6 +264,29 @@ default on SM86. Ambient dispatch overrides are refused. These synthetic
 functional checks and their component timings do not qualify model quality,
 full-model throughput or a daily release.
 
+`STRATA_QSA_MIXED_PRE75=1` opts into experimental mixed-owner resident K8V4
+attention on the selected CUDA pre75 path. It combines only the chunk/merge
+launches; score and top-k selection remain per row. Each query retains its own
+pool, position, selection and scratch. Same-owner, streamed and unsupported
+dispatch paths retain their existing ordering. The flag accepts only `0` or `1`
+and is off by default; it is a shared target optimization, not DFlash2-only.
+`STRATA_QSA_MIXED_PRE75_TRACE=1` enables one bounded selected/completed receipt
+per verifier, using the existing full-key completion and invalidation checks.
+Selection follows successful mixed-kernel enqueue; completion requires the
+matching graph to pass existing drains and guards. Keep same-slot tracing off
+when collecting this receipt: both use the same bounded first-selection state.
+
+`qsa_same_slot_test CUDA_DEVICE_ORDINAL mixed` checks five/eight-row mixed
+packets at capacity 262144, different attention widths, owner-local input
+changes, unchanged-owner output, cached reversed owner layouts, missing-scale
+refusal and poisoned guards. It requires one actual pre75 chunk launch on SM70
+and the existing scalar fallback on SM86. Both devices passed this bounded
+functional check. A six-task c4 service screen completed cleanly with actual
+mixed-path exposure on both SM70 stages, but DFlash2 throughput fell 1.22%
+with the feature (95.21 to 94.05 committed tokens/s); MTP also fell 3.80%.
+The candidate failed the predeclared +3% confirmation threshold and remains
+disabled and unadopted. This single screen does not establish broader effects.
+
 ## Protected GPU tests
 
 On Linux, the fork's short-lived GPU parity/canary tests honor `STRATA_SUPERVISED=1`:

@@ -64,6 +64,16 @@ struct QsaAttnSlotPools {
 /// (n_q > kQsaAttnMaxSlots, mixed formats, the pre-sm_75 / gfx103x or gfx906 variants): the caller loops instead.
 bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
+/// Query dispatch support before changing per-row launch ordering; performs no kernel launch.
+bool qsa_decode_attn_mixed_pre75_supported(const QsaAttnPoolsRows& rows);
+/// CUDA pre75 K8V4 attention with one independent pool per query, preserving the existing chunk/merge arithmetic.
+/// False means nothing launched: keep the caller's existing per-row path. Only 2..8 homogeneous resident rows
+/// are supported; the caller must establish resident backing before deferring attention across selections.
+/// As with the batch path, the caller supplies positive page/head dimensions and capacity representable
+/// as int, valid page mappings/selections, and per-query scratch sized by qsa_decode_attn_scratch_floats.
+bool qsa_decode_attn_mixed_pre75(const float* q, const QsaAttnPoolsRows& rows,
+                                const int32_t* ids, const int32_t* steps, int64_t cap, const QsaShapes& s,
+                                float* scratch, float* attn, int64_t n_q, void* stream);
 /// For src/kernels/qsa_merge_daily_parity.cpp only: qsa_decode_attn_batch's two passes apart, whatever the environment
 /// says.  `chunks_only` runs the chunk pass into `scratch` with `daily_chunk` 0: attn_chunk_kernel (upstream's default),
 /// 1: the Daily's (attn_chunk_kernel_pre75, what STRATA_ATTN_DAILY=1 picks on CUDA).  `merge_only` merges those

@@ -36,6 +36,18 @@ struct DailyTargetFiles {
     std::string embedding_sha256, head_sha256;
 };
 
+// Resolve execution only; the native loader's identity/device remains unchanged.
+// Capability-query failures propagate before adapter allocation, never fall back.
+template<class UnifiedAddressing>
+int resolve_embedding_execution_device(bool local, int loader_device, int drafter_device,
+                                       bool mapped_host, UnifiedAddressing&& unified) {
+    if (!local) return loader_device;
+    if (!mapped_host) throw Refusal("dflash2 local embedding requires an actual host-mapped table");
+    if (!unified(loader_device) || (drafter_device != loader_device && !unified(drafter_device)))
+        throw Refusal("dflash2 local embedding requires unified addressing on both devices");
+    return drafter_device;
+}
+
 // Constructible only by verification of actual file bytes plus native receipts.
 // The loaded geometry and receipts must come from the very target being borrowed.
 // No global service selection, model load, download or device work is performed.

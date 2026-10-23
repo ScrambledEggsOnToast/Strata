@@ -31,6 +31,11 @@ void require(bool condition, const char* message) { if (!condition) throw Native
 void cuda_require(cudaError_t status, const char* message) {
     if (status != cudaSuccess) throw NativeFailure(message, status);
 }
+void require_device(int expected) {
+    int current = -1;
+    cuda_require(cudaGetDevice(&current), "dflash2 embedding current device query");
+    require(current == expected, "dflash2 embedding execution device selection failed");
+}
 bool refuse(std::string& error, const char* message) { error = std::string("dflash2 drafter: ") + message; return false; }
 constexpr size_t raw_float_bytes = block_size * hidden_size * sizeof(float);
 constexpr size_t raw_bf16_bytes = block_size * hidden_size * sizeof(uint16_t);
@@ -61,7 +66,7 @@ struct DflashNativeDrafter::Impl {
     VerifiedDailyTarget verified;
     const NativeEmbed& embedding;
     const NativeHead& head;
-    int device;
+    int device, embedding_device;
     std::unique_ptr<DeviceForward> forward;
     std::unique_ptr<DeviceSelector> selector;
     std::unique_ptr<DeviceContextSnapshot> snapshot;
@@ -83,9 +88,9 @@ struct DflashNativeDrafter::Impl {
     int32_t proposal_anchor = -1;
 
     Impl(const RuntimeWeights& weights, VerifiedDailyTarget verified,
-         const NativeEmbed& embedding, const NativeHead& head, int device)
+         const NativeEmbed& embedding, const NativeHead& head, int device, int embedding_device)
         : weights(weights), verified(std::move(verified)), embedding(embedding), head(head), device(device),
-          head_scratch_bytes(head.projection_scratch_bytes(int(head_three_rows))) {}
+          embedding_device(embedding_device), head_scratch_bytes(head.projection_scratch_bytes(int(head_three_rows))) {}
     Request* request(int slot) { return slot >= 0 && slot <= 8 ? requests[size_t(slot)].get() : nullptr; }
     const Request* request(int slot) const { return slot >= 0 && slot <= 8 ? requests[size_t(slot)].get() : nullptr; }
     void check_target() const {
@@ -98,7 +103,7 @@ struct DflashNativeDrafter::Impl {
         if (cudaGetDevice(&previous) != cudaSuccess) std::terminate();
         int current = previous;
         const std::array streams{std::pair{device, operation_stream},
-            std::pair{embedding.device(), embedding_stream}, std::pair{head.device(), head_stream}};
+            std::pair{embedding_device, embedding_stream}, std::pair{head.device(), head_stream}};
         for (size_t i = 0; i < streams.size(); ++i) {
             if (!streams[i].second) continue;
             bool duplicate = false;
@@ -117,9 +122,10 @@ struct DflashNativeDrafter::Impl {
     bool drain(std::string&) const { drain_or_terminate(); return true; }
     ~Impl() {
         drain_or_terminate();
-        {
-            const OnDevice on(embedding.device());
-            if (raw_bf16 && embedding.device() != device && cudaFree(raw_bf16) != cudaSuccess) std::terminate();
+        if (tokens || raw || raw_bf16 || embedding_stream) {
+            const OnDevice on(embedding_device);
+            require_device(embedding_device);
+            if (raw_bf16 && embedding_device != device && cudaFree(raw_bf16) != cudaSuccess) std::terminate();
             if (raw && cudaFree(raw) != cudaSuccess) std::terminate();
             if (tokens && cudaFree(tokens) != cudaSuccess) std::terminate();
             if (embedding_stream && embedding_stream != operation_stream && cudaStreamDestroy(embedding_stream) != cudaSuccess)
@@ -134,8 +140,9 @@ struct DflashNativeDrafter::Impl {
             if (head_stream && head_stream != operation_stream && cudaStreamDestroy(head_stream) != cudaSuccess)
                 std::terminate();
         }
-        {
+        if (embedding_bf16 || hidden || logits) {
             const OnDevice on(device);
+            require_device(device);
             if (embedding_bf16 && cudaFree(embedding_bf16) != cudaSuccess) std::terminate();
             if (hidden && cudaFree(hidden) != cudaSuccess) std::terminate();
             if (logits && cudaFree(logits) != cudaSuccess) std::terminate();
@@ -151,7 +158,14 @@ DflashNativeDrafter::DflashNativeDrafter(const RuntimeWeights& weights, Verified
             head.loaded() && embedding.identity() == verified.embedding() && head.identity() == verified.head() &&
             head.projection_scratch_bytes() == size_t(hidden_size / 32 * 36),
             "dflash2 native adapter requires the verified loaded daily target and exact scratch geometry");
-    auto state = std::make_unique<Impl>(weights, std::move(verified), embedding, head, device);
+    const int embedding_device = resolve_embedding_execution_device(local_embedding_enabled(),
+        embedding.device(), device, embedding.mapped_host(), [](int id) {
+            int unified = 0;
+            cuda_require(cudaDeviceGetAttribute(&unified, cudaDevAttrUnifiedAddressing, id),
+                         "dflash2 embedding unified addressing query");
+            return unified != 0;
+        });
+    auto state = std::make_unique<Impl>(weights, std::move(verified), embedding, head, device, embedding_device);
     device_ = device; window_ = context_rows;
     identity_.kind = DraftKind::dflash2; identity_.format = 1;
     identity_.geometry = native_geometry;
@@ -173,7 +187,10 @@ DflashNativeDrafter::DflashNativeDrafter(const RuntimeWeights& weights, Verified
     state->import_metadata.projection_mode = DeviceForward::numerical_mode();
     {
         const OnDevice on(device);
-        cuda_require(cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking), "dflash2 operation stream");
+        require_device(device);
+        cudaStream_t operation_stream = nullptr;
+        cuda_require(cudaStreamCreateWithFlags(&operation_stream, cudaStreamNonBlocking), "dflash2 operation stream");
+        cs_ = operation_stream;
         state->operation_stream = cs_;
         std::string error;
         require(canary_.init(error), "dflash2 operation canary allocation failed");
@@ -183,6 +200,7 @@ DflashNativeDrafter::DflashNativeDrafter(const RuntimeWeights& weights, Verified
             state->forward->weight("candidate_selector.predecessor_codebook"),
             state->forward->weight("candidate_selector.successor_codebook"));
         state->snapshot = state->forward->create_snapshot();
+        require_device(device);
         cuda_require(cudaMalloc(reinterpret_cast<void**>(&state->embedding_bf16), raw_bf16_bytes), "draft raw embeddings");
         cuda_require(cudaMalloc(reinterpret_cast<void**>(&state->hidden), raw_bf16_bytes), "draft hidden rows");
         cuda_require(cudaMalloc(reinterpret_cast<void**>(&state->logits), logits_bytes), "draft three full logit rows");
@@ -191,15 +209,24 @@ DflashNativeDrafter::DflashNativeDrafter(const RuntimeWeights& weights, Verified
         state->requests[8]->context = state->forward->create_context(0);
     }
     {
-        const OnDevice on(embedding.device());
-        state->embedding_stream = cs_;
-        if (embedding.device() != device)
-            cuda_require(cudaStreamCreateWithFlags(&state->embedding_stream, cudaStreamNonBlocking), "native embedding stream");
+        const OnDevice on(embedding_device);
+        require_device(embedding_device);
+        if (embedding_device == device) {
+            state->embedding_stream = cs_;
+        } else {
+            cudaStream_t stream = nullptr;
+            cuda_require(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "native embedding stream");
+            state->embedding_stream = stream;
+        }
         cuda_require(cudaMalloc(reinterpret_cast<void**>(&state->tokens), block_size * sizeof(int32_t)), "native embedding tokens");
         cuda_require(cudaMalloc(reinterpret_cast<void**>(&state->raw), raw_float_bytes), "native raw embedding rows");
-        state->raw_bf16 = state->embedding_bf16;
-        if (embedding.device() != device)
-            cuda_require(cudaMalloc(reinterpret_cast<void**>(&state->raw_bf16), raw_bf16_bytes), "native embedding transfer rows");
+        if (embedding_device == device) {
+            state->raw_bf16 = state->embedding_bf16;
+        } else {
+            uint16_t* rows = nullptr;
+            cuda_require(cudaMalloc(reinterpret_cast<void**>(&rows), raw_bf16_bytes), "native embedding transfer rows");
+            state->raw_bf16 = rows;
+        }
     }
     {
         const OnDevice on(head.device());
@@ -216,6 +243,9 @@ DflashNativeDrafter::DflashNativeDrafter(const RuntimeWeights& weights, Verified
         cuda_require(cudaMalloc(&state->head_scratch, state->head_scratch_bytes), "native dedicated head scratch");
     }
     impl_ = std::move(state);
+    std::fprintf(stderr, "DFLASH2_EMBED placement=%s load_device=%d execution_device=%d mapped_host=%d\n",
+        local_embedding_enabled() ? "local" : "native", embedding.device(), embedding_device,
+        int(embedding.mapped_host()));
 }
 
 DflashNativeDrafter::~DflashNativeDrafter() {
@@ -250,7 +280,7 @@ DraftAllocationPlan DflashNativeDrafter::planned_allocation(int device, size_t d
     return plan;
 }
 DraftAllocationPlan DflashNativeDrafter::allocation_plan() const {
-    return planned_allocation(device_, impl_->weights.dense().size_bytes(), impl_->embedding.device(),
+    return planned_allocation(device_, impl_->weights.dense().size_bytes(), impl_->embedding_device,
                               impl_->head.device(), impl_->head_scratch_bytes);
 }
 DraftAllocationPlan DflashNativeDrafter::planned_target_allocation(int device, int drafter_device,
@@ -264,7 +294,7 @@ DraftAllocationPlan DflashNativeDrafter::planned_target_allocation(int device, i
     return plan;
 }
 DraftAllocationPlan DflashNativeDrafter::target_allocation_plan(int device) const {
-    return planned_target_allocation(device, device_, impl_->embedding.device(), impl_->head.device(),
+    return planned_target_allocation(device, device_, impl_->embedding_device, impl_->head.device(),
                                      impl_->head_scratch_bytes);
 }
 void DflashNativeDrafter::invalidate_coverage() {
@@ -508,7 +538,8 @@ bool DflashNativeDrafter::propose_impl(Operation& operation, const float*, int32
     try {
         impl_->check_target();
         {
-            const OnDevice on(impl_->embedding.device());
+            const OnDevice on(impl_->embedding_device);
+            require_device(impl_->embedding_device);
             cuda_require(cudaMemcpyAsync(impl_->tokens, ids.data(), sizeof(int32_t) * size_t(rows + 1), cudaMemcpyHostToDevice,
                                           impl_->embedding_stream), "native embedding token upload");
             impl_->embedding.gather_dev(impl_->tokens, rows + 1, impl_->raw, impl_->embedding_stream);
@@ -516,9 +547,9 @@ bool DflashNativeDrafter::propose_impl(Operation& operation, const float*, int32
             cuda_require(cudaStreamSynchronize(impl_->embedding_stream), "native raw embedding completion");
         }
         const OnDevice on(device_);
-        if (impl_->embedding.device() != device_)
+        if (impl_->embedding_device != device_)
             cuda_require(cudaMemcpyPeerAsync(impl_->embedding_bf16, device_, impl_->raw_bf16,
-                impl_->embedding.device(), raw_bf16_bytes, cs_), "raw BF16 embedding device transfer");
+                impl_->embedding_device, raw_bf16_bytes, cs_), "raw BF16 embedding device transfer");
         FeatureView empty;
         empty.start = frontier; empty.count = 0; empty.incarnation = int64_t(expected.incarnation);
         std::array<char, 21> id{};
@@ -582,7 +613,7 @@ bool DflashNativeDrafter::propose_impl(Operation& operation, const float*, int32
                 "head_host_ms=%.6f selector_host_ms=%.6f result_host_ms=%.6f\n",
                 expected.seat, (unsigned long long)expected.request,
                 (unsigned long long)expected.incarnation, frontier, rows, rows + 1, device_,
-                impl_->embedding.device(), impl_->head.device(),
+                impl_->embedding_device, impl_->head.device(),
                 (long long)phase_ns[0], (long long)phase_ns[5], elapsed(0, 5),
                 elapsed(0, 1), elapsed(1, 2), elapsed(2, 3), elapsed(3, 4), elapsed(4, 5));
         }

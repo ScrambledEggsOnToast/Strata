@@ -750,6 +750,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(STRATA_BUILD_TESTS)
       # Explicit queued CUDA execution only, never an unguarded CTest workload.
       if(NOT STRATA_HIP_GFX906 AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+          add_executable(dflash2_embedding_owner_test tests/core/dflash2_embedding_owner_test.cpp)
+          target_link_libraries(dflash2_embedding_owner_test PRIVATE strata_engine)
+          target_link_options(dflash2_embedding_owner_test PRIVATE
+            -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaFree -Wl,--wrap=cudaHostAlloc -Wl,--wrap=cudaFreeHost
+            -Wl,--wrap=cudaStreamCreateWithFlags -Wl,--wrap=cudaStreamDestroy
+            -Wl,--wrap=cudaStreamSynchronize -Wl,--wrap=cudaSetDevice)
+        endif()
         add_executable(dflash2_context_runtime_test src/kernels/dflash2_context_runtime_test.cpp)
         target_include_directories(dflash2_context_runtime_test PRIVATE "${STRATA_DFLASH2_JSON_INCLUDE_DIR}" ${_strata_gpu_include_directories})
         target_link_libraries(dflash2_context_runtime_test PRIVATE strata_engine strata_dflash2_bridge OpenSSL::Crypto)

@@ -127,6 +127,7 @@ struct Probe {
     Buffer<int32_t> steps, selection[2];
     std::vector<int32_t> host_steps;
     int count, context;
+    bool mixed_mode = false;
     std::map<c::VerifyBatchKey, std::unique_ptr<Graph>> cache;
     explicit Probe(int n, int ctx, int capacity = kCells)
         : cells(capacity), blocks(capacity / int(shapes.idx_block) + 2),
@@ -145,11 +146,19 @@ struct Probe {
         std::uniform_real_distribution<float> nd(-0.25f, 0.25f);
         std::vector<float> hqi(query_index.size, std::numeric_limits<float>::quiet_NaN());
         std::vector<float> hq(query.size, std::numeric_limits<float>::quiet_NaN());
-        for (int i = 0; i < count * qi; ++i) hqi[size_t(i)] = nd(rng) + revision * 0.1f;
-        for (int i = 0; i < count * qo; ++i) hq[size_t(i)] = nd(rng) + revision * 0.1f;
+        for (int i = 0; i < count * qi; ++i)
+            hqi[size_t(i)] = nd(rng) + ((!mixed_mode || i / qi < count / 2) ? revision * 0.1f : 0.0f);
+        for (int i = 0; i < count * qo; ++i)
+            hq[size_t(i)] = nd(rng) + ((!mixed_mode || i / qo < count / 2) ? revision * 0.1f : 0.0f);
         host_steps.assign(steps.size, -123456);
-        for (int row = 0; row < count; ++row)
-            k::qsa_step_fill(host_steps.data() + row * k::kStepCount, context - 1 + row + revision * 4, shapes);
+        for (int row = 0; row < count; ++row) {
+            const int depth = mixed_mode && row < count / 2 ? 2040 : context;
+            const int shift = !mixed_mode || row < count / 2 ? revision * 4 : 0;
+            k::qsa_step_fill(host_steps.data() + row * k::kStepCount, depth - 1 + row + shift, shapes);
+        }
+        if (mixed_mode)
+            require(host_steps[k::kStepWidth] != host_steps[size_t((count - 1) * k::kStepCount + k::kStepWidth)],
+                    "mixed owners must exercise different attention widths");
         query_index.upload(hqi, stream); query.upload(hq, stream); steps.upload(host_steps, stream);
     }
     void poison() {
@@ -159,11 +168,25 @@ struct Probe {
         }
         ck(cudaStreamSynchronize(stream));
     }
+    bool mixed_supported(const std::vector<int>& owners, bool candidate, bool resident,
+                         k::QsaAttnPoolsRows& rows) {
+        if (!mixed_mode || !candidate || !resident || count < 2 || count > k::kAttnRowsMax) return false;
+        bool different = false;
+        rows.n = count;
+        for (int row = 0; row < count; ++row) {
+            rows.p[row] = pools[owners[size_t(row)]].view;
+            different = different || owners[size_t(row)] != owners[0];
+        }
+        return different && k::qsa_decode_attn_mixed_pre75_supported(rows);
+    }
     // part=0 full pipeline, 1 scores, 2 top-k, 3 chunk+merge. Same eligibility helper as verify.cpp.
     void launch(const std::vector<int>& owners, bool candidate, bool resident = true, int part = 0) {
         require(int(owners.size()) == count, "owner extent");
         const int arm = candidate ? 1 : 0;
-        const bool grouped = c::qsa_same_slot_rows_eligible(candidate, true, owners.data(), count, resident);
+        const bool grouped = !mixed_mode &&
+            c::qsa_same_slot_rows_eligible(candidate, true, owners.data(), count, resident);
+        k::QsaAttnPoolsRows mixed_pools{};
+        const bool mixed = mixed_supported(owners, candidate, resident, mixed_pools);
         const int stride = grouped ? count : 1;
         for (int row = 0; row < count; row += stride) {
             const Pool& pool = pools[owners[size_t(row)]];
@@ -173,11 +196,15 @@ struct Probe {
             if (part == 0 || part == 2)
                 k::qsa_block_topk(scores[arm].data + row * blocks, steps.data + row * k::kStepCount,
                     stride, blocks, cap, shapes, selection[arm].data + row * cap, stream);
-            if (part == 0 || part == 3)
+            if (!mixed && (part == 0 || part == 3))
                 k::qsa_decode_attn_batch(query.data + row * qo, pool.view, selection[arm].data + row * cap,
                     steps.data + row * k::kStepCount, cap, shapes, scratch[arm].data + size_t(row) * scratch_stride,
                     output[arm].data + row * qo, stride, stream);
         }
+        if (mixed && (part == 0 || part == 3))
+            require(k::qsa_decode_attn_mixed_pre75(query.data, mixed_pools, selection[arm].data,
+                steps.data, cap, shapes, scratch[arm].data, output[arm].data, count, stream),
+                "mixed launch must retain its preflight eligibility");
     }
     std::unique_ptr<Graph> capture(const std::vector<int>& owners, bool candidate, bool resident = true, int part = 0) {
         auto graph = std::make_unique<Graph>();
@@ -188,7 +215,10 @@ struct Probe {
         ck(cudaGraphGetNodes(graph->graph, nullptr, &count_nodes));
         std::vector<cudaGraphNode_t> nodes(count_nodes);
         ck(cudaGraphGetNodes(graph->graph, nodes.data(), &count_nodes));
-        const bool grouped = c::qsa_same_slot_rows_eligible(candidate, true, owners.data(), count, resident);
+        const bool grouped = !mixed_mode &&
+            c::qsa_same_slot_rows_eligible(candidate, true, owners.data(), count, resident);
+        k::QsaAttnPoolsRows mixed_pools{};
+        const bool mixed = mixed_supported(owners, candidate, resident, mixed_pools);
         for (auto node : nodes) {
             cudaGraphNodeType type;
             ck(cudaGraphNodeGetType(node, &type));
@@ -201,7 +231,7 @@ struct Probe {
             if (name && std::strstr(name, "attn_chunk_kernel")) {
                 if (std::strstr(name, "attn_chunk_kernel_pre75")) ++graph->pre75_nodes;
                 else ++graph->default_nodes;
-                require(params.gridDim.z == unsigned(grouped ? count : 1), "attention live query grid");
+                require(params.gridDim.z == unsigned(grouped || mixed ? count : 1), "attention live query grid");
             }
             if (name && std::strstr(name, "block_topk_wide_kernel")) {
                 ++graph->wide_topk_nodes;
@@ -211,7 +241,7 @@ struct Probe {
             require(false, "CUDA >=12.3 required to establish actual kernel exposure");
 #endif
         }
-        const int attention_nodes = (part == 0 || part == 3) ? (grouped ? 1 : count) : 0;
+        const int attention_nodes = (part == 0 || part == 3) ? (grouped || mixed ? 1 : count) : 0;
         require(graph->pre75_nodes == (expect_pre75 ? attention_nodes : 0) &&
                 graph->default_nodes == (expect_pre75 ? 0 : attention_nodes),
                 "actual device-specific attention route must execute; fallback is not acceptance");
@@ -311,11 +341,13 @@ void policy_checks() {
 
 int main(int argc, char** argv) {
     policy_checks();
-    require(argc <= 2, "usage: qsa_same_slot_test [CUDA-device-ordinal]");
+    require(argc <= 3, "usage: qsa_same_slot_test [CUDA-device-ordinal] [mixed]");
+    const bool mixed_mode = argc == 3;
+    require(!mixed_mode || std::strcmp(argv[2], "mixed") == 0, "unknown fixture mode");
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     int device = 0;
-    if (argc == 2) {
+    if (argc >= 2) {
         char* end = nullptr;
         const long parsed = std::strtol(argv[1], &end, 10);
         require(end != argv[1] && *end == '\0' && parsed >= 0 && parsed < devices, "CUDA device ordinal");
@@ -333,6 +365,50 @@ int main(int argc, char** argv) {
                              "STRATA_SCORES_HALVE", "STRATA_TOPK_OLD", "STRATA_TOPK_SPLIT",
                              "STRATA_EMULATE_CC"})
         require(std::getenv(name) == nullptr, "clear independent attention overrides before probe");
+    if (mixed_mode) {
+        for (int rows : {5, 8}) {
+            Probe p(rows, 262132, 262144);
+            p.mixed_mode = true;
+            std::vector<int> owners(size_t(rows), 1);
+            for (int row = 0; row < rows / 2; ++row) owners[size_t(row)] = 0;
+            p.input(0); p.poison();
+            auto reference = p.capture(owners, false);
+            Graph& candidate = p.cached(owners);
+            require(candidate.pre75_nodes == (expect_pre75 ? 1 : 0) &&
+                    candidate.default_nodes == (expect_pre75 ? 0 : rows),
+                    "SM70 must execute mixed pre75; SM86 must retain scalar fallback");
+            k::QsaAttnPoolsRows incomplete{};
+            incomplete.n = rows;
+            for (int row = 0; row < rows; ++row) incomplete.p[row] = p.pools[owners[size_t(row)]].view;
+            incomplete.p[0].k_scale = nullptr;
+            require(!k::qsa_decode_attn_mixed_pre75_supported(incomplete), "missing K scale must refuse before launch");
+            const auto first = p.replay(owners, *reference, candidate);
+            p.input(1);
+            const auto changed = p.replay(owners, *reference, candidate);
+            require(first != changed, "mixed independent-pool replay must observe changed inputs");
+            const size_t unchanged = size_t(rows / 2 * p.qo);
+            require(std::memcmp(first.data() + unchanged, changed.data() + unchanged,
+                                (first.size() - unchanged) * sizeof(float)) == 0,
+                    "changing one owner must not change the other owner's attention");
+            auto reversed = owners;
+            for (int& owner : reversed) owner = 1 - owner;
+            auto reversed_reference = p.capture(reversed, false);
+            Graph& reversed_candidate = p.cached(reversed);
+            p.replay(reversed, *reversed_reference, reversed_candidate);
+            require(p.cache.size() == 2 && &p.cached(owners) == &candidate &&
+                    &candidate != &reversed_candidate, "mixed owner layouts must retain distinct graph executables");
+            require(changed == p.replay(owners, *reference, p.cached(owners)),
+                    "revisiting owner layout must preserve its own pools");
+            auto fallback = p.capture(owners, true, false);
+            p.replay(owners, *reference, *fallback);
+            std::fill(owners.begin(), owners.end(), 0);
+            auto same_reference = p.capture(owners, false);
+            auto same_candidate = p.capture(owners, true);
+            p.replay(owners, *same_reference, *same_candidate);
+        }
+        std::puts("PASS mixed-pool QSA: full capacity, unequal depths, independent pools, changed replay, guards and fallbacks");
+        return 0;
+    }
     for (int rows : {2, 3, 4}) for (int context : {244, 2047}) {
         Probe p(rows, context);
         const std::vector<int> owners(size_t(rows), 0);

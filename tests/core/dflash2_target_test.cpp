@@ -1,10 +1,12 @@
 // CPU-only synthetic native weights/device sinks. No target/checkpoint load or
 // GPU qualification: exercise the SAME adapter, upload hashing and file verifier.
 #include "strata/core/dflash2_target.hpp"
+#include "strata/core/dflash2_capture.hpp"
 #include "conversation_store_sha256.hpp"
 #include "native_verified_upload.hpp"
 
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -23,6 +25,40 @@ void check(bool ok, const char* why) { if (!ok) throw std::runtime_error(why); }
 template<class F> void refuses(F&& action) {
     try { action(); } catch (const d::Refusal&) { return; }
     throw std::runtime_error("expected DFlash2 refusal");
+}
+void embedding_flag_tests() {
+    constexpr auto name = "STRATA_DFLASH2_LOCAL_EMBEDDING";
+    const char* previous = std::getenv(name);
+    const bool present = previous != nullptr;
+    const std::string saved = previous ? previous : "";
+    std::string error;
+    check(unsetenv(name) == 0 && d::validate_feature_flags(error), "absent embedding placement flag is valid");
+    for (const char* value : {"0", "1"})
+        check(setenv(name, value, 1) == 0 && d::validate_feature_flags(error), "explicit embedding placement mode is valid");
+    for (const char* value : {"", "true", "2"})
+        check(setenv(name, value, 1) == 0 && !d::validate_feature_flags(error), "ambiguous embedding placement mode must refuse");
+    check((present ? setenv(name, saved.c_str(), 1) : unsetenv(name)) == 0, "restore embedding placement environment");
+}
+void embedding_placement_tests() {
+    const auto unexpected_query = [](int) -> bool { throw std::runtime_error("unexpected capability query"); };
+    check(d::resolve_embedding_execution_device(false, 0, 2, false, unexpected_query) == 0,
+          "disabled placement must retain the loader device without capability queries");
+    refuses([&] { d::resolve_embedding_execution_device(true, 0, 2, false, unexpected_query); });
+    check(d::resolve_embedding_execution_device(true, 0, 2, true, [](int) { return true; }) == 2,
+          "eligible mapped storage must execute on the drafter device");
+    for (const int unsupported : {0, 2})
+        refuses([&] {
+            d::resolve_embedding_execution_device(true, 0, 2, true,
+                [&](int device) { return device != unsupported; });
+        });
+    struct QueryFailure {};
+    bool query_failed = false;
+    try {
+        d::resolve_embedding_execution_device(true, 0, 2, true, [](int) -> bool { throw QueryFailure{}; });
+    } catch (const QueryFailure&) {
+        query_failed = true;
+    }
+    check(query_failed, "capability query failure must propagate without selecting a fallback");
 }
 std::string hash(const std::string& value) { return sha256_hex(sha256(value.data(), value.size())); }
 void file(const fs::path& path, const std::string& value) {
@@ -329,7 +365,7 @@ void bridge_binding_tests() {
 } // namespace
 int main() {
     try {
-        upload_tests(); artifact_tests(); adapter_tests(); adapter_refusals(); bridge_binding_tests();
+        embedding_flag_tests(); embedding_placement_tests(); upload_tests(); artifact_tests(); adapter_tests(); adapter_refusals(); bridge_binding_tests();
         std::cout << "dflash2_target_test: all passed (synthetic CPU contracts; no GPU qualification)\n";
         return 0;
     } catch (const std::exception& error) {

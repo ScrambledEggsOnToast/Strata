@@ -32,8 +32,16 @@ inline bool feature_phases_enabled() {
     }();
     return enabled;
 }
+inline bool local_embedding_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_DFLASH2_LOCAL_EMBEDDING");
+        return value && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
 inline bool validate_feature_flags(std::string& error) {
-    for (const char* name : {"STRATA_DFLASH2_DEVICE_FEATURES", "STRATA_DFLASH2_PHASES"}) {
+    for (const char* name : {"STRATA_DFLASH2_DEVICE_FEATURES", "STRATA_DFLASH2_PHASES",
+                             "STRATA_DFLASH2_LOCAL_EMBEDDING"}) {
         const char* value = std::getenv(name);
         if (value && std::string_view(value) != "0" && std::string_view(value) != "1") {
             error = std::string("dflash2 capture: ") + name + " must be absent, 0 or 1";

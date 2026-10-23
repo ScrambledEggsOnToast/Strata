@@ -1623,6 +1623,13 @@ void Verifier::poison_dflash2_capture() {
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err) {
+    for (const char* name : {"STRATA_QSA_MIXED_PRE75", "STRATA_QSA_MIXED_PRE75_TRACE"}) {
+        const char* value = std::getenv(name);
+        if (value && std::strcmp(value, "0") != 0 && std::strcmp(value, "1") != 0) {
+            err = std::string("verify: ") + name + " must be 0 or 1";
+            return false;
+        }
+    }
     g_diag_verifier.store(this);
     diag_verify_fn().store(&diag_active_verifier);
     for (auto& slot : g_live) {
@@ -2923,7 +2930,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     // one resident pool. Existing nq-aware kernels retain the per-row arithmetic,
                     // including the pre-SM75 attention route. Appends/commit stay unchanged.
                     static const bool same_slot_trace = env_on("STRATA_QSA_SAME_SLOT_TRACE");
-                    if (same_slot_trace) trace_qsa_same_slot_selected(l, T);
+                    if (same_slot_trace) trace_qsa_selected(l, T, false, tb, n);
                     const QsaState& sx = slot_ss(tb).qsa_states[qi];
                     qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount,
                                      n, max_blocks_, s, scores_ + (size_t) tb * max_blocks_, cs);
@@ -2986,18 +2993,42 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                       attn_ + t * NH * HD, 1, cs);
                     }
                 } else if (batch_rec_) {   // each row selects and attends over its own slot's K/V
+                    static const bool mixed_pre75 = env_on("STRATA_QSA_MIXED_PRE75");
+                    bool mixed_resident = mixed_pre75 && n >= 2 && n <= kAttnRowsMax;
+                    bool distinct_owners = false;
+                    QsaAttnPoolsRows mixed_pools{};
+                    mixed_pools.n = n;
+                    for (int t = tb; mixed_resident && t < te; ++t) {
+                        const QsaState& sx = slot_ss(t).qsa_states[qi];
+                        mixed_resident = sx.kv_mode != 1;
+                        distinct_owners = distinct_owners || brow_[t] != brow_[tb];
+                        mixed_pools.p[t - tb] = qsa_attn_pools(sx);
+                    }
+                    const bool mixed_launch = mixed_resident && distinct_owners &&
+                        qsa_decode_attn_mixed_pre75_supported(mixed_pools);
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
                         qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, 1,
                                          max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
                         qsa_block_topk(scores_ + (size_t) t * max_blocks_, step_ + t * kStepCount, 1, max_blocks_, cap_, s,
                                        sel_ + (size_t) t * cap_, cs);
+                        if (mixed_launch) continue; // Resident pools cannot be overwritten by another row's resolve.
                         qsa_kv_resolve(sx, *g_, sel_ + (size_t) t * cap_, step_ + t * kStepCount, 1, cap_, cs);
                         const QsaAttnPools px = qsa_attn_pools(sx);
                         qsa_decode_attn_batch(qcur_ + t * NH * HD, px, sel_ + (size_t) t * cap_, step_ + t * kStepCount,
                                               cap_, s, attn_scratch_ + (size_t) t * attn_scratch_floats_,
                                               attn_ + t * NH * HD, 1, cs);
                     }
+                    if (mixed_launch && !qsa_decode_attn_mixed_pre75(
+                            qcur_ + tb * NH * HD, mixed_pools, sel_ + (size_t) tb * cap_,
+                            step_ + tb * kStepCount, cap_, s,
+                            attn_scratch_ + (size_t) tb * attn_scratch_floats_,
+                            attn_ + tb * NH * HD, n, cs)) {
+                        err = "verify: mixed pre75 attention lost its preflight eligibility";
+                        return false;
+                    }
+                    static const bool mixed_trace = env_on("STRATA_QSA_MIXED_PRE75_TRACE");
+                    if (mixed_launch && mixed_trace) trace_qsa_selected(l, T, true, tb, n);
                 } else {
                 if (!sidem) idx_select(cs);
                 else if (cudaStreamWaitEvent(cs, mjoin_, 0) != cudaSuccess) {
@@ -5172,7 +5203,19 @@ void Verifier::report_batch_resources(const char* phase) const {
         (unsigned long long) b.history_bytes, b.graph_keys, b.graph_execs);
 }
 
-void Verifier::trace_qsa_same_slot_receipt(bool completed, const char* route) const {
+void Verifier::trace_qsa_receipt(bool completed, const char* route) const {
+    if (qsa_trace_mixed_) {
+        std::fprintf(stderr, "strata qsa-mixed-pre75: selected=%d completed=%d verifier=%p device=%d "
+                             "layers=%lld:%lld first_qsa_layer=%lld route=%s query_base=%d query_rows=%d "
+                             "key=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                     completed ? 0 : 1, completed ? 1 : 0, static_cast<const void*>(this), device_,
+                     (long long) lb_, (long long) le_, (long long) qsa_trace_layer_, route,
+                     qsa_trace_query_base_, qsa_trace_query_rows_,
+                     qsa_trace_key_[0], qsa_trace_key_[1], qsa_trace_key_[2], qsa_trace_key_[3],
+                     qsa_trace_key_[4], qsa_trace_key_[5], qsa_trace_key_[6], qsa_trace_key_[7],
+                     qsa_trace_key_[8], qsa_trace_key_[9], qsa_trace_key_[10]);
+        return;
+    }
     std::fprintf(stderr, "strata qsa-same-slot: selected=%d completed=%d verifier=%p device=%d "
                          "layers=%lld:%lld first_qsa_layer=%lld route=%s "
                          "key=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
@@ -5183,23 +5226,26 @@ void Verifier::trace_qsa_same_slot_receipt(bool completed, const char* route) co
                  qsa_trace_key_[8], qsa_trace_key_[9], qsa_trace_key_[10]);
 }
 
-void Verifier::trace_qsa_same_slot_selected(int64_t layer, int rows) {
+void Verifier::trace_qsa_selected(int64_t layer, int rows, bool mixed, int query_base, int query_rows) {
     if (qsa_trace_state_ != QsaTraceState::unseen) return;
-    // Called only inside the selected resident same-owner branch during batch capture.
+    // Selected resident branch during capture; mixed selection follows a successful mixed kernel enqueue.
     // A later capture failure cannot yield completion: no executable for this key is launched.
     qsa_trace_key_ = bkey(brow_, rows, row_base_);
     qsa_trace_layer_ = layer;
+    qsa_trace_mixed_ = mixed;
+    qsa_trace_query_base_ = query_base;
+    qsa_trace_query_rows_ = query_rows;
     qsa_trace_state_ = QsaTraceState::selected;
-    trace_qsa_same_slot_receipt(false, "capture");
+    trace_qsa_receipt(false, "capture");
 }
 
-void Verifier::trace_qsa_same_slot_completed(const int* owners, int rows, int hbase, const char* route) {
+void Verifier::trace_qsa_completed(const int* owners, int rows, int hbase, const char* route) {
     if (qsa_trace_state_ != QsaTraceState::selected || bkey(owners, rows, hbase) != qsa_trace_key_) return;
     const auto graph = exec_bm_.find(qsa_trace_key_);
     if (graph == exec_bm_.end() || !graph->second) return;
     // Callers have passed their existing compute/copy drains, canaries and finish_dflash2_batch.
     qsa_trace_state_ = QsaTraceState::completed;
-    trace_qsa_same_slot_receipt(true, route);
+    trace_qsa_receipt(true, route);
 }
 
 void Verifier::trace_head_split_completed(const int* owners, int rows, int hbase, const char* route) {
@@ -5792,7 +5838,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             if (!scratch_.ready()) { err = "verify: batch ownership was poisoned"; return false; }        // FORK
             if (!finish_dflash2_batch(err)) return false;
             if (qsa_copy_drain == cudaSuccess) {
-                trace_qsa_same_slot_completed(rows, S, 0, "run_slot_rows");
+                trace_qsa_completed(rows, S, 0, "run_slot_rows");
                 trace_head_split_completed(rows, S, 0, "run_slot_rows");
                 if (!complete_expert_reuse_trace("run_slot_rows", err)) return false;
                 if (!complete_expert_group_census("run_slot_rows", err)) return false;
@@ -5808,7 +5854,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         if (!scratch_.ready()) { err = "verify: batch ownership was poisoned"; return false; }            // FORK
         if (!finish_dflash2_batch(err)) return false;
         if (qsa_copy_drain == cudaSuccess) {
-            trace_qsa_same_slot_completed(rows, S, 0, "run_slot_rows");
+            trace_qsa_completed(rows, S, 0, "run_slot_rows");
             trace_head_split_completed(rows, S, 0, "run_slot_rows");
             if (!complete_expert_reuse_trace("run_slot_rows", err)) return false;
             if (!complete_expert_group_census("run_slot_rows", err)) return false;
@@ -5891,7 +5937,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         if (next_ && !next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err)) return false;
         if (!scratch_.ready()) { err = "verify: batch ownership was poisoned"; return false; }
         if (!finish_dflash2_batch(err)) return false;
-        trace_qsa_same_slot_completed(rows, S, 0, "run_slot_rows");
+        trace_qsa_completed(rows, S, 0, "run_slot_rows");
         trace_head_split_completed(rows, S, 0, "run_slot_rows");
         guard.keep = true;
         return true;
@@ -5903,7 +5949,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     progress_beat();
     if (!scratch_.ready()) { err = "verify: batch ownership was poisoned"; return false; }
     if (!finish_dflash2_batch(err)) return false;
-    trace_qsa_same_slot_completed(rows, S, 0, "run_slot_rows");
+    trace_qsa_completed(rows, S, 0, "run_slot_rows");
     trace_head_split_completed(rows, S, 0, "run_slot_rows");
     guard.keep = true;
     return true;
@@ -6236,7 +6282,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         }
     if (!(b_deferred_ ? scratch_.ready() : scratch_.finish_batch())) { err = "verify: batch ownership was poisoned"; return -1; }
     if (!finish_dflash2_batch(err)) return -1;
-    trace_qsa_same_slot_completed(last_rows_, S, row_base_, "batch_poll");
+    trace_qsa_completed(last_rows_, S, row_base_, "batch_poll");
     trace_head_split_completed(last_rows_, S, row_base_, "batch_poll");
     if (!complete_expert_reuse_trace("batch_poll", err)) return -1;
     if (!complete_expert_group_census("batch_poll", err)) return -1;

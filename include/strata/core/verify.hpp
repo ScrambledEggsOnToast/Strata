@@ -564,9 +564,11 @@ private:
     QsaTraceState qsa_trace_state_ = QsaTraceState::unseen;
     BatchKey qsa_trace_key_{};
     int64_t qsa_trace_layer_ = -1;
-    void trace_qsa_same_slot_selected(int64_t layer, int rows);
-    void trace_qsa_same_slot_completed(const int* owners, int rows, int hbase, const char* route);
-    void trace_qsa_same_slot_receipt(bool completed, const char* route) const;
+    bool qsa_trace_mixed_ = false;
+    int qsa_trace_query_base_ = 0, qsa_trace_query_rows_ = 0;
+    void trace_qsa_selected(int64_t layer, int rows, bool mixed, int query_base, int query_rows);
+    void trace_qsa_completed(const int* owners, int rows, int hbase, const char* route);
+    void trace_qsa_receipt(bool completed, const char* route) const;
     bool head_split_trace_pending_ = false, head_split_trace_completed_ = false;
     BatchKey head_split_trace_key_{};
     void trace_head_split_completed(const int* owners, int rows, int hbase, const char* route);

@@ -540,13 +540,21 @@ __device__ __forceinline__ float load_v1(const QsaAttnPools& p, long long row, i
     }
 }
 
-template <int KV_MODE, int NC_ = 2, bool DPP_ = false>
-__global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* __restrict__ q, QsaAttnPools p,
+__device__ __forceinline__ const QsaAttnPools& pre75_query_pools(const QsaAttnPools& pools, unsigned) {
+    return pools;
+}
+__device__ __forceinline__ const QsaAttnPools& pre75_query_pools(const QsaAttnPoolsRows& rows, unsigned query) {
+    return rows.p[query];
+}
+
+template <int KV_MODE, int NC_ = 2, bool DPP_ = false, class Pools = QsaAttnPools>
+__global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* __restrict__ q, Pools pools,
                                                              const int32_t* __restrict__ ids,
                                                              const int32_t* __restrict__ step, int n_kv_heads,
                                                              int page_size, float scale, float* __restrict__ part_acc,
                                                              float* __restrict__ part_m, float* __restrict__ part_l,
                                                              int n_chunks, int cap = 0, long long scratch_stride = 0) {
+    const QsaAttnPools& p = pre75_query_pools(pools, blockIdx.z);
     // batched form: query blockIdx.z, with its own q row, selection, step and scratch
     q += (size_t) blockIdx.z * (size_t) (n_kv_heads * G) * HD;
     ids += (size_t) blockIdx.z * (size_t) cap;
@@ -1054,6 +1062,61 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         std::fprintf(stderr, "qsa_decode_attn_batch: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
+}
+
+bool qsa_decode_attn_mixed_pre75_supported(const QsaAttnPoolsRows& rows) {
+#if defined(STRATA_ATTN_PRE75_BUILT) && !defined(__HIPCC__)
+    if (rows.n < 2 || rows.n > kAttnRowsMax || lane_cell_attn() || !pre75_attn()) return false;
+    for (int row = 0; row < rows.n; ++row)
+        if (!rows.p[row].page_table || !rows.p[row].k_scale || attn_kv_mode(rows.p[row]) != 3) return false;
+    return true;
+#else
+    (void) rows;
+    return false;
+#endif
+}
+
+bool qsa_decode_attn_mixed_pre75(const float* q, const QsaAttnPoolsRows& rows,
+                                const int32_t* ids, const int32_t* steps, int64_t cap, const QsaShapes& s,
+                                float* scratch, float* attn, int64_t n_q, void* stream) {
+#if defined(STRATA_ATTN_PRE75_BUILT) && !defined(__HIPCC__)
+    if (rows.n != n_q || !qsa_decode_attn_mixed_pre75_supported(rows)) return false;
+    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 ||
+        !q || !scratch || !attn || !ids || !steps) {
+        std::fprintf(stderr, "qsa_decode_attn_mixed_pre75: unsupported geometry or missing buffers\n");
+        std::exit(1);
+    }
+    for (int64_t row = 0; row < n_q; ++row) {
+        if (!rows.p[row].page_table) {
+            std::fprintf(stderr, "qsa_decode_attn_mixed_pre75: missing page table\n");
+            std::exit(1);
+        }
+        if (attn_kv_mode(rows.p[row]) != 3) return false;
+    }
+    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
+    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+    float* part_acc = scratch;
+    float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
+    float* part_l = part_m + (size_t) n_chunks * s.n_head;
+    const float scale = 1.0f / sqrtf((float) HD);
+    const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
+    cudaStream_t st = (cudaStream_t) stream;
+    attn_chunk_kernel_pre75<3, 2, false, QsaAttnPoolsRows><<<grid, THREADS, 0, st>>>(
+        q, rows, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale,
+        part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+    launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, steps, attn, stride,
+                 (unsigned) s.n_head, (unsigned) n_q, st);
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        std::fprintf(stderr, "qsa_decode_attn_mixed_pre75: %s\n", cudaGetErrorString(error));
+        std::exit(1);
+    }
+    return true;
+#else
+    (void) q; (void) rows; (void) ids; (void) steps; (void) cap; (void) s;
+    (void) scratch; (void) attn; (void) n_q; (void) stream;
+    return false;
+#endif
 }
 
 bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const int32_t* ids, const int32_t* steps,
